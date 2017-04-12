@@ -1,0 +1,596 @@
+
+先强调一下 linux x86的assembly语法，采用AT&T格式。dst 是后面的operand，不同
+于x86手册中描述的，dst operand在前面。
+
+一. 第一个程序 setup.bin 
+
+
+1. header.S 为c程序运行做准备
+
+此程序由 setup.ld链接脚本生成。
+
+程序的前一个sector，也就是0x200(512 bytes) 包含一些重要的启动数据。在较早的
+kernel版本中，该sector还包含系统引导代码，主要功能是通过BIOS的int调用，从硬盘
+中将内核文件读取到内存0x9000:0。在目前的kernel中，已经不使用这段引导代码，而
+完全依赖于诸如grub等引导程序。因此当前此sector中会有代码给出warning信息，提示
+用户必须使用引导程序。这个告警只会在某些老系统还从该sector开始运行的情况下才
+会产生。我们目前大多数系统应该不会看到这个warning。
+
+在setup.ld中定义了 ENTRY(_start)，也就是程序的入口是 _start。应该是boot-loader
+会跳转到这里开始内核的booting(没有跟踪grub或uefi的代码。如果有误，请boot-loader
+大牛指正)。
+
+实际上从 _start开始，以下指令会直接跳转到 start_of_setup（相对跳转)
+
+		.byte	0xeb		# short (2-byte) jump
+		.byte	start_of_setup-1f
+
+介于该指令与 start_of_setup之间的是一些boot重要数据。
+实际上，从偏移495开始，直到start_of_setup，都是.header 这个section的范围。
+
+好了，下一步我们看start_of_setup。
+在此之前，有必要补充以下：
+1） 当前运行在real mode，地址都是物理地址，访问地址的方式是 8086实模式，也就是
+cs:ip的组合方式。在该模式下最大的访址访问应该是 ffff:ffff，也就是
+(0x100000 + ffff - 1)。 PS: 同样，这个是我的理解，欢迎拍砖。
+2） boot-loader跳转到_start，也就设置好了cs和ip，指向 _start 所在的物理地址。应该
+是 0x9020:0吧。不过从boot protocol 2.02 开始，_start 的物理地址不一定是
+0x9020:0了。 boot-loader会尽可能的将 setup.bin 部署到更低的地址去。
+
+原因是什么呢？ 大牛们给出了说明：
+
+It is desirable to keep the "memory ceiling" -- the highest point in
+low memory touched by the boot loader -- as low as possible, since
+some newer BIOSes have begun to allocate some rather large amounts of
+memory, called the Extended BIOS Data Area, near the top of low memory.
+
+不管怎样，boot-loader会正确的设置好 cs:ip，以便跳转到正确的_start去。
+
+下面给出了新旧协议下的低端内存分布。我只是copy了我能理解的部分。BIOS相关的部分
+去请教那些大牛去吧。我不能将人引入歧途。
+
+
+X+10000	+------------------------+
+	|  Stack/heap		 |	For use by the kernel real-mode code.
+X+08000	+------------------------+	
+	|  Kernel setup		 |	The kernel real-mode code.
+	|  Kernel boot sector	 |	The kernel legacy boot sector.
+X       +------------------------+
+	|  Boot loader		 |	<- Boot sector entry point 0000:7C00
+001000	+------------------------+
+		新协议下的内存layout
+
+
+09A000	+------------------------+
+	|  Command line		 |
+	|  Stack/heap		 |	For use by the kernel real-mode code.
+098000	+------------------------+	
+	|  Kernel setup		 |	The kernel real-mode code.
+090200	+------------------------+
+	|  Kernel boot sector	 |	The kernel legacy boot sector.
+090000	+------------------------+
+	|  Protected-mode kernel |	The bulk of the kernel image.
+010000	+------------------------+
+	|  Boot loader		 |	<- Boot sector entry point 0000:7C00
+001000	+------------------------+
+		传统的内存layout
+
+3) 在start_of_setup处理的最后，当前kenrel会建立一个real mode下使用的stack，实际
+就是setup.bin程序剩余部分代码使用的stack。然后跳转到main.c下的main函数中。
+
+说到了main函数，那就很明显为什么需要stack了。
+那该stack是在什么内存位置？
+
+下面的代码基本确定了stack的esp指向哪里。
+
+	movw	$_end, %dx
+	testb	$CAN_USE_HEAP, loadflags
+	jz	1f
+	movw	heap_end_ptr, %dx
+1:	addw	$STACK_SIZE, %dx
+
+
+也就是在_end + STACK_SIZE 或 heap_end_ptr + STACK_SIZE 的位置。因为stack在real mode下需要对齐4 bytes，
+因此最大不能大于 0xfffc了。
+
+也就是说，通常stack是在 kernel setup 之上 STACK_SIZE 左右的位置：）
+上面的图实际已经标识出来了。
+
+4） 最后一点（怎么还有最后！！！）,当前的 cs 是不等于 ds,ss等segment寄存器的。
+差值应该是 0x20。但是 在 0x90000 到0x90200之间还有好些boot后续需要使用的关键
+数据啊。为了处理的方便，将cs调整为跟ds,ss等一致，都是0x9000。这样效果就如同
+data section与 text section是同一个section了，访问时使用cs或ds都一样了。
+相关代码如下：
+
+	pushw	%ds
+	pushw	$6f
+	lretw
+
+个人感觉还有一个更加重要的原因：PIC(代码位置无关性）的需要。
+setup.bin中的符号值都是相对于setup.bin的加载地址的（参考setup.ld)。在real mode下，
+cs设置为setup.bin所加载的物理地址（对应上面的图，应该为0x9000或 X）,这样，
+当前 cs << 2 + 某个符号值 就是该符号的实际物理地址了。
+
+
+好，罗嗦半天，可以进入下一步了。
+
+
+2. C程序初始化硬件
+
+早期的kernel，初始化CPU的工作，大多都是以汇编完成，看着不是那么爽，开发维护也
+不是那么讨人喜。不知什么时候（我没有追溯内核的历史）开始，这些活给c函数来完成
+了！ 汇编只是前面那么一点点。
+
+具体这些c函数做了什么，我不分析了。较多硬件架构相关的东东，不能简单的一一说明。
+自己好好去琢磨吧。
+
+需要关心的是 如何从 setup.bin 转到另外一个程序 vmlinux 去运行。
+调用的关系如下：
+
+main ---> go_to_protected_mode ---> protected_mode_jump
+
+从 protected_mode_jump 开始，又转入了汇编。
+为什么？
+老实说，我不知道原因是什么。是因为需要较多的硬件操作？不知道其它大牛是否能给出更
+有说服力的解释。
+
+在这段汇编代码中，比较重要的是启动了保护模式。该模式enable(CR0.PE)后，寻址的方式发生了变化。
+不再是cs:ip了，而是段寻址模式。通过cs找到代码段的base address,结合 IP的偏移生成
+线性地址。在页模式没有启用(CR0.PG=0)的情况下，该地址就是物理地址了。
+
+请注意，在go_to_protected_mode --> setup_gdt 中会完成内核保护模式时会使用到的
+GDT entries的设定，也就是 text, data 等segment段空间的设置。
+
+最终，会跳转到 boot_params.hdr.code32_start 设定的位置执行。
+
+实际上，该位置是一个物理地址，是vmlinux的入口。
+参考 vmlinux.ld.S中的 ENTRY(startup_32)。
+
+在arch/x86/boot/compressed/head_64.S中的 startup_32.
+提请注意一点，esi中保存的是 boot_params 的地址，不知道是什么目的。
+
+此外，似乎 esp 在进入startup_32之前设置为 cs << 2了。也就是setup.bin所在的地址。
+
+
+二. vmlinux的运行
+
+在 arch/x86/boot/compressed 目录下会编译生成vmlinux程序。
+链接脚本是该目录下的 vmlinux.ld.S
+
+我们只跟踪分析 x86_64。对应 head_64.S
+
+
+1. 启动分页机制
+
+下面的代码比较重要。通过一个call 1f在esp堆栈中压入了 1f 对应的物理地址。
+我们在编译vmlinux时是以0为base的。因此$1b是popl	%ebp的相对偏移地址。因此最后sub
+得到vmlinux真实运行的加载物理地址，保存到%ebp中。
+
+	leal	(BP_scratch+4)(%esi), %esp
+	call	1f
+1:	popl	%ebp
+	subl	$1b, %ebp
+
+这里需要注意的是 设置 %esp为 (BP_scratch+4)(%esi) 而不是 BP_scratch(%esi)。因为
+堆栈是descending的，应该使用 esp - 4的低地址来压入数据。
+
+重设置 stack，使用定义在本文件中的bss段的高端地址作为stack。 这里需要注意如何
+取得 boot_stack_end的地址。因为 kernel 在保护模式下 cs是 segment descriptor,
+基地址为0，不再是实模式下由 boot-loader 设置好了正确的物理基地址（尽管boot-loader
+可能知道 vmlinux所加载的物理地址，但是一旦开始运行setup.bin，不能再设置cs等系统
+寄存器了，只能设置指向setup.bin的_start)。0 不等于 vmlinux
+实际被加载的物理地址，因此必须进行relocation处理。也就是add %ebp中的base addr.
+	movl	$boot_stack_end, %eax
+	addl	%ebp, %eax
+	movl	%eax, %esp
+
+	call	verify_cpu
+	testl	%eax, %eax
+	jnz	no_longmode
+对于x86_64,必须支持 longmode，否则跳转 no_longmode 产生 panic。 这里不详细分析
+verify_cpu，自行参考手册跟踪分析。
+
+
+这里的处理是为解压真正的内核做准备。真正的内核是作为vmlinux的 section
+".rodata..compressed"而存在的。具体可以参考编译过程中在 arch/x86/boot/compressed/
+piggy.S。
+
+运行vmlinux到一定阶段，需要将该section中的 压缩内核解压到内存。那么解压到哪里呢？
+下面的代码就是确定 解压到哪个物理地址。
+#ifdef CONFIG_RELOCATABLE
+	movl	%ebp, %ebx
+	movl	BP_kernel_alignment(%esi), %eax
+	decl	%eax
+	addl	%eax, %ebx
+	notl	%eax
+	andl	%eax, %ebx
+	cmpl	$LOAD_PHYSICAL_ADDR, %ebx
+	jge	1f
+#endif
+	movl	$LOAD_PHYSICAL_ADDR, %ebx
+1:
+
+	/* Target address to relocate to for decompression */
+	addl	$z_extract_offset, %ebx
+
+
+显然，解压出来的内核不能覆盖当前vmlinux。 因此在创建 vmlinux过程中，会通过 mkpiggy
+程序，生成一个zoffset.h的文件，记录了压缩内核的一些关键数据。上面使用到的
+z_extract_offset 就是在zoffset.h中定义的。
+查看mkpiggy.c的处理，可以看到 z_extract_offset 实际是容纳解压后的kernel所需要的
+空间。 目前linux x86内核为了解压，会先将 vmlinux 后移 z_extract_offset，也就是
+上面%ebx指向的地址。然后将压缩内核解压到 %ebx，也就是vmlinux的起始base 经过对齐
+处理后得到的地址。
+
+实际解压内核存放的物理位置不能小于 配置指定的 LOAD_PHYSICAL_ADDR。
+
+
+之后是重新lgdt,启用 PAE(CR4_PAE)。然后是初始化线性地址= 物理地址的 4G 内存空间对应
+的页表，总共需要6页，分别对应L4,L3,L2级（1+1+4页）。L2 中每个entry对应2M空间。
+
+需要注意的是，因为这些页表是解压后的内核会使用到 idmap 页表（不同于 identity mapping），
+因此都是使用%ebx作为 base address. 实际上，从startup_64 开始也会使用这里初始化好
+的页表。
+
+配置 IA32_EFER.LME，准备启动 IA-32e paging。
+	movl	$MSR_EFER, %ecx
+	rdmsr
+	btsl	$_EFER_LME, %eax
+	wrmsr
+
+
+
+对于LDT与 GDT的关系，手册中有：
+
+The segment that contains the LDT must have a segment descriptor in the GDT.
+When the LLDT instruction loads a segment selector in the LDTR:
+the base address, limit, and descriptor attributes from the LDT descriptor
+are automatically loaded in the LDTR.
+
+也就是每个LDT在 GDT中都有一个entry。
+
+下面的代码真正启动分页。
+这里的 __KERNEL_CS 定义在 arch/x86/include/asm/segment.h
+
+	pushl	$__KERNEL_CS
+	leal	startup_64(%ebp), %eax
+#ifdef CONFIG_EFI_MIXED
+	movl	efi32_config(%ebp), %ebx
+	cmp	$0, %ebx
+	jz	1f
+	leal	handover_entry(%ebp), %eax
+1:
+#endif
+	pushl	%eax
+
+	/* Enter paged protected Mode, activating Long Mode */
+	movl	$(X86_CR0_PG | X86_CR0_PE), %eax /* Enable Paging and Protected mode */
+	movl	%eax, %cr0
+
+	/* Jump from 32bit compatibility mode into 64bit mode. */
+	lret
+
+我们先不管 EFI，只是跟踪正常流程。为了跳转到 startup_64, 将ecs, eip都压入到堆栈，
+然后通过ret返回指令，由硬件将 ecs, eip弹出，实现了跳转。
+
+至此，CR0_PE也置为1了，启用了IA-32e的paging。
+
+
+2. 内核解压
+
+强调一点，PIC的代码能正确运行，前提是 设置 rcs:rip 或 ecs:eip指向正确的物理base
+address。之后就可以使用符号值（编译时生成的相对偏移值）来定位实际的符合物理地址了。
+
+对于x86_64,也就是long mode, 使用的是flat mode的内存模式。 segmentation 机制
+已经被取消。因此这里全置为 null而不会产生NP。
+	xorl	%eax, %eax
+	movl	%eax, %ds
+	movl	%eax, %es
+	movl	%eax, %ss
+	movl	%eax, %fs
+	movl	%eax, %gs
+
+在long mode下计算当前运行vmlinux的起始物理地址。因为 uefi 之类的boot-loader可能
+直接跳转到 startup_64运行而没有经过startup_32的处理，因此需要重新计算。但是这里
+的计算不同于 startup_32中的算法。
+这里直接使用%rip，而startup_32使用short call 的方式计算。个人觉得是x86_64 longmode
+时 rip中就已经是绝对（物理）地址，而在x86_32模式下，eip中是相对于 code segment的
+base的offset，不能使用leas  sym(%eip)的方式得到 symbol对应的地址。
+
+leaq startup_32(%rip), %rbp 反汇编后是  lea    -0x213(%rip),%rbp 
+编译器为了得到 startup_32的当前绝对地址，会将 startup_32 转换为相对于 %rip的偏移。
+但是如果 ()不是rip，将直接使用 符号值。 譬如 leaq boot_stack_end(%rbx), %rsp 反汇编
+后是 lea    0x55f580(%rbx),%rsp   
+0x55f580 就是 boot_stack_end 的符号值（编译时生成）。
+#ifdef CONFIG_RELOCATABLE
+	leaq	startup_32(%rip) /* - $startup_32 */, %rbp
+	movl	BP_kernel_alignment(%rsi), %eax
+	decl	%eax
+	addq	%rax, %rbp
+	notq	%rax
+	andq	%rax, %rbp
+	cmpq	$LOAD_PHYSICAL_ADDR, %rbp
+	jge	1f
+#endif
+	movq	$LOAD_PHYSICAL_ADDR, %rbp
+1:
+
+	/* Target address to relocate to for decompression */
+	leaq	z_extract_offset(%rbp), %rbx
+
+	/* Set up the stack */
+	leaq	boot_stack_end(%rbx), %rsp
+
+
+
+之前的处理，已经确定了vmlinux要搬移到哪里了，该地址保存在 %rbx中。
+
+此段代码是将vmlinux中从 bss开始到vmlinux的0地址之间的代码/数据，倒着move到
+_bss(%rbx)的新地址。
+
+	pushq	%rsi
+	leaq	(_bss-8)(%rip), %rsi
+	leaq	(_bss-8)(%rbx), %rdi
+	movq	$_bss /* - $startup_32 */, %rcx
+	shrq	$3, %rcx
+	std
+	rep	movsq
+	cld
+	popq	%rsi
+
+然后跳转到新的 relocated 处继续运行。
+
+	leaq	relocated(%rbx), %rax
+	jmp	*%rax
+
+之后的运行都是在新的地址进行的了。
+
+
+在relocated的处理中，会清空bss，会调整 _got表段。 暂时不理解为什么需要调整_got。
+
+	leaq	_got(%rip), %rdx
+	leaq	_egot(%rip), %rcx
+1:
+	cmpq	%rcx, %rdx
+	jae	2f
+	addq	%rbx, (%rdx)
+	addq	$8, %rdx
+	jmp	1b
+
+
+然后调用decompress_kernel 开始解压内核。 因为 decompress_kernel 对于x86_32是
+__attribute__((regparm(0))), 将使用stack传递参数。而x86_64 根据默认规则传递
+参数。对于整数 或 指针，应该是使用 regs传递。但是参数过多时，会使用 stack。具体
+参考 ABI。
+
+具体 decompress_kernel 的解压处理，涉及解压算法，不分析。
+我们只是关心如何使用内核 binary。
+
+简单描述一下 解压的处理：
+
+decompress_kernel -> decompress 
+
+那么decompress 在哪里定义。以 CONFIG_KERNEL_GZIP 为例，实际上 decompress 在
+decompress_inflate.c中定义了宏：
+#define decompress gunzip
+
+因此实际就是 gunzip。
+
+还有一个问题，decompress_inflate.c是如何编译到vmlinux的？
+在misc.c中直接include
+#ifdef CONFIG_KERNEL_GZIP
+#include "../../../../lib/decompress_inflate.c"
+#endif
+
+然后在 decompress_inflate.c中
+#include <linux/decompress/mm.h>
+
+在mm.h中定义了malloc 等static函数来管理 decompress_kernel传入的heap对应的缓冲。
+
+parse_elf 根据 elf program header中的physical address相对于 编译时默认的
+LOAD_PHYSICAL_ADDR的偏移，调整各个 program segments的实际物理地址。
+
+handle_relocations 为什么需要进行 relocation 的处理？ 说实在话，我还没有理解。
+关于此话题，可以参考以下mail:
+http://lists.openwall.net/linux-kernel/2014/10/13/509
+
+or
+
+https://lkml.org/lkml/2014/10/13/225
+
+
+
+
+decompress_kernel 返回 最终内核运行的起始物理地址。
+应该是指向 head_64.S(arch/x86/kernel下）的 startup_64。
+
+
+
+
+三.  head_64.S （arch/x86/kernel)
+
+此汇编没有仔细一一跟踪。 看了一下，主要是调整 early_level4_pgt 为起始的页表中的
+物理地址为正确的地址，不单纯靠 level3_kernel_pgt - __START_KERNEL_map 计算绝对
+的地址。
+
+此外还有 gdt, idt的初始化。比较关心的是 early_printk的实现机制，目前没有时间，
+先跳过。
+
+还有 MSR_GS_BASE 的处理，这个看来需要好好读manual，也先跳过去。
+
+最后 会通过 lretq 调用 x86_64_start_kernel。 注意 传给 x86_64_start_kernel 的
+参数是 movq	%rsi, %rdi 后由 %rdi 传递的。
+
+
+
+四. head64.c 
+
+
+在 pgtable_64_types.h  (arch/x86/include/asm）中，
+
+
+
+1. 关于fix address
+
+对于 x86_32, 有
+unsigned long __FIXADDR_TOP = 0xfffff000;
+
+对于x86_64,有
+
+可以参考 Documentation/x86/x86_64/mm.txt中VM 的分配
+#define VSYSCALL_ADDR (-10UL << 20)
+
+
+#ifdef CONFIG_X86_32
+/* used by vmalloc.c, vsyscall.lds.S.
+ *
+ * Leave one empty page between vmalloc'ed areas and
+ * the start of the fixmap.
+ */
+extern unsigned long __FIXADDR_TOP;
+#define FIXADDR_TOP	((unsigned long)__FIXADDR_TOP)
+#else
+#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+			 PAGE_SIZE)
+#endif
+
+
+#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&PAGE_MASK)) >> PAGE_SHIFT)
+
+
+
+2. 调用 start_kernel之前的处理
+
+在head_64.S中，我们看到 进入 head64.c之前，将 pgd base register设置指向了
+early_level4_pgt。但是 early_level4_pgt 这个L4 的pgd 页表中，只是设置了
+entry 511(针对 __START_KERNEL_map 为起始的 PUD)，并没有初始化 其后的L3,
+L2页表。 但是，在 x86_64_start_kernel 却又调用了诸如
+copy_bootdata(__va(real_mode_data)) 之类的函数来访问PAGE_OFFSET 起始的内核虚拟
+地址空间。没有建立对应的pg table entries，如何能访问内核虚拟空间？？
+
+奥妙在于 以下代码：
+
+	for (i = 0; i < NUM_EXCEPTION_VECTORS; i++)
+		set_intr_gate(i, early_idt_handlers[i]);
+	load_idt((const struct desc_ptr *)&idt_descr);
+
+这些代码将设置 前32 个系统异常对应的异常处理函数 early_idt_handlers[i].
+跟踪到 head_64.S，对于 page fault, 应该会调用 early_make_pgtable 来构建
+对应的 entyies。
+
+x86_32并没有采用此种方法。在head_32.S中，建立了 从 initial_page_table ->
+initial_pg_pmd 的两级页表，覆盖 内核所占据的内存空间范围，也就是从 0到 pa(_end) + MAPPING_BEYOND_END
+的范围。 这里需要注意的是 MAPPING_BEYOND_END ，该宏定义在 head_32.S中，实际上是
+对应 32位 OS的内核虚拟地址空间 对应页表所需要的 页表空间大小。
+
+这些页表 位于 __brk_base 与 __brk_limit 之间。
+
+	. = ALIGN(PAGE_SIZE);
+	.brk : AT(ADDR(.brk) - LOAD_OFFSET) {
+		__brk_base = .;
+		. += 64 * 1024;		/* 64k alignment slop space */
+		*(.brk_reservation)	/* areas brk users have reserved */
+		__brk_limit = .;
+	}
+
+	_end = .;
+
+.brk_reservation 通过 宏 RESERVE_BRK(pagetables, INIT_MAP_SIZE) 生成。
+
+从vmlinux.lds.S看来，_end 应该已经包含了所有的MAPPING_BEYOND_END页表， 理论上 不
+需要 在head_32.S中 循环创建 超出 pa(_end)的页表：
+
+	movl $pa(_end) + MAPPING_BEYOND_END + PTE_IDENT_ATTR, %ebp
+	cmpl %ebp,%eax
+	jb 10b
+
+待编译一个x86_32的vmlinux后，比较 _end 与 __brk_base 的差值就可以看到_end是否覆盖
+了 MAPPING_BEYOND_END页表。 也可以查看 PMD 的页表entries指向的 PTE页表基地址是否
+超出了_end范围内。如果是，那么就多映射了启动阶段不会使用的direct mapping页表 entries。
+
+因为 kernel image不会扩展到接近894MB（最大512M)，因此不会导致 _pa(_end) + 
+MAPPING_BEYOND_END 超过 最大的内核1:1内存空间。
+
+* x86_32 对于 PAGE_OFFSET 以上的虚拟地址空间对应的 direct mapping，采用了比较技巧
+性的处理，直接将 PAGE_OFFSET 对应的 pgd entry 指向 已经初始化好了页表的 pmd页，
+也就是initial_pg_pmd。
+
+* x86_64类似的在 early_level4_pgt 创建 0到 _end 这个内存区间的direct mapping。对于
+内核虚拟地址空间部分，也是采用类似方法。 将 early_level4_pgt 中的 entry 511 指向
+level3_kernel_pgt， 而在 level3_kernel_pgt 中 设置 entry 510指向level2_kernel_pgt，
+entry 511指向 level2_fixmap_pgt。从而建立了内核虚拟地址空间的mapping。
+
+* 因为 x86_64 的内核image 占据了 完全独立的VM空间（从 __START_KERNEL_map 开始），
+在初始化阶段的 direct mapping只是 完成了 该VM空间的映射。没有包括 PAGE_OFFSET开始
+的虚拟空间。一旦访问到这些空间，就会产生page fault。 具体可以参考
+early_make_pgtable 中的处理。
+
+！！！疑问
+为什么需要 独立的 __START_KERNEL_map。
+
+
+
+
+head64.c的最后调用 start_kernel。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

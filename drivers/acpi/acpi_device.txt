@@ -1,0 +1,174 @@
+You can refer to ACPI spec chater 6.
+
+
+in struct device, there is a field member named struct fwnode_handle
+*fwnode, where this field is set??
+
+
+
+for platform device,
+
+acpi_create_platform_device -> pdevinfo.fwnode = acpi_fwnode_handle(adev) ->
+platform_device_register_full
+
+will set struct device in struct platform_device :
+	pdev->dev.fwnode = pdevinfo->fwnode;
+
+You must remember that in struct acpi_device, struct fwnode_handle fwnode is
+not pointer!!!
+So, this field memeber is set in this chain:
+
+acpi_bus_scan_fixed -> acpi_add_single_object -> acpi_init_device_object
+
+or
+
+acpi_bus_scan -> acpi_bus_check_add
+
+
+
+    set_primary_fwnode ->
+
+    set_secondary_fwnode
+
+
+1. How to match the device
+
+
+acpi_init_device_object -> acpi_set_pnp_ids(handle, &device->pnp, type)
+
+
+
+2. How to define the resources
+
+
+acpi_create_platform_device -> acpi_dev_get_resources(adev, &resource_list,
+	NULL, NULL) -> acpi_walk_resources(adev->handle, METHOD_NAME__CRS,..)
+	->
+
+
+the resource from acpi device object will be represented as struct
+resource_entry. Then copy as struct resource variable or array.
+Those resources will be pointed by pdevinfo.res of struct platform_device_info
+pdevinfo.
+
+At the same time, the fwnode will be set as:
+pdevinfo.fwnode = acpi_fwnode_handle(adev);
+
+At last, will call :
+platform_device_register_full(&pdevinfo)
+
+this function will allocate the struct platform_device and initialized with
+the information of pdevinfo.
+
+
+
+2.1 _PRS for pnp device
+
+fs_initcall(pnpacpi_init) -> acpi_get_devices(NULL,
+	pnpacpi_add_device_handler, NULL, NULL) ->
+pnpacpi_add_device_handler -> pnpacpi_add_device ->
+pnpacpi_parse_resource_option_data(dev) -> acpi_walk_resources(handle,
+		METHOD_NAME__PRS, pnpacpi_option_resource, &parse_data)
+
+for pnp device, will check the acpi_device is pnp device in
+acpi_is_pnp_device:
+	return adev->handler == &acpi_pnp_handler || is_cmos_rtc_device(adev)
+
+    acpi_bus_attach -> acpi_scan_attach_handler will set the struct
+    acpi_scan_handler *handler of struct acpi_device.
+
+
+======================================
+
+
+1. Scan ACPI
+
+acpi_scan_init -> acpi_bus_scan(ACPI_ROOT_OBJECT) -> 
+
+1.1 acpi_bus_check_add(handle, 0, NULL, &device)
+
+	firstly, will process the acpi_gbl_root_node.
+	If the first node is succeed in the processing, then
+
+	acpi_walk_namespace(ACPI_TYPE_ANY, handle, ACPI_UINT32_MAX,
+		    acpi_bus_check_add, NULL,
+		    NULL, &device)
+
+This will traverse whole namespace to call acpi_bus_check_add
+
+
+So, the core is acpi_bus_check_add.
+
+1) acpi_add_single_object(&device, handle, type, sta)
+
+	this function will allocate a struct acpi_device variable and
+	initialse it with the data from ACPI table or objects.
+
+acpi_init_device_object(device, handle, type, sta)
+	will call acpi_set_pnp_ids(handle, &device->pnp, type) to setup the
+	struct acpi_device_pnp.
+	And also set the device->parent, initialise the device->fwnode.type.
+
+After these, will call acpi_device_add(device, acpi_device_release) ->
+device_add(&device->dev) will register this acpi_device. Please note that, the
+bus_type for acpi device is :
+
+device->dev.bus = &acpi_bus_type;
+
+It means all the acpi devices are linked to acpi_bus_type.
+
+2) acpi_device_dep_initialize(device)
+
+This function is meaningful for device dependency.
+It is from the "_DEP" object.
+All the struct acpi_dep_data nodes are linked to acpi_dep_list.
+
+This list is used by :
+
+acpi_walk_dep_device_list
+
+
+1.2 acpi_bus_attach(struct acpi_device *device)
+
+The struct acpi_scan_handler *handler of struct apci_device is set in :
+	acpi_scan_attach_handler(device)
+
+The core processing is :
+
+	if (!ret && device->pnp.type.platform_id)
+		acpi_default_enumeration(device);
+This will call :
+
+	if (!is_spi_i2c_slave)
+		acpi_create_platform_device(device);
+
+to create platform device.
+
+The last is scan the children devices:
+
+	list_for_each_entry(child, &device->children, node)
+			acpi_bus_attach(child);
+
+Please note that the device->children had been built in acpi_bus_check_add
+
+
+SO,  the acpi_bus_scan will create the platform_device for all qulified
+acpi_device.
+
+
+
+
+
+
+2. How to run control method
+
+
+acpi_ut_evaluate_object -> acpi_ns_evaluate -> acpi_ps_execute_method ->
+acpi_ps_parse_aml -> acpi_ps_parse_loop
+
+or
+
+acpi_ds_call_control_method
+
+
+

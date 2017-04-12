@@ -1,0 +1,79 @@
+1. src tree下的Makefile
+
+all: vmlinux
+
+经过 include $(srctree)/arch/$(SRCARCH)/Makefile
+后，一般情况下，arch的Makefile会定义自己的all，缺省 target 规则。
+
+以x86下的Makefile为例，在Makefile中有
+
+all: bzImage
+
+
+2. 几个 vmlinux文件的说明
+
+对于x86来说,
+        arch/x86/boot下的Makefile会生成多个binaries，这些binaries是怎么生成的，
+区别是什么？
+
+$(obj)/bzImage: $(obj)/setup.bin $(obj)/vmlinux.bin $(obj)/tools/build FORCE
+        $(call if_changed,image)
+可见，最终生成的 bzImage是 由arch/x86/boot下的 setup.bin, vmlinux.bin通过
+arch/x86/boot/tools/build生成，如下：
+cmd_image = $(obj)/tools/build $(obj)/setup.bin $(obj)/vmlinux.bin \
+                        $(obj)/zoffset.h $@
+
+那么下面的问题就是 setup.bin, vmlinux.bin的规则是怎样的？
+
+
+OBJCOPYFLAGS_vmlinux.bin := -O binary -R .note -R .comment -S
+$(obj)/vmlinux.bin: $(obj)/compressed/vmlinux FORCE
+        $(call if_changed,objcopy)
+
+$(obj)/setup.elf: $(src)/setup.ld $(SETUP_OBJS) FORCE
+        $(call if_changed,ld)
+
+SETUP_OBJS = $(addprefix $(obj)/,$(setup-y))
+
+OBJCOPYFLAGS_setup.bin  := -O binary
+$(obj)/setup.bin: $(obj)/setup.elf FORCE
+        $(call if_changed,objcopy)
+
+
+剩下的就是 compressed/vmlinux如何生成。在 arch/x86/boot/Makefile中，有规则：
+$(obj)/compressed/vmlinux: FORCE
+        $(Q)$(MAKE) $(build)=$(obj)/compressed $@
+
+因此是由 compressed目录下的Makefile决定。
+
+
+----------------------------
+实际上，compressed/vmlinux 并不是一个压缩文件，规则如下：
+$(obj)/vmlinux: $(vmlinux-objs-y) FORCE
+        $(call if_changed,ld)
+
+其中 vmlinux-objs-y 包含了 $(obj)/piggy.o，此 object依赖于
+$(obj)/piggy.S: $(obj)/vmlinux.bin.$(suffix-y) $(obj)/mkpiggy FORCE
+        $(call if_changed,mkpiggy)
+
+因此将生成 vmlinux.bin.gzip之类的压缩文件。规则如下：
+OBJCOPYFLAGS_vmlinux.bin :=  -R .comment -S
+$(obj)/vmlinux.bin: vmlinux FORCE
+        $(call if_changed,objcopy)
+这里的vmlinux应该是真正的内核binary，一般在src tree根下生成。
+
+vmlinux.bin.all-y := $(obj)/vmlinux.bin
+vmlinux.bin.all-$(CONFIG_X86_NEED_RELOCS) += $(obj)/vmlinux.relocs
+$(obj)/vmlinux.bin.gz: $(vmlinux.bin.all-y) FORCE
+        $(call if_changed,gzip)
+
+$(obj)/piggy.o 是一个普通的object，由 piggy.S
+经过as(汇编器）后生成。表面上看，piggy.S是一个汇编文件，size应该小。但是实际上此文件不是一个传统的.S文件。查看编译后生成的
+                piggy.S，看到该文件定义了一个.rodata..compressed的section，以及
+系列symbols。最后的.incbin
+                "arch/x86/boot/compressed/vmlinux.bin.gz"才是关键。这里的directive就是将之前生成的vmlinux.bin.gz
+                作为piggy.S的数据而编译到bzImage中。
+
+
+
+

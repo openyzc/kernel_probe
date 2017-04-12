@@ -1,0 +1,195 @@
+
+1. MODVERDIR 在Makefile中定义
+export MODVERDIR := $(if $(KBUILD_EXTMOD),$(firstword $(KBUILD_EXTMOD))/).tmp_versions
+如果KBUILD_EXTMOD没有定义，那么MODVERDIR是.tmp_versions，在目录树根目录下。
+
+2. MODVERDIR目录下的*.mod如何生成
+在 scripts/Makefile.build下，有规则:
+$(multi-used-m): FORCE
+        $(call if_changed,link_multi-m)
+        @{ echo $(@:.o=.ko); echo $(link_multi_deps); \
+           $(cmd_undef_syms); } > $(MODVERDIR)/$(@F:.o=.mod)
+$(call multi_depend, $(multi-used-m), .o, -objs -y -m)
+
+
+此规则的target是multi-used-m,来自Makefile.lib中处理obj-m的结果:
+multi-used-m := $(sort $(foreach m,$(obj-m), $(if $(strip $($(m:.o=-objs))
+$($(m:.o=-y)) $($(m:.o=-m))), $(m))))
+
+譬如以下的 Make 语句：
+ifneq ($(KERNELRELEASE),)
+	obj-m := lpc_bt.o
+	lpc_bt-y := lpc_ipmi.o lpc_bt_sm.o
+else
+
+经过 Makefile.lib的处理后，有
+obj-m := lpc_bt.o
+multi-used-m := lpc_ipmi.o lpc_bt_sm.o
+实际expand过程中，会产生:
+lpc_bt.o被替换为 lpc_bt-y，
+lpc_bt-y 最终被expand 为 lpc_ipmi.o lpc_bt_sm.o
+
+
+在Makefile.build中, multi-used-m实际是composite module依赖的objects list
+link_multi_deps =                     \
+$(filter $(addprefix $(obj)/,         \
+$($(subst $(obj)/,,$(@:.o=-objs)))    \
+$($(subst $(obj)/,,$(@:.o=-y)))), $^)
+
+
+$^来自以下调用产生
+$(call multi_depend, $(multi-used-m), .o, -objs -y)
+
+而在 scripts/Makefile.lib中定义了multi_depend
+
+define multi_depend
+$(foreach m, $(notdir $1), \
+        $(eval $(obj)/$m: \
+        $(addprefix $(obj)/, $(foreach s, $3, $($(m:%$(strip
+						$2)=%$(s)))))))
+endef
+也就是 foreach 遍历$(multi-used-m),将后缀.o替换为-objs 或
+-y，-m; 然后expand新的变量，也就是该组合module所依赖的所有objects
+经过multi_depend后，将生成编译某个composite module的依赖规则。
+
+最后结合以下两条规则：
+
+$(multi-used-y): FORCE
+	$(call if_changed,link_multi-y)
+         @{ echo $(@:.o=.ko); echo $(link_multi_deps); } > $(MODVERDIR)/$(@F:.o=.mod)
+
+$(multi-used-m): FORCE
+        $(call if_changed,link_multi-m)
+        @{ echo $(@:.o=.ko); echo $(link_multi_deps); \
+           $(cmd_undef_syms); } > $(MODVERDIR)/$(@F:.o=.mod)
+
+这里的{}复合shell语句将生成一个$(MODVERDIR)目录下的.mod文件。 包含
+ko目标文件, 以及生成此复合目标文件的依赖objfiles。
+可以参考 oprofile.mod
+
+一旦multi-used-m中任何成员发生需要remake的更新，$(call if_changed, link_multi-m)
+会触发cmd_link_multi-m = $(cmd_link_multi-link)，从而
+
+cmd_link_multi-link = $(LD) $(ld_flags) -r -o $@ $(link_multi_deps)
+$(cmd_secanalysis)
+
+会完成 LD的处理。
+
+
+至于 从 c到.o 的编译规则，也是在 scripts/Makefile.build 中：
+$(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
+        $(call cmd,force_checksrc)
+        $(call if_changed_rule,cc_o_c)
+
+这里需要补充if_changed_rule中的使用到的 arg-check（参见Kbuild.include）
+该处理实际上是比较保存的当前target的.cmd文件中的cmd_$@规则(recipe)是否与当前定义的recipe是否一致。如果不一致，返回非empty。
+某个target的.cmd文件在source所在的路径下，如
+./arch/x86/oprofile/.backtrace.o.cmd
+
+
+
+single-used-m
+
+不同于 single-used-m的如下规则:
+
+$(single-used-m): $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
+        $(call cmd,force_checksrc)
+        $(call if_changed_rule,cc_o_c)
+        @{ echo $(@:.o=.ko); echo $@; } > $(MODVERDIR)/$(@F:.o=.mod)
+也就是对于single object生成的module，其.mod只要将object
+file的后缀.o改为.ko就可以作为最终的目标module名了。
+可以参考 ip_tables.mod
+
+
+3. modules编译相关
+
+可以参考 Documents/kbuilds/modules.txt
+
+1) obj-m 定义了module由哪些object files生成
+
+2) modorder
+在makefile.lib中，有
+modorder        := $(patsubst %/,%/modules.order, $(filter %/, $(obj-y)) $(obj-m:.o=.ko))
+这里的modorder
+将表示obj-y所包含的目录成员下的modules.order，obj-m下的.o将直接替换为.ko后不作改动而赋值给modorder。
+
+modorder        := $(addprefix $(obj)/,$(modorder))
+最后还会prefix当前目录。
+
+实际上，这里的modorder只是找寻到 当前路径下obj-y指定的下游目录，以及
+obj-m中定义的.o
+(!!!注意，这里的modules.order 与 modules.builtin
+ 的格式一样，但是包含的ko是不同的。这里的ko来自于
+ obj-m指定的，而modules.builtin应该是 来自 obj-Y，也就是配置为 Y的tristate
+ 配置项obj-(CONFIG_XXXXX)）
+
+最终，通过Makefile.build中的
+modorder-cmds =                                         \
+        $(foreach m, $(modorder),                       \
+                $(if $(filter %/modules.order, $m),     \
+                        cat $m;, echo kernel/$m;))
+
+$(modorder-target): $(subdir-ym) FORCE
+        $(Q)(cat /dev/null; $(modorder-cmds)) > $@
+
+具体modules.order的内容可以参考arch/x86/kernel/modules.order.
+诸如： kernel/arch/x86/kernel/msr.ko （前面都添加了 kernel/）
+
+在arch/x86/kernel/Makefile中定义了cpu/,	acpi/,apic/等下游目录，如果
+这些目录下的obj-m有模块定义，那么就会生成非empty的modules.order
+
+
+-------------基本的处理过程---------------
+
+1） modbuiltin 的生成
+scripts/Makefile.modbuiltin 是编译生成 %/modules.builtin的 Makefile。
+
+include/config/tristate.conf 是由 confdata.c生成的，包含tristate
+且配置值非N的config items。
+
+实际各个层次目录下的 modules.builtin 是通过以下rules生成的。
+
+modbuiltin-subdirs := $(patsubst %,%/modules.builtin, $(subdir-ym))
+modbuiltin-mods    := $(filter %.ko, $(obj-Y:.o=.ko))
+modbuiltin-target  := $(obj)/modules.builtin
+
+$(modbuiltin-target): $(subdir-ym) FORCE
+        $(Q)(for m in $(modbuiltin-mods); do echo kernel/$$m; done;     \
+	cat /dev/null $(modbuiltin-subdirs)) > $@
+
+因为 subdir-ym 依赖于 modbuiltin-target，所以会先完成下游目录的
+modules.builtin的生成，最后才生成当前目录的 modules.builtin
+
+经过查看 System.map下的符号信息（nm命令能看到关于符号类型的描述），属于
+arch/x86/kernel/cpu/mcheck/mce-inject.ko 的函数因为该ko是基于
+obj-m生成的，属于modules.order中，不是builtin，不能查到。 而
+arch/x86/crypto/crc32c-intel.ko
+在CONFIG_CRYPTO_CRC32C_INTEL=y的配置下，出现在 modules.builtin中，对应的
+crc32c-intel_glue.c 中的函数在System.map中能查看到。
+
+
+实际上，ko所依赖的.o都是在 vmlinux-dirs
+的编译过程中就生成了。这是ko生成的第一步。第二步在 ./Makefile下的规则完成：
+
+modules: $(vmlinux-dirs) $(if $(KBUILD_BUILTIN),vmlinux) modules.builtin
+        $(Q)$(AWK) '!x[$$0]++' $(vmlinux-dirs:%=$(objtree)/%/modules.order)  > $(objtree)/modules.order
+        @$(kecho) '  Building modules, stage 2.';
+        $(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modpost
+
+开始第二步.
+
+
+
+1) 需要掌握 scripts/mod/modpost 的使用
+
+在没有定义 KBUILD_EXTMOD， 也就是不进行 external
+modules编译时，将输出所有符号到 kernelsymfile， 实际上是通过 modpost 中的
+$(if $(KBUILD_EXTMOD),-i,-o) $(kernelsymfile)实现的。可以参考
+scripts/Makefile.modpost
+
+还需要注意的是，.mod.c也是由 modpost 生成的，用于支持 CONFIG_MODVERSIONS
+（参考 scripts/Makefile.built)
+
+
+
+

@@ -1,0 +1,222 @@
+
+Please check this kernel bootline:
+
+earlycon=uart8250,mmio32,0x80300000
+
+We can find in D02&D03, the kernel bootline must contain this parameters.
+We will trace why this is needed.
+
+
+you can find the description in:
+Documentation/kernel-parameters.txt:1007
+
+
+1. how to process this kernel parameter
+
+
+1.1 how to define
+
+
+in include/asm-generic/init.h :
+
+#define __setup_param(str, unique_id, fn, early)			\
+	static const char __setup_str_##unique_id[] __initconst		\
+		__aligned(1) = str; 					\
+	static struct obs_kernel_param __setup_##unique_id		\
+		__used __section(.init.setup)				\
+		__attribute__((aligned((sizeof(long)))))		\
+		= { __setup_str_##unique_id, fn, early }
+
+#define early_param(str, fn)			\
+	__setup_param(str, fn, fn, 1)
+
+
+This early_param will be used in for console or earlycon:
+drivers/tty/serial/earlycon.c
+
+early_param("earlycon", param_setup_earlycon);
+
+so the calling chain is:
+
+param_setup_earlycon -> setup_earlycon(buf) -> register_earlycon(buf, match)
+	->parse_options(&early_console_dev, buf)
+and	->match->setup(&early_console_dev, buf)
+
+
+you can find that the earlycon parameter will be devided into two segments by
+','. The front is the con device name, the later is the con options.
+
+start_kernel -> parse_early_param -> parse_early_options(tmp_cmdline) ->
+parse_args("early options", cmdline, NULL, 0, 0, 0, NULL, do_early_param) ->
+	parse_one ->do_early_param -> p->setup_func(val)
+	->param_setup_earlycon -> setup_earlycon
+
+Please note parse_one is using the input parameter of num as 0, it will lead
+to do_early_param will be called directly without comparing the kernel_param
+level. This is special only for 'console' and 'earlycon' parameters.
+BTW, the val parameter to p->setup_func points to the substring after
+'earlycon='.
+
+As the option part, will be processed by :
+
+setup_earlycon -> register_earlycon -> parse_options(&early_console_dev, buf)
+
+this will initialize the struct uart_port field of struct earlycon_device.
+this struct will be used by match->setup of struct earlycon_id *match.
+
+This struct earlycon_id member is defined in __section(__earlycon_table).
+
+the macro of EARLYCON_DECLARE will defined those section variables.
+
+in include/linux/serial_core.h :
+
+#define EARLYCON_DECLARE(_name, fn)	OF_EARLYCON_DECLARE(_name, "", fn)
+
+
+The actual call is found in :
+
+drivers/tty/serial/8250/8250_early.c
+
+EARLYCON_DECLARE(uart8250, early_serial8250_setup);
+
+This is for earlycon whose name "uart8250".
+
+
+1.2 the option parsing
+
+the entry function is parse_options(struct earlycon_device *device, char
+		*options) in drivers/tty/serial/8250/8250_early.c
+
+parse_options(&early_console_dev, buf)
+
+you can refer to this helper doc :
+
+Documentation/kernel-parameters.txt
+
+for 'console=' and 'earlycon='
+
+the options after uart[8250],io,<addr>, are something like :
+
+ttyS<n>[,options]
+ttyUSB0[,options]
+Use the specified serial port.  The options are of
+the form "bbbbpnf", where "bbbb" is the baud rate,
+"p" is parity ("n", "o", or "e"), "n" is number of
+bits, and "f" is flow control ("r" for RTS or
+omit it).  Default is "9600n8".
+
+Those options are used in 'console='
+
+
+2 earlycon initialization
+
+2.1 register earlycon
+
+
+when processing 'earlycon' parameter, will call this chain:
+
+param_setup_earlycon -> setup_earlycon(buf) -> register_earlycon(buf, match)
+
+here, match points to one struct variable defined by EARLYCON_DECLARE, such as
+EARLYCON_DECLARE(uart8250, early_serial8250_setup).
+
+in register_earlycon, will call this hook :
+err = match->setup(&early_console_dev, buf);
+
+ok, early_serial8250_setup in EARLYCON_DECLARE(uart8250,
+		early_serial8250_setup) will be invoked in the end.
+
+
+After match->setup, register_console will be called as the last step.
+
+
+2.2 The first call of  register_console
+
+in register_earlycon,
+register_console(early_console_dev.con)
+
+for earlycon, this function only add early_console_dev.con into
+console_drivers. And the buffered messages will be dumped too.
+
+
+
+2.3
+
+in drivers/tty/serial/8250/8250_core.c :
+serial8250_init(void)
+
+
+This function is defined as :
+
+module_init(serial8250_init);
+
+in include/linux/module.h :
+#define module_init(x)	__initcall(x);
+
+in include/linux/init.h :
+#define device_initcall(fn)		__define_initcall(fn, 6)
+#define __initcall(fn) device_initcall(fn)
+
+So, this function will be called during the initial phrase 6.
+
+
+if MODULE is defined, module_init(x) is different.
+You can find these in Makefile:
+
+KBUILD_AFLAGS_MODULE  := -DMODULE
+KBUILD_CFLAGS_MODULE  := -DMODULE
+
+You can find KBUILD_CFLAGS_MODULE is used in scripts/Makefile.modpost and
+scripts/Makefile.build ;
+
+I think scripts/Makefile.build is more important.
+For module build, modkern_cflags will define with $(KBUILD_CFLAGS_MODULE)
+	$(CFLAGS_MODULE)
+
+
+
+
+
+3. console parameter processing
+
+
+in kernel/printk/printk.c :
+
+__setup("console=", console_setup);
+
+
+you can find this __setup is defined in:
+
+include/linux/init.h
+
+#define __setup(str, fn)						\
+		__setup_param(str, fn, fn, 0)
+
+The parameter level is 0
+
+For this level parameters, if the paramter name is not "console", it will not
+processed in parse_early_param -> parse_early_options -> do_early_param
+since this condition expression:
+
+if ((p->early && parameq(param, p->str)) ||
+		(strcmp(param, "console") == 0 &&
+		 strcmp(p->str, "earlycon") == 0)
+   )
+
+Here, param is the parameter name whithout the '='
+This condition will guarrantee the 'earlycon=' kernel parameters will be
+processed here.
+
+But for this:
+
+__setup("console=", console_setup);
+
+will be processed in this chain:
+
+do_initcalls -> do_initcall_level -> parse_args
+
+when doing init level 0 processing.
+
+It should be later than parse_early_param!
+
+

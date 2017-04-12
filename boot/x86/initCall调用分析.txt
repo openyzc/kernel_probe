@@ -1,0 +1,119 @@
+
+在 vmlinux.lds.h 中有以下定义：
+
+#define INIT_CALLS_LEVEL(level)						\
+		VMLINUX_SYMBOL(__initcall##level##_start) = .;		\
+		*(.initcall##level##.init)				\
+		*(.initcall##level##s.init)				\
+
+#define INIT_CALLS							\
+		VMLINUX_SYMBOL(__initcall_start) = .;			\
+		*(.initcallearly.init)					\
+		INIT_CALLS_LEVEL(0)					\
+		INIT_CALLS_LEVEL(1)					\
+		INIT_CALLS_LEVEL(2)					\
+		INIT_CALLS_LEVEL(3)					\
+		INIT_CALLS_LEVEL(4)					\
+		INIT_CALLS_LEVEL(5)					\
+		INIT_CALLS_LEVEL(rootfs)				\
+		INIT_CALLS_LEVEL(6)					\
+		INIT_CALLS_LEVEL(7)					\
+		VMLINUX_SYMBOL(__initcall_end) = .;
+
+
+
+可见，系统定义了 
+__initcall_start,
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+
+这些标志在 main.c 中有：
+
+static initcall_t *initcall_levels[] __initdata = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+
+以下 initcall_levels[], __initcall_start 在两个函数中使用：
+
+static void __init do_pre_smp_initcalls(void)
+{
+	initcall_t *fn;
+
+	for (fn = __initcall_start; fn < __initcall0_start; fn++)
+		do_one_initcall(*fn);
+}
+
+然后是
+
+do_basic_setup -> do_initcalls -> do_initcall_level 
+
+static void __init do_initcall_level(int level)
+{
+	initcall_t *fn;
+
+	strcpy(initcall_command_line, saved_command_line);
+	parse_args(initcall_level_names[level],
+		   initcall_command_line, __start___param,
+		   __stop___param - __start___param,
+		   level, level,
+		   &repair_env_string);
+
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(*fn);
+}
+
+因此, __initcall_start 是最早执行的，然后是 __initcall0_start， 介于相邻 __initcall?_start
+之间的所有 *fn都会被依次执行。
+
+
+因此 rootfs_initcall(populate_rootfs) 是在 vfs_caches_init(totalram_pages)之后，
+且 smp_init完成后才执行的。
+
+
+而在init.h 中有以下 init sections的定义：
+
+
+#define pure_initcall(fn)		__define_initcall(fn, 0)
+
+#define core_initcall(fn)		__define_initcall(fn, 1)
+#define core_initcall_sync(fn)		__define_initcall(fn, 1s)
+#define postcore_initcall(fn)		__define_initcall(fn, 2)
+#define postcore_initcall_sync(fn)	__define_initcall(fn, 2s)
+#define arch_initcall(fn)		__define_initcall(fn, 3)
+#define arch_initcall_sync(fn)		__define_initcall(fn, 3s)
+#define subsys_initcall(fn)		__define_initcall(fn, 4)
+#define subsys_initcall_sync(fn)	__define_initcall(fn, 4s)
+#define fs_initcall(fn)			__define_initcall(fn, 5)
+#define fs_initcall_sync(fn)		__define_initcall(fn, 5s)
+#define rootfs_initcall(fn)		__define_initcall(fn, rootfs)
+#define device_initcall(fn)		__define_initcall(fn, 6)
+#define device_initcall_sync(fn)	__define_initcall(fn, 6s)
+#define late_initcall(fn)		__define_initcall(fn, 7)
+#define late_initcall_sync(fn)		__define_initcall(fn, 7s)
+
+
+
+
+
+
+
+
+
+
+

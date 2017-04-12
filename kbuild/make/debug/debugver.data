@@ -1,0 +1,614 @@
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `Makefile'...
+Reading makefile `vars.mk'...
+Updating goal targets....
+Considering target file `scripts_basic'.
+ File `scripts_basic' does not exist.
+  Considering target file `sub-make'.
+   File `sub-make' does not exist.
+    Considering target file `FORCE'.
+     File `FORCE' does not exist.
+     Finished prerequisites of target file `FORCE'.
+    Must remake target `FORCE'.
+    Successfully remade target file `FORCE'.
+   Finished prerequisites of target file `sub-make'.
+  Must remake target `sub-make'.
+make -C /home/yuan_zc/linaro/work_dir/linux_master_L/build_out KBUILD_SRC=/home/yuan_zc/linaro/work_dir/linux_master_L \
+	-f /home/yuan_zc/linaro/work_dir/linux_master_L/Makefile scripts_basic d-build
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `/home/yuan_zc/linaro/work_dir/linux_master_L/Makefile'...
+Reading makefile `../scripts/Kbuild.include' (search path) (no ~ expansion)...
+Reading makefile `include/config/auto.conf' (search path) (don't care) (no ~ expansion)...
+Reading makefile `include/config/auto.conf.cmd' (search path) (don't care) (no ~ expansion)...
+Reading makefile `../arch/arm64/Makefile' (search path) (no ~ expansion)...
+Reading makefile `../scripts/Makefile.extrawarn' (search path) (no ~ expansion)...
+make[1]: Entering directory `/home/yuan_zc/linaro/work_dir/linux_master_L/build_out'
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `../Makefile'...
+Reading makefile `../scripts/Kbuild.include' (search path) (no ~ expansion)...
+Reading makefile `../arch/arm64/Makefile' (search path) (no ~ expansion)...
+Updating goal targets....
+Considering target file `silentoldconfig'.
+ File `silentoldconfig' does not exist.
+  Considering target file `scripts_basic'.
+   File `scripts_basic' does not exist.
+   Finished prerequisites of target file `scripts_basic'.
+  Must remake target `scripts_basic'.
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `../scripts/Makefile.build'...
+Reading makefile `include/config/auto.conf' (search path) (don't care) (no ~ expansion)...
+Reading makefile `scripts/Kbuild.include' (search path) (no ~ expansion)...
+Reading makefile `../scripts/basic/Makefile' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.lib' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.host' (search path) (no ~ expansion)...
+Updating goal targets....
+Considering target file `__build'.
+ File `__build' does not exist.
+  Considering target file `scripts/basic/fixdep'.
+   File `scripts/basic/fixdep' does not exist.
+    Considering target file `scripts/basic/fixdep.c'.
+     Finished prerequisites of target file `scripts/basic/fixdep.c'.
+    No need to remake target `scripts/basic/fixdep.c'; using VPATH name `../scripts/basic/fixdep.c'.
+    Considering target file `FORCE'.
+     File `FORCE' does not exist.
+     Finished prerequisites of target file `FORCE'.
+    Must remake target `FORCE'.
+    Successfully remade target file `FORCE'.
+   Finished prerequisites of target file `scripts/basic/fixdep'.
+  Must remake target `scripts/basic/fixdep'.
+  HOSTCC  scripts/basic/fixdep
+  Successfully remade target file `scripts/basic/fixdep'.
+ Finished prerequisites of target file `__build'.
+Must remake target `__build'.
+Successfully remade target file `__build'.
+  Successfully remade target file `scripts_basic'.
+  Considering target file `outputmakefile'.
+   File `outputmakefile' does not exist.
+   Finished prerequisites of target file `outputmakefile'.
+  Must remake target `outputmakefile'.
+  GEN     ./Makefile
+  Successfully remade target file `outputmakefile'.
+  Considering target file `FORCE'.
+   File `FORCE' does not exist.
+   Finished prerequisites of target file `FORCE'.
+  Must remake target `FORCE'.
+  Successfully remade target file `FORCE'.
+ Finished prerequisites of target file `silentoldconfig'.
+Must remake target `silentoldconfig'.
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `../scripts/Makefile.build'...
+Reading makefile `include/config/auto.conf' (search path) (don't care) (no ~ expansion)...
+Reading makefile `scripts/Kbuild.include' (search path) (no ~ expansion)...
+Reading makefile `../scripts/kconfig/Makefile' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.lib' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.host' (search path) (no ~ expansion)...
+Updating goal targets....
+Considering target file `silentoldconfig'.
+ File `silentoldconfig' does not exist.
+  Considering target file `scripts/kconfig/conf'.
+   File `scripts/kconfig/conf' does not exist.
+    Considering target file `FORCE'.
+     File `FORCE' does not exist.
+     Finished prerequisites of target file `FORCE'.
+    Must remake target `FORCE'.
+    Successfully remade target file `FORCE'.
+    Considering target file `scripts/kconfig/conf.o'.
+     File `scripts/kconfig/conf.o' does not exist.
+      Considering target file `scripts/kconfig/conf.c'.
+       Finished prerequisites of target file `scripts/kconfig/conf.c'.
+      No need to remake target `scripts/kconfig/conf.c'; using VPATH name `../scripts/kconfig/conf.c'.
+      Pruning file `FORCE'.
+     Finished prerequisites of target file `scripts/kconfig/conf.o'.
+    Must remake target `scripts/kconfig/conf.o'.
+  HOSTCC  scripts/kconfig/conf.o
+    Successfully remade target file `scripts/kconfig/conf.o'.
+    Considering target file `scripts/kconfig/zconf.tab.o'.
+     File `scripts/kconfig/zconf.tab.o' does not exist.
+      Considering target file `scripts/kconfig/zconf.tab.c'.
+       File `scripts/kconfig/zconf.tab.c' does not exist.
+        Considering target file `scripts/kconfig/zconf.tab.c_shipped'.
+         Finished prerequisites of target file `scripts/kconfig/zconf.tab.c_shipped'.
+        No need to remake target `scripts/kconfig/zconf.tab.c_shipped'; using VPATH name `../scripts/kconfig/zconf.tab.c_shipped'.
+       Finished prerequisites of target file `scripts/kconfig/zconf.tab.c'.
+      Must remake target `scripts/kconfig/zconf.tab.c'.
+  SHIPPED scripts/kconfig/zconf.tab.c
+      Successfully remade target file `scripts/kconfig/zconf.tab.c'.
+      Pruning file `FORCE'.
+      Considering target file `scripts/kconfig/zconf.lex.c'.
+       File `scripts/kconfig/zconf.lex.c' does not exist.
+        Considering target file `scripts/kconfig/zconf.lex.c_shipped'.
+         Finished prerequisites of target file `scripts/kconfig/zconf.lex.c_shipped'.
+        No need to remake target `scripts/kconfig/zconf.lex.c_shipped'; using VPATH name `../scripts/kconfig/zconf.lex.c_shipped'.
+       Finished prerequisites of target file `scripts/kconfig/zconf.lex.c'.
+      Must remake target `scripts/kconfig/zconf.lex.c'.
+  SHIPPED scripts/kconfig/zconf.lex.c
+      Successfully remade target file `scripts/kconfig/zconf.lex.c'.
+      Considering target file `scripts/kconfig/zconf.hash.c'.
+       File `scripts/kconfig/zconf.hash.c' does not exist.
+        Considering target file `scripts/kconfig/zconf.hash.c_shipped'.
+         Finished prerequisites of target file `scripts/kconfig/zconf.hash.c_shipped'.
+        No need to remake target `scripts/kconfig/zconf.hash.c_shipped'; using VPATH name `../scripts/kconfig/zconf.hash.c_shipped'.
+       Finished prerequisites of target file `scripts/kconfig/zconf.hash.c'.
+      Must remake target `scripts/kconfig/zconf.hash.c'.
+  SHIPPED scripts/kconfig/zconf.hash.c
+      Successfully remade target file `scripts/kconfig/zconf.hash.c'.
+     Finished prerequisites of target file `scripts/kconfig/zconf.tab.o'.
+    Must remake target `scripts/kconfig/zconf.tab.o'.
+  HOSTCC  scripts/kconfig/zconf.tab.o
+    Successfully remade target file `scripts/kconfig/zconf.tab.o'.
+   Finished prerequisites of target file `scripts/kconfig/conf'.
+  Must remake target `scripts/kconfig/conf'.
+  HOSTLD  scripts/kconfig/conf
+  Successfully remade target file `scripts/kconfig/conf'.
+ Finished prerequisites of target file `silentoldconfig'.
+Must remake target `silentoldconfig'.
+scripts/kconfig/conf --silentoldconfig Kconfig
+Updating goal targets....
+Considering target file `scripts_basic'.
+ File `scripts_basic' does not exist.
+ Finished prerequisites of target file `scripts_basic'.
+Must remake target `scripts_basic'.
+make -f ../scripts/Makefile.build obj=scripts/basic
+GNU Make 3.81
+Copyright (C) 2006  Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+
+This program built for x86_64-pc-linux-gnu
+Reading makefiles...
+Reading makefile `../scripts/Makefile.build'...
+Reading makefile `include/config/auto.conf' (search path) (don't care) (no ~ expansion)...
+Reading makefile `scripts/Kbuild.include' (search path) (no ~ expansion)...
+Reading makefile `../scripts/basic/Makefile' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.lib' (search path) (no ~ expansion)...
+Reading makefile `scripts/Makefile.host' (search path) (no ~ expansion)...
+Reading makefile `scripts/basic/.fixdep.cmd' (search path) (no ~ expansion)...
+Updating goal targets....
+Considering target file `__build'.
+ File `__build' does not exist.
+  Considering target file `scripts/basic/fixdep'.
+    Considering target file `scripts/basic/fixdep.c'.
+     Finished prerequisites of target file `scripts/basic/fixdep.c'.
+    No need to remake target `scripts/basic/fixdep.c'; using VPATH name `../scripts/basic/fixdep.c'.
+    Considering target file `FORCE'.
+     File `FORCE' does not exist.
+     Finished prerequisites of target file `FORCE'.
+    Must remake target `FORCE'.
+    Successfully remade target file `FORCE'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/types.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/types.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/types.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/types.h'.
+    Considering target file `/usr/include/features.h'.
+     Finished prerequisites of target file `/usr/include/features.h'.
+    No commands for `/usr/include/features.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/features.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/predefs.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/predefs.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/predefs.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/predefs.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/cdefs.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/cdefs.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/cdefs.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/cdefs.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/wordsize.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/wordsize.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/wordsize.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/wordsize.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/gnu/stubs.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/gnu/stubs.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/gnu/stubs.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/gnu/stubs.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/gnu/stubs-64.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/gnu/stubs-64.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/gnu/stubs-64.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/gnu/stubs-64.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/types.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/types.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/types.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/types.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/typesizes.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/typesizes.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/typesizes.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/typesizes.h'.
+    Considering target file `/usr/include/time.h'.
+     Finished prerequisites of target file `/usr/include/time.h'.
+    No commands for `/usr/include/time.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/time.h'.
+    Considering target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stddef.h'.
+     Finished prerequisites of target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stddef.h'.
+    No commands for `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stddef.h' and no prerequisites actually changed.
+    No need to remake target `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stddef.h'.
+    Considering target file `/usr/include/endian.h'.
+     Finished prerequisites of target file `/usr/include/endian.h'.
+    No commands for `/usr/include/endian.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/endian.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/endian.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/endian.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/endian.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/endian.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/byteswap.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/byteswap.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/byteswap.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/byteswap.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/select.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/select.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/select.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/select.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/select.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/select.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/select.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/select.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/sigset.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/sigset.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/sigset.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/sigset.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/time.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/time.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/time.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/time.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/select2.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/select2.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/select2.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/select2.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/sysmacros.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/sysmacros.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/sysmacros.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/sysmacros.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/stat.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/stat.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/stat.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/stat.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/stat.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/stat.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/stat.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/stat.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/mman.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/mman.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/mman.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/mman.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/mman.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/mman.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/mman.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/mman.h'.
+    Considering target file `/usr/include/unistd.h'.
+     Finished prerequisites of target file `/usr/include/unistd.h'.
+    No commands for `/usr/include/unistd.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/unistd.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/posix_opt.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/posix_opt.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/posix_opt.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/posix_opt.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/environments.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/environments.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/environments.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/environments.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/confname.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/confname.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/confname.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/confname.h'.
+    Considering target file `/usr/include/getopt.h'.
+     Finished prerequisites of target file `/usr/include/getopt.h'.
+    No commands for `/usr/include/getopt.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/getopt.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/unistd.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/unistd.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/unistd.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/unistd.h'.
+    Considering target file `/usr/include/fcntl.h'.
+     Finished prerequisites of target file `/usr/include/fcntl.h'.
+    No commands for `/usr/include/fcntl.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/fcntl.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/fcntl.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/fcntl.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/fcntl.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/fcntl.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/fcntl2.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/fcntl2.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/fcntl2.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/fcntl2.h'.
+    Considering target file `/usr/include/string.h'.
+     Finished prerequisites of target file `/usr/include/string.h'.
+    No commands for `/usr/include/string.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/string.h'.
+    Considering target file `/usr/include/xlocale.h'.
+     Finished prerequisites of target file `/usr/include/xlocale.h'.
+    No commands for `/usr/include/xlocale.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/xlocale.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/string.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/string.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/string.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/string.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/string2.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/string2.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/string2.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/string2.h'.
+    Considering target file `/usr/include/stdlib.h'.
+     Finished prerequisites of target file `/usr/include/stdlib.h'.
+    No commands for `/usr/include/stdlib.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/stdlib.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/string3.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/string3.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/string3.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/string3.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/waitflags.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/waitflags.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/waitflags.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/waitflags.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/waitstatus.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/waitstatus.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/waitstatus.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/waitstatus.h'.
+    Considering target file `/usr/include/alloca.h'.
+     Finished prerequisites of target file `/usr/include/alloca.h'.
+    No commands for `/usr/include/alloca.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/alloca.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/stdlib.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/stdlib.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/stdlib.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/stdlib.h'.
+    Considering target file `/usr/include/stdio.h'.
+     Finished prerequisites of target file `/usr/include/stdio.h'.
+    No commands for `/usr/include/stdio.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/stdio.h'.
+    Considering target file `/usr/include/libio.h'.
+     Finished prerequisites of target file `/usr/include/libio.h'.
+    No commands for `/usr/include/libio.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/libio.h'.
+    Considering target file `/usr/include/_G_config.h'.
+     Finished prerequisites of target file `/usr/include/_G_config.h'.
+    No commands for `/usr/include/_G_config.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/_G_config.h'.
+    Considering target file `/usr/include/wchar.h'.
+     Finished prerequisites of target file `/usr/include/wchar.h'.
+    No commands for `/usr/include/wchar.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/wchar.h'.
+    Considering target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdarg.h'.
+     Finished prerequisites of target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdarg.h'.
+    No commands for `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdarg.h' and no prerequisites actually changed.
+    No need to remake target `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdarg.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/stdio_lim.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/stdio_lim.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/stdio_lim.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/stdio_lim.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/sys_errlist.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/sys_errlist.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/sys_errlist.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/sys_errlist.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/stdio.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/stdio.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/stdio.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/stdio.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/stdio2.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/stdio2.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/stdio2.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/stdio2.h'.
+    Considering target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/limits.h'.
+     Finished prerequisites of target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/limits.h'.
+    No commands for `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/limits.h' and no prerequisites actually changed.
+    No need to remake target `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/limits.h'.
+    Considering target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/syslimits.h'.
+     Finished prerequisites of target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/syslimits.h'.
+    No commands for `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/syslimits.h' and no prerequisites actually changed.
+    No need to remake target `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/syslimits.h'.
+    Considering target file `/usr/include/limits.h'.
+     Finished prerequisites of target file `/usr/include/limits.h'.
+    No commands for `/usr/include/limits.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/limits.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/posix1_lim.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/posix1_lim.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/posix1_lim.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/posix1_lim.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/local_lim.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/local_lim.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/local_lim.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/local_lim.h'.
+    Considering target file `/usr/include/linux/limits.h'.
+     Finished prerequisites of target file `/usr/include/linux/limits.h'.
+    No commands for `/usr/include/linux/limits.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/linux/limits.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/posix2_lim.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/posix2_lim.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/posix2_lim.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/posix2_lim.h'.
+    Considering target file `/usr/include/ctype.h'.
+     Finished prerequisites of target file `/usr/include/ctype.h'.
+    No commands for `/usr/include/ctype.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/ctype.h'.
+    Considering target file `/usr/include/arpa/inet.h'.
+     Finished prerequisites of target file `/usr/include/arpa/inet.h'.
+    No commands for `/usr/include/arpa/inet.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/arpa/inet.h'.
+    Considering target file `/usr/include/netinet/in.h'.
+     Finished prerequisites of target file `/usr/include/netinet/in.h'.
+    No commands for `/usr/include/netinet/in.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/netinet/in.h'.
+    Considering target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdint.h'.
+     Finished prerequisites of target file `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdint.h'.
+    No commands for `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdint.h' and no prerequisites actually changed.
+    No need to remake target `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdint.h'.
+    Considering target file `/usr/include/stdint.h'.
+     Finished prerequisites of target file `/usr/include/stdint.h'.
+    No commands for `/usr/include/stdint.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/stdint.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/wchar.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/wchar.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/wchar.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/wchar.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/socket.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/socket.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/socket.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/socket.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/sys/uio.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/sys/uio.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/sys/uio.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/sys/uio.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/uio.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/uio.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/uio.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/uio.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/socket.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/socket.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/socket.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/socket.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/sockaddr.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/sockaddr.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/sockaddr.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/sockaddr.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/asm/socket.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/asm/socket.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/asm/socket.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/asm/socket.h'.
+    Considering target file `/usr/include/asm-generic/socket.h'.
+     Finished prerequisites of target file `/usr/include/asm-generic/socket.h'.
+    No commands for `/usr/include/asm-generic/socket.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/asm-generic/socket.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/asm/sockios.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/asm/sockios.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/asm/sockios.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/asm/sockios.h'.
+    Considering target file `/usr/include/asm-generic/sockios.h'.
+     Finished prerequisites of target file `/usr/include/asm-generic/sockios.h'.
+    No commands for `/usr/include/asm-generic/sockios.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/asm-generic/sockios.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/socket2.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/socket2.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/socket2.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/socket2.h'.
+    Considering target file `/usr/include/x86_64-linux-gnu/bits/in.h'.
+     Finished prerequisites of target file `/usr/include/x86_64-linux-gnu/bits/in.h'.
+    No commands for `/usr/include/x86_64-linux-gnu/bits/in.h' and no prerequisites actually changed.
+    No need to remake target `/usr/include/x86_64-linux-gnu/bits/in.h'.
+   Finished prerequisites of target file `scripts/basic/fixdep'.
+   Prerequisite `../scripts/basic/fixdep.c' is older than target `scripts/basic/fixdep'.
+   Prerequisite `FORCE' of target `scripts/basic/fixdep' does not exist.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/types.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/features.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/predefs.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/cdefs.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/wordsize.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/gnu/stubs.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/gnu/stubs-64.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/types.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/typesizes.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/time.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stddef.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/endian.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/endian.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/byteswap.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/select.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/select.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/sigset.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/time.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/select2.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/sysmacros.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/pthreadtypes.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/stat.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/stat.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/mman.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/mman.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/unistd.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/posix_opt.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/environments.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/confname.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/getopt.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/unistd.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/fcntl.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/fcntl.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/fcntl2.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/string.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/xlocale.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/string.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/string2.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/stdlib.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/string3.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/waitflags.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/waitstatus.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/alloca.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/stdlib.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/stdio.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/libio.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/_G_config.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/wchar.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdarg.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/stdio_lim.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/sys_errlist.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/stdio.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/stdio2.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/limits.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/lib/gcc/x86_64-linux-gnu/4.6/include-fixed/syslimits.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/limits.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/posix1_lim.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/local_lim.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/linux/limits.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/posix2_lim.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/ctype.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/arpa/inet.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/netinet/in.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/lib/gcc/x86_64-linux-gnu/4.6/include/stdint.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/stdint.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/wchar.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/socket.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/sys/uio.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/uio.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/socket.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/sockaddr.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/asm/socket.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/asm-generic/socket.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/asm/sockios.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/asm-generic/sockios.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/socket2.h' is older than target `scripts/basic/fixdep'.
+   Prerequisite `/usr/include/x86_64-linux-gnu/bits/in.h' is older than target `scripts/basic/fixdep'.
+  Must remake target `scripts/basic/fixdep'.
+  Successfully remade target file `scripts/basic/fixdep'.
+ Finished prerequisites of target file `__build'.
+Must remake target `__build'.
+:
+Successfully remade target file `__build'.
+rm -f .tmp_quiet_recordmcount
+Successfully remade target file `scripts_basic'.
+Considering target file `d-build'.
+ File `d-build' does not exist.
+ Finished prerequisites of target file `d-build'.
+Must remake target `d-build'.
+make[1]: Leaving directory `/home/yuan_zc/linaro/work_dir/linux_master_L/build_out'

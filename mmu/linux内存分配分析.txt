@@ -1,0 +1,175 @@
+
+
+
+
+
+分析从用户态开始，由顶向下的逐步跟踪。
+
+
+1. mmap
+
+系统调用的原型如下：
+SYNOPSIS
+       #include <sys/mman.h>
+
+       void *mmap(void *addr, size_t length, int prot, int flags,
+                  int fd, off_t offset);
+       int munmap(void *addr, size_t length);
+
+DESCRIPTION
+       mmap() creates a new mapping in the virtual address space of the call‐
+       ing process.  The starting address for the new mapping is specified in
+       addr.  The length argument specifies the length of the mapping.
+
+       If  addr is NULL, then the kernel chooses the address at which to cre‐
+       ate the mapping; this is the most portable method of  creating  a  new
+       mapping.   If  addr  is  not  NULL, then the kernel takes it as a hint
+       about where to place the mapping; on Linux, the mapping will  be  cre‐
+       ated  at  a  nearby  page boundary.  The address of the new mapping is
+       returned as the result of the call.
+
+       The contents of a file mapping (as opposed to  an  anonymous  mapping;
+       see  MAP_ANONYMOUS below), are initialized using length bytes starting
+       at offset offset in the file (or other object) referred to by the file
+       descriptor fd.  offset must be a multiple of the page size as returned
+       by sysconf(_SC_PAGE_SIZE).
+
+对应的内核代码在 mm/mmap.c中：
+SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, pgoff)
+
+
+对于x86来说，在 arch/x86/syscalls/Makefile中有：
+syscall32 := $(srctree)/$(src)/syscall_32.tbl
+syscall64 := $(srctree)/$(src)/syscall_64.tbl
+
+syshdr := $(srctree)/$(src)/syscallhdr.sh
+systbl := $(srctree)/$(src)/syscalltbl.sh
+
+
+syshdr_abi_unistd_64 := common,64
+$(uapi)/unistd_64.h: $(syscall64) $(syshdr)
+        $(call if_changed,syshdr)
+
+因此定义 系统调用表的unistd_64.h（对于x86_64)是从syscall_64.tbl生成的。
+
+在syscall_64.tbl中指向的是sys_mmap，因此 arch/x86/kernel/Sys_x86_64.c 中有：
+
+SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, off)
+会调用
+error = sys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+
+
+核心处理函数是 vm_mmap_pgoff
+
+vm_mmap_pgoff -> do_mmap_pgoff 
+
+--> mm_populate
+
+1.1 vm_flags
+
+
+mm_init 中会设置 struct mm_struct 的 def_flags 和 flags成员。
+
+	if (current->mm) {
+		mm->flags = current->mm->flags & MMF_INIT_MASK;
+		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
+	} else {
+		mm->flags = default_dump_filter;
+		mm->def_flags = 0;
+	}
+
+
+在 include/uapi/asm-generic/mman-common.h 中，有
+#define PROT_READ	0x1		/* page can be read */
+#define PROT_WRITE	0x2		/* page can be written */
+#define PROT_EXEC	0x4		/* page can be executed */
+#define PROT_SEM	0x8		/* page may be used for atomic ops */
+#define PROT_NONE	0x0		/* page can not be accessed */
+#define PROT_GROWSDOWN	0x01000000	/* mprotect flag: extend change to start of growsdown vma */
+#define PROT_GROWSUP	0x02000000	/* mprotect flag: extend change to end of growsup vma */
+
+1.2 get_unmapped_area
+
+get_unmapped_area 的核心是调用 
+	get_area = current->mm->get_unmapped_area;
+	if (file && file->f_op->get_unmapped_area)
+		get_area = file->f_op->get_unmapped_area;
+	addr = get_area(file, addr, len, pgoff, flags);
+
+函数钩子 get_unmapped_area 通过 setup_new_exec -> arch_pick_mmap_layout(current->mm)
+设置。
+
+对于 ARMv8, 有
+#define TASK_SIZE_64		(UL(1) << VA_BITS)
+
+#define TASK_UNMAPPED_BASE	(PAGE_ALIGN(TASK_SIZE / 4))
+
+
+最终是调用到 unmapped_area_topdown 或 unmapped_area
+
+
+1.3 struct vm_area_struct
+
+struct vm_area_struct中的  unsigned long rb_subtree_gap 如何设置的？
+最终是通过 vma_compute_subtree_gap完成设置。
+
+RB_DECLARE_CALLBACKS(static, vma_gap_callbacks, struct vm_area_struct, vm_rb,
+		     unsigned long, rb_subtree_gap, vma_compute_subtree_gap)
+
+static void vma_gap_update(struct vm_area_struct *vma)
+{
+	/*
+	 * As it turns out, RB_DECLARE_CALLBACKS() already created a callback
+	 * function that does exacltly what we want.
+	 */
+	vma_gap_callbacks_propagate(&vma->vm_rb, NULL);
+}
+
+这里的 vma_gap_callbacks_propagate 是通过 RB_DECLARE_CALLBACKS定义的。
+
+在 include/linux/rbtree_augmented.h中如下：
+#define RB_DECLARE_CALLBACKS(rbstatic, rbname, rbstruct, rbfield,	\
+			     rbtype, rbaugmented, rbcompute)		\
+static inline void							\
+rbname ## _propagate(struct rb_node *rb, struct rb_node *stop)		\
+{									\
+	while (rb != stop) {						\
+		rbstruct *node = rb_entry(rb, rbstruct, rbfield);	\
+		rbtype augmented = rbcompute(node);			\
+		if (node->rbaugmented == augmented)			\
+			break;						\
+		node->rbaugmented = augmented;				\
+		rb = rb_parent(&node->rbfield);				\
+	}								\
+}
+...
+rbstatic const struct rb_augment_callbacks rbname = {			\
+	rbname ## _propagate, rbname ## _copy, rbname ## _rotate	\
+};
+
+最终效果是定义了变量 vma_gap_callbacks， 包含了系列 callbacks.
+通过 vma_rb_erase -> rb_erase_augmented， vma_rb_insert -> rb_insert_augmented 
+调用。
+
+从 vma_compute_subtree_gap 的实现来看， rb_subtree_gap 对于vma叶子节点是该叶与prev
+节点的距离；
+对于非叶子节点，是max(到prev距离, left子树的最大距离，right子树的最大距离）；
+其中子树的最大距离是子树所有节点之间，子树root节点到 prev距离中的最大值。
+
+因此, rb_subtree_gap 是指定 vma节点的prev 开始的顺序链中所有节点之间的最大距离。
+
+
+
+
+
+
+
+
+
+
+
+

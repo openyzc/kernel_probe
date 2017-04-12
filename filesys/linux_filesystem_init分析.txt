@@ -1,0 +1,547 @@
+
+
+
+prepare_namespace -> mount_root -> create_dev("/dev/root", ROOT_DEV) ->
+sys_mknod(name, S_IFBLK|0600, new_encode_dev(dev))
+
+
+在 namei.c 中：
+SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned, dev)
+{
+	return sys_mknodat(AT_FDCWD, filename, mode, dev);
+}
+
+
+SYSCALL_DEFINE4(mknodat, int, dfd, const char __user *, filename, umode_t, mode,
+		unsigned, dev)
+
+以上函数只要 current->fs->root 被设置为指向有效的 root dentry就可以调用，不需要完成
+mount才能创建目录。 current->fs->root 是在 init_mount_tree 中完成设置的。
+
+
+1. 根文件系统初始化第一阶段： 初始化 rootfs
+
+static struct file_system_type rootfs_fs_type = {
+	.name		= "rootfs",
+	.mount		= rootfs_mount,
+	.kill_sb	= kill_litter_super,
+};
+
+vfs_caches_init -> mnt_init -> init_rootfs 
+
+一般来说， mount函数指针是 由 mount_fs 触发调用，完成 struct dentry结构的创建。
+
+
+
+static char __initdata saved_root_name[64];
+static int __init root_dev_setup(char *line)
+{
+	strlcpy(saved_root_name, line, sizeof(saved_root_name));
+	return 1;
+}
+__setup("root=", root_dev_setup);
+
+
+static char * __initdata root_mount_data;
+__setup("rootflags=", root_data_setup);
+
+static char * __initdata root_fs_names;
+__setup("rootfstype=", fs_names_setup);
+
+static unsigned int __initdata root_delay;
+__setup("rootdelay=", root_delay_setup);
+
+
+static int root_wait;
+__setup("rootwait", rootwait_setup);
+
+
+
+1.1 init_rootfs
+
+完成 rootfs_fs_type 的register。此外，根据编译选项，完成 shmem_fs_type， 
+ramfs_fs_type 的注册。
+
+条件是 ： (IS_ENABLED(CONFIG_TMPFS) && !saved_root_name[0] &&
+		(!root_fs_names || strstr(root_fs_names, "tmpfs")))
+static struct file_system_type shmem_fs_type = {
+	.owner		= THIS_MODULE,
+	.name		= "tmpfs",
+	.mount		= shmem_mount,
+	.kill_sb	= kill_litter_super,
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+
+其它情况下，注册下面的fs:
+static struct file_system_type ramfs_fs_type = {
+	.name		= "ramfs",
+	.mount		= ramfs_mount,
+	.kill_sb	= ramfs_kill_sb,
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+
+
+
+1.2 核心函数 init_mount_tree
+
+此函数将 完成 rootfs 内存文件系统的挂载。
+主要是 通过  vfs_kern_mount -> alloc_vfsmnt 完成 struct mount 结构的分配和初始化；
+mount_fs 函数完成根目录对应的 dentry 结构，以及 通过 type->mount 钩子函数完成
+super_block, inode的创建和初始化。
+
+最后建立 struct mount 与 dentry的关系：
+	root.mnt = mnt;
+	root.dentry = mnt->mnt_root;
+	mnt->mnt_flags |= MNT_LOCKED;
+
+	set_fs_pwd(current->fs, &root);
+	set_fs_root(current->fs, &root);
+
+因此，
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+};
+mnt 会指向 struct mount中的 struct vfsmount；
+dentry 指向 struct vfsmount中的  mnt_root, 实际是 vfs_kern_mount 中创建的 根目录对应
+的 struct dentry.
+
+最后的 set_fs_pwd 将根文件系统关联到current进程的 fs->pwd, fs->root;
+
+
+1.1.1 结构 struct vfsmount 与 struct mount
+struct vfsmount 是 struct mount中的一个结构成员：
+	struct vfsmount mnt;
+
+
+vfs_kern_mount 中调用 alloc_vfsmnt(name) 会创建  struct mount结构。
+
+然后通过mount_fs 得到 struct dentry后，再建立 struct mount与 struct dentry,
+struct super_block之间的关系：
+
+init_mount_tree -> vfs_kern_mount 中会有（ 设置 struct mount 中的 struct vfsmount 结构成员）
+
+	mnt->mnt.mnt_root = root;
+	mnt->mnt.mnt_sb = root->d_sb;
+
+	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+	mnt->mnt_parent = mnt;
+
+此外， super_block中有哪些 struct mount的挂载点， 通过链表来表示：
+
+list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+
+参见 vfs_kern_mount 中的处理。
+
+
+
+
+1.1.2 struct super_block 与 struct dentry
+对于rootfs, rootfs_mount 函数是入口。
+
+rootfs_mount -> sget(fs_type, NULL, set_anon_super, flags, NULL)
+
+通过 sget -> alloc_super 会分配 struct super_block 结构，然后 调用set 钩子（这里
+是 set_anon_super 对 struct super_block 进行基本初始化。新分配的 struct super_block
+会被挂入到 super_blocks 链表中。
+
+set_anon_super -> get_anon_bdev(&s->s_dev) 实际功能是 从 unnamed_dev_ida 中分配以
+unnamed_dev_start 为起始的 minor设备号，最后通过 MKDEV(0, dev & MINORMASK) 构建一个
+设备号保存到 struct super_block 的 s_dev 中。
+
+这就是为什么调用的是  mount_nodev， nodev就是没有指定 dev号。
+非 CONFIG_TMPFS 情况下， ramfs_fill_super会被调用到。
+此函数中会对 struct super_block的一些成员完成初始化。包括inode的设置。
+
+sb->s_op		= &ramfs_ops;
+
+	inode = ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
+	sb->s_root = d_make_root(inode);
+实际 inode的分配和初始化是 ramfs_get_inode -> new_inode 完成的。
+
+对于 struct inode结构，主要设置包括：
+
+inode->i_mapping->a_ops = &ramfs_aops;
+
+		switch (mode & S_IFMT) {
+		default:
+			init_special_inode(inode, mode, dev);
+			break;
+		case S_IFREG:
+			inode->i_op = &ramfs_file_inode_operations;
+			inode->i_fop = &ramfs_file_operations;
+			break;
+		case S_IFDIR:
+			inode->i_op = &ramfs_dir_inode_operations;
+			inode->i_fop = &simple_dir_operations;
+
+			/* directory inodes start off with i_nlink == 2 (for "." entry) */
+			inc_nlink(inode);
+			break;
+		case S_IFLNK:
+			inode->i_op = &page_symlink_inode_operations;
+			break;
+		}
+
+
+1.1.3  inode  与 struct dentry
+
+d_make_root 中会调用 __d_alloc 分配struct dentry 结构，d_instantiate(struct dentry *entry, struct inode * inode) 
+-> __d_instantiate 会 设置
+	dentry->d_inode = inode;
+
+建立了  inode 与 struct dentry 的关系。
+
+请注意，调用 ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0) 是传入的
+flags参数是 S_IFDIR, 因此 对于 rootfs, 
+
+			inode->i_op = &ramfs_dir_inode_operations;
+			inode->i_fop = &simple_dir_operations;
+
+
+从整个处理过程来看， super_block 与 struct dentry ， struct inode 存在紧密关系。
+
+1） struct super_block 与 struct dentry 
+super_block 中的 struct dentry		*s_root 指向 分配的 struct dentry 结构；
+sb->s_root = d_make_root(inode)
+（参见 ramfs_fill_super）
+
+而  dentry 如何找到对应 super_block？ 在struct dentry 中有 struct super_block *d_sb： 
+	dentry->d_sb = sb;
+（参见 __d_alloc）
+
+2) super_block 与 struct inode
+结构 inode 中有
+struct super_block	*i_sb 
+
+创建 inode时（new_inode） 会设置  
+-> new_inode_pseudo -> alloc_inode -> inode_init_always中
+	inode->i_sb = sb
+而在super_block中有链表 
+struct list_head	s_inodes
+通过 inode_sb_list_add 会将某个新inode 挂入到 super_block的 s_inodes中...
+
+对于 ramfs, super_block的  s_op是 ramfs_ops。
+3) struct dentry 与 struct inode 之间关系
+d_instantiate -> __d_instantiate 中：
+	dentry->d_inode = inode
+通过 struct dentry 中的 struct inode *d_inode 指向  struct inode 结构；
+
+
+
+
+2. 真实文件系统 的挂载处理
+
+
+2.1 基本调用流程
+
+prepare_namespace -> mount_root -> create_dev("/dev/root", ROOT_DEV)
+mount_block_root("/dev/root", root_mountflags);
+
+
+
+2.2 函数 prepare_namespace
+会处理通过启动参数 root= 引入的 saved_root_name[].
+	if (saved_root_name[0]) {
+		root_device_name = saved_root_name;
+		if (!strncmp(root_device_name, "mtd", 3) ||
+		    !strncmp(root_device_name, "ubi", 3)) {
+			mount_block_root(root_device_name, root_mountflags);
+			goto out;
+		}
+		ROOT_DEV = name_to_dev_t(root_device_name);
+		if (strncmp(root_device_name, "/dev/", 5) == 0)
+			root_device_name += 5;
+	}
+从而生成了 ROOT_DEV这个设备号。
+
+如果支持 CONFIG_BLK_DEV_INITRD， 将调用 initrd_load() 完成 initrd 小文件系统的
+加载和初始化启动。 
+initrd_load -> rd_load_image (加载）
+	-> handle_initrd() -> load_default_modules 完成初始化处理。
+其中的 load_default_modules 会加载一些后续kernel处理必需modules，譬如 SAS 驱动，Raid
+驱动。
+
+这里不详细跟踪 initrd的处理。
+
+最后，开始调用 mount_root() 来启动 真实 filesystem的挂载。
+
+
+2.3 函数 mount_root
+就两个函数调用：
+	create_dev("/dev/root", ROOT_DEV);
+	mount_block_root("/dev/root", root_mountflags);
+
+2.3.1 create_dev
+实际调用的是 
+sys_mknod(name, S_IFBLK|0600, new_encode_dev(dev))；
+注意这里的mode 是 S_IFBLK|0600.
+
+继续跟踪到系统调用的定义有：
+SYSCALL_DEFINE4(mknodat, int, dfd, const char __user *, filename, umode_t, mode,
+		unsigned, dev)
+-> vfs_mknod -> dir->i_op->mknod(dir, dentry, mode, dev),
+对于rootfs，最终调用到 ramfs_get_inode 中 设置的 inode->i_op。
+
+这里的 inode->i_op应该是 通过 rootfs_mount -> mount_nodev -> ramfs_fill_super ->
+ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0) 完成设置的。
+如下：
+		case S_IFDIR:
+			inode->i_op = &ramfs_dir_inode_operations;
+			inode->i_fop = &simple_dir_operations;
+
+此外，请记住，这里传入的path name 是 "/dev/root"，其中/dev目录必须已经创建了。
+root 这个文件可以没有创建，而在create_dev过程中通过 mknod完成创建。
+
+2.3.2 mount_block_root
+核心的处理是以下语句：
+	for (p = fs_names; *p; p += strlen(p)+1) {
+		int err = do_mount_root(name, p, flags, root_mount_data);
+
+其中 fs_names 来自一个page,存放的是系统在 mount_block_root时希望遍历的 fs_type类型。
+可以通过 "rootfstype=" 指定（使用","分隔）,或者直接使用kernel 已经register的文件系统
+类型（取决于哪些 fs_type模块被注册）。
+
+
+2.3.3 do_mount_root 
+
+核心是调用  sys_mount, 定义在：
+fs/namespace.c:2802:SYSCALL_DEFINE5(mount,
+
+SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
+		char __user *, type, unsigned long, flags, void __user *, data)
+
+
+int err = sys_mount(name, "/root", fs, flags, data);
+
+然后调用最核心的函数 do_mount（定义在 namespace.c中）
+功能是将 dev_name 对应的设备 （对于ramfs, 可以是虚拟的 blk dev设备：通过 mknod 生成
+/dev/root 的设备文件） 调用 vfs_kern_mount(type, flags, name, data) 创建本次mount
+文件系统对应的 struct mount 结构。
+
+对于一般的 mount 操作，最终是调用
+		retval = do_new_mount(&path, type_page, flags, mnt_flags,
+				      dev_name, data_page);
+完成将文件系统关联/挂载到 path 对应的目录下。
+并且会建立新的 struct mount 与 父 struct mount之间的关联。
+
+请注意， init_mount_tree 中没有调用 do_mount 或 do_new_mount， 只是创建了 struct mount
+和 该文件系统的 root dentry（ 通过 ramfs_fill_super -> d_make_root 完成），没有
+实际的挂载。
+最终挂载是在后面的 	mount_block_root("/dev/root", root_mountflags); 配合
+	sys_mount(".", "/", NULL, MS_MOVE, NULL); 完成将 /root 所挂载的rootfs 
+移动到 "/" 新挂载点下。
+参见  do_mount -> do_move_mount(&path, dev_name); 
+
+
+而 sys_chdir定义在 ：
+fs/open.c:412:SYSCALL_DEFINE1(chdir, const char __user *, filename)
+
+
+3. 挂载点
+
+struct mount {
+	struct hlist_node mnt_hash;
+	struct mount *mnt_parent;
+	struct dentry *mnt_mountpoint;
+	struct vfsmount mnt;
+
+必须区分 挂载点 与 根目录 的两个概念。
+挂载点 可以跨设备，也就是安装到另外一个设备的目录树下。
+
+
+挂载点 对应 mount 结构。实际其中的 vfsmount结构才是描述此文件系统的。
+
+如果 某个文件系统 的根目录 同时是此文件系统的挂载点，那么表示抵达了此文件系统的
+最上层，不能再lookup了。
+
+但是此挂载点可能是另外一个文件系统下的某个节点，此种关系通过 mnt_parent 来表示，也就是
+mnt_parent指向 另外一个文件系统的 mount 结构，也就是当前挂载点的上游文件系统。
+
+而 mnt_mountpoint 指向 dentry结构，表示当前文件系统 在parent文件系统中的挂载点对应的
+dentry对象。如果没有parent, mnt->mnt_parent = mnt, 也就是 mnt->mnt_parent 是指向自身。
+而 struct mount *mnt_paren 指向 parent 文件系统的 struct mount.
+因此，以上两个指针主要反映与parent之间的关系。
+此外，第一个struct hlist_node mnt_hash 是挂载时才有意义，用于挂接到
+mount_hashtable[]中的某个链表中。
+
+参见 attach_recursive_mnt -> mnt_set_mountpoint 
+以及
+参见 follow_dotdot_rcu -> follow_up_rcu 
+
+
+结构 struct mount 的解释
+
+struct mount {
+	struct hlist_node mnt_hash;
+	struct mount *mnt_parent;
+	struct dentry *mnt_mountpoint;
+	struct vfsmount mnt;
+	union {
+		struct rcu_head mnt_rcu;
+		struct llist_node mnt_llist;
+	};
+#ifdef CONFIG_SMP
+	struct mnt_pcp __percpu *mnt_pcp;
+#else
+	int mnt_count;
+	int mnt_writers;
+#endif
+	struct list_head mnt_mounts;	/* list of children, anchored here */
+	struct list_head mnt_child;	/* and going through their mnt_child */
+	struct list_head mnt_instance;	/* mount instance on sb->s_mounts */
+	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+	struct list_head mnt_list;
+	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+	struct list_head mnt_share;	/* circular list of shared mounts */
+	struct list_head mnt_slave_list;/* list of slave mounts */
+	struct list_head mnt_slave;	/* slave list entry */
+	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+	struct mnt_namespace *mnt_ns;	/* containing namespace */
+	struct mountpoint *mnt_mp;	/* where is it mounted */
+	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+#ifdef CONFIG_FSNOTIFY
+	struct hlist_head mnt_fsnotify_marks;
+	__u32 mnt_fsnotify_mask;
+#endif
+	int mnt_id;			/* mount identifier */
+	int mnt_group_id;		/* peer group identifier */
+	int mnt_expiry_mark;		/* true if marked for expiry */
+	struct hlist_head mnt_pins;
+	struct fs_pin mnt_umount;
+	struct dentry *mnt_ex_mountpoint;
+}
+
+
+struct hlist_node mnt_hash; 用于将本 mount 结构 挂接到 mount_hashtable[]中的某个链表中。
+至于选择哪个链表，由 本mount对应的 文件系统的parent 对应的 vfsmount结构地址 + 当前
+文件系统挂载点目录的 dentry结构地址 进行 hash处理后得到。
+m_hash(&parent->mnt, mp->m_dentry)
+参见 m_hash 中的hash处理。
+具体挂入链表是在 attach_mnt 或 attach_shadowed 中完成的。
+
+
+struct list_head mnt_child; 用于将本mount节点挂入到 parent 节点的  mnt_mounts链中。
+参见 attach_mnt 或 attach_shadowed。 因此此成员的 mnt_child.next 将指向parent下当前
+mount节点之后的下一个兄弟节点。 而 通过 mnt_child, 本mount节点会作为 parent的一个child
+挂入到了 parent mount节点的mnt_mounts链中了。
+
+
+4. VFS文件系统
+
+请注意，VFS文件系统不一定非得挂载。如果 某个文件系统被挂载后，没有通过chroot 将
+current->fs->root 指向 的 struct path 设置为新的挂载点对应的 struct path,那该
+进程还能访问原来的 root 指向的 struct vfsmount *mnt 对应的文件系统。例如系统的
+第一个文件系统 rootfs 在之前并挂载，待完成与特定设备关联后才挂载到/root下，最后
+才通过 sys_mount 的move操作，将该挂载的VFS系统挪动到 ；
+
+mount_root 中：
+	create_dev("/dev/root", ROOT_DEV);
+	mount_block_root("/dev/root", root_mountflags);
+
+然后 prepare_namespace 的最后：
+	sys_mount(".", "/", NULL, MS_MOVE, NULL);
+	sys_chroot(".");
+
+以上处理过程中的路径的"/" 应该都是 rootfs的根目录（实际取决于 current->fs->root)。
+
+
+
+
+通过查找VFS文件系统下某个路径，能得到struct path结构，表示此路径下 
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+};
+参见 walk_component 中的 handle_dots 和 lookup_fast -> __follow_mount_rcu，
+如果当前 path 不是挂载点（只是普通目录），则直接返回依照指定路径找到的 path 结构；
+对于 当前 path 是挂载点时（应该同时是被挂载文件系统的根目录），
+均会调用到循环调用
+		mounted = __lookup_mnt(path->mnt, path->dentry);
+		if (!mounted)
+			break;
+		path->mnt = &mounted->mnt;
+		path->dentry = mounted->mnt.mnt_root;
+此处理表示在当前 path 对应的路径为挂载点时， 将一直往下找寻到第一个其下没有挂载点的dentry,
+也就是此时的 path->dentry 是一个叶子根目录（其下没有挂载任何VFS，自身是某个VFS的根目录），
+此时 path中的 mnt 指向 找寻到的 entry 所在的 VFS文件系统。
+
+而 lookup_mnt 只是在同一个parent 文件系统下遍历 所有child 挂载点，不会跑到更下层去。
+
+从上面的处理可以得到，在指定 路径下 调用 user_path_at 之类函数时，将返回指定路径下的
+第一个叶子根目录，不一定返回指定目录对应的dentry。 
+挂载时应该允许在同一个目录下挂载多个文件系统，但是不能在同一个目录下挂载相同类型的
+文件系统，参见 do_add_mount 中的处理：
+	err = -EBUSY;
+	if (path->mnt->mnt_sb == newmnt->mnt.mnt_sb &&
+	    path->mnt->mnt_root == path->dentry)
+		goto unlock;
+
+
+
+请注意， vfsmount结构是用于描述VFS文件系统的，与是否挂载应该没有依赖关系。
+参见  do_mount -> do_new_mount  与 init_mount_tree 中在vfs_kern_mount 生成 
+struct vfsmount 后的差别。 都有 dentry, inode, super_block，但是 init_mount_tree
+没有怎么使用struct mount，没有更新 struct vfsmount对应的 struct mount 下的 
+mnt_mountpoint， mnt_parent 等成员。
+
+
+
+
+5. dentry查找
+
+对于 LOOKUP_PARENT 的用法，可以比较：
+user_path_at_empty 与 filename_create
+其实关键在 path_lookupat 中：
+	if (!err && !(flags & LOOKUP_PARENT)) {
+		err = lookup_last(nd, &path);
+
+LOOKUP_FOLLOW 的用法，影响是否找寻链接的最终对象，
+static inline int lookup_last(struct nameidata *nd, struct path *path)
+{
+	if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
+		nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+
+	nd->flags &= ~LOOKUP_PARENT;
+	return walk_component(nd, path, nd->flags & LOOKUP_FOLLOW);
+}
+
+如果 查找时传入的 flags 带有 LOOKUP_FOLLOW， 那么 nd->flags也会带用，从而使得
+walk_component 的第三个参数为 LOOKUP_FOLLOW.
+
+
+
+
+6. 几个关键fs函数说明
+
+SYSCALL_DEFINE1(chroot, const char __user *, filename) 主要是调用
+set_fs_root(current->fs, &path) 将 current->fs->root 设置为 传入的 path:
+	fs->root = *path;
+
+SYSCALL_DEFINE1(chdir, const char __user *, filename) 主要是调用
+set_fs_pwd(current->fs, &path) 将 current->fs->pwd 设置为传入的 path:
+	fs->pwd = *path;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+

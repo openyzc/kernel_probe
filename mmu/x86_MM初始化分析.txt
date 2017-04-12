@@ -1,0 +1,1366 @@
+以 start_kernel 为起点分析。
+更早之前的处理，参考<x86_boot全新分析.txt>
+
+ARMv8的MMU，应该有很多可借鉴x86的地方。
+这里暂不以armv8为分析对象。
+
+一. setup_arch
+
+关于 lockdep，暂时遗留，后续专题跟踪分析。
+
+
+1 page_address_init()  对 支持 CONFIG_HIGHMEM 的 x86_32 以及 armv7有意义
+主要是 初始化 page_address_htable[]。
+
+
+描述0号进程空间的 mm_struct 结构变量 init_mm 定义（架构无关）：
+struct mm_struct init_mm = {
+	.mm_rb		= RB_ROOT,
+	.pgd		= swapper_pg_dir,
+	.mm_users	= ATOMIC_INIT(2),
+	.mm_count	= ATOMIC_INIT(1),
+	.mmap_sem	= __RWSEM_INITIALIZER(init_mm.mmap_sem),
+	.page_table_lock =  __SPIN_LOCK_UNLOCKED(init_mm.page_table_lock),
+	.mmlist		= LIST_HEAD_INIT(init_mm.mmlist),
+	INIT_MM_CONTEXT(init_mm)
+};
+
+
+2 early iomap处理
+
+在start_arch中，有 early_ioremap_init() 调用，完成 fix_map 中 FIX_BTMAP_BEGIN ～
+FIX_BTMAP_END 这个 BTMAP 范围的页表项初始化（除了 PTE没有设置外，实际上只是设置了
+PMD 中对应的entry 指向 bm_pte）。必须保证 FIX_BTMAP_BEGIN 与 FIX_BTMAP_END 在
+同一个 PMD页entry內，也就是 ＆-PTRS_PER_PTE 应该相等。参考 enum fixed_addresses
+中的定义。
+
+实际PTE entry的设置通过 __early_set_fixmap 完成。
+
+olpc_ofw_detect 会影响 x86_32 的 __FIXADDR_TOP，但是不管如何调整，__FIXADDR_TOP都
+必须 先对齐 PMD_SIZE后 - PAGE_SIZE.
+
+几个相关的重要结构
+
+static pte_t bm_pte[PAGE_SIZE/sizeof(pte_t)] __page_aligned_bss;
+
+static void __iomem *prev_map[FIX_BTMAPS_SLOTS] __initdata;
+static unsigned long prev_size[FIX_BTMAPS_SLOTS] __initdata;
+static unsigned long slot_virt[FIX_BTMAPS_SLOTS] __initdata;
+
+
+这些 变量的意义，参考 __early_ioremap 的处理。
+实际上这三数组是互相配合描述 某个slot的 BTMAP映射情况。
+
+slot_virt[] 表示某个slot 所固定对应的 slot fixaddr 区的起始地址，每个slot有NR_FIX_BTMAPS
+页；
+prev_map[] 某个slot 所映射的virtual 地址区间的起始地址，ioremap支持非页对齐的映射；
+prev_size[]表示某个slot 所映射的virtual区间大小。
+
+
+3 内存的资源
+
+	iomem_resource.end = (1ULL << boot_cpu_data.x86_phys_bits) - 1;
+	setup_memory_map();
+
+其中 setup_memory_map会根据BIOS 传递的e820 数据对剩余可用的 memory进行去overlap处理
+后更新到 e820[]中。（通过 x86_init.resources.memory_setup 钩子，也就是 
+default_machine_specific_memory_setup 完成）
+同时e820_saved[]会保留 e820[]的备份。
+
+parse_setup_data 会处理boot-loader通过 boot_params.hdr.setup_data传递下来的
+一些数据，诸如 SETUP_E820_EXT，SETUP_DTB， SETUP_EFI等。这些数据会在e820[]中
+增加entry或初始化一些全局变量。会使用到 early_memremap 对传递下来的物理地址
+空间进行映射后访问。
+
+其后的 memblock_x86_reserve_range_setup_data， e820_reserve_setup_data 也会使用
+到 boot_params.hdr.setup_data。 但是它们的处理不同于 parse_setup_data。 后面两个
+函数是将 boot_params.hdr.setup_data 涉及的物理内存在e820[]和memblock中设置为
+RESERVED，也就是已经被占用了。
+
+
+x86中mem是作为资源管理的。不管是code, 还是data, bss，都占用了mem资源。 内核中统一
+使用以 iomem_resource为root的树来描述这种稀缺资源的分配使用情况。
+因此，kernel image中已经消耗的 code, data, bss都需要作为 iomem_resource的子节点
+挂入：
+	insert_resource(&iomem_resource, &code_resource);
+	insert_resource(&iomem_resource, &data_resource);
+	insert_resource(&iomem_resource, &bss_resource);
+
+其后， pci/pcie设备的资源也会被纳入此树进行管理（另文分析）。
+
+
+e820_add_kernel_range()只是对 _text, _end的内核kernel image范围进行e820属性检测。
+保证都属于 E820_RAM 类型。
+
+4 x86中的 early brk
+
+我们知道，在head_64.S中只是建立了较少范围的物理内存映射page entries。那在kernel启动
+过程中，如果还需要分配内存使用，怎么办？
+
+在arm64中，目前是通过 early_alloc 调用 memblock_alloc 直接从系统可用的物理内存区
+中分配可用的内存。基于物理可用内存在初始化阶段总是足够的假设，这个没有什么问题。但是
+当前已经运行在 虚拟模式了。需要MMU完成VA --> PA的转换，因此对应的page entries必须
+已经设置好。 目前 ARM64在 head.S中只是完成了较少范围的 direct mapping处理。实际是
+建立了覆盖从 KERNEL_START 到 KERNEL_END 范围的pmd entries.
+
+#define KERNEL_RAM_VADDR	(PAGE_OFFSET + TEXT_OFFSET)
+
+#define KERNEL_START	KERNEL_RAM_VADDR
+#define KERNEL_END	_end
+
+	mov	x0, x26				// swapper_pg_dir
+	mov	x5, #PAGE_OFFSET
+	create_pgd_entry x0, x5, x3, x6
+	ldr	x6, =KERNEL_END
+	mov	x3, x24				// phys offset
+	create_block_map x0, x7, x3, x5, x6
+
+如果kernel image的size 正好抵达 2M的边缘，也就是已经建立的pmd entries所覆盖的范围
+内没有多少剩余的可用pages, 而又在 实现完整kernel direct mapping处理的create_mapping
+调用之前或处理过程中，发生了多次early_alloc调用，导致分配了没有建立mapping的物理页，
+那kernel 就会产生 panic。
+目前arm64没有问题，是因为 create_mapping 通过强制 起始的内核虚拟地址对齐 2M,从而能
+直接使用以定义的全局页空间来存放large page的entries。但是 如果在建立了足够
+direct mapping的空间前，发生了early_alloc调用，还是会产生问题。这是一个脆弱的
+假设。
+
+
+x86是如何解决这个问题的？
+首先，在head_32.S 或 head_64.S中，不只是建立覆盖 kernel image所在范围虚拟空间的
+direct mapping。在x86_64, 对于 identity map，只是建立覆盖 kernel image所在
+物理空间的entries。但对于虚拟空间，映射了整个 KERNEL_IMAGE_SIZE 范围。
+在x86_32 中，建立了kernel image所在的物理空间在identity mapping中的页表映射，
+且建立了kernel image所在物理空间在 direct mapping 中的页表映射。更加重要的是，
+在已经建立好的direct mapping页表映射中覆盖了 MAPPING_BEYOND_END 页。这些页
+足够满足整个direct mapping空间（32位 < 892M)的页表需求。
+这样处理后，x86在后续启动过程中，如果需要新的物理页来构建页表，就能从这些
+已映射的页中分配了。
+
+现在，如果我们需要访问在 kernel image范围以外的数据，怎么处理？
+x86_32采用了 early_memremap 的方式，动态的建立 FIX_BTMAP_BEGIN~FIX_BTMAP_END
+之间VA与指定PA之间的映射，从而能满足临时访问的需求。
+
+对于x86_64，没有采用此种方法，而是采取了 early page fault的异常处理方法。
+
+此外，如果在完整的direct mapping建立之前，需要申请可用页面，怎么处理？
+x86内核实现了 早期 brk机制，会使用到 __brk_base~__brk_end之间的页。而这些页定义
+在kernel image中，因此已经在head_32.S或head_64.S中已经为它们建立了direct mapping。
+具体分配实现参考 extend_brk。
+early_alloc_pgt_buf 函数专门定义了用于 pte使用的brk page。
+需要注意的是，这些brk的空间最终会设置为reserved，也就是被占用了。
+reserve_brk() 调用后，brk 空间的使用就结束了。
+
+
+实际上，还有一个问题，如果内核image支持relocatable，也就是image可以被加载到任意
+物理地址开始运行（实际上对于x86并不是任意物理地址，上限还是存在的）。那identity 
+mapping如何建立来覆盖这个不确定的物理空间？
+x86_64采用了比较技巧的方法。可以参考
+https://lkml.org/lkml/2013/1/29/630
+
+
+
+5 系统可用内存的确定
+对于armv8，系统可用内存目前更多的是通过dts来传入内核来确定的。现在uefi也成为了
+boot-loader的一个重要选项，因此也能通过UEFI的service来获得系统可用内存（这个说法
+不知是否精确，需要UEFI专家确定）。
+
+对于x86，系统中哪些地址范围的内存是内核可用的，是基于BIOS（boot-loader）传递的e820[]
+以及自身初始化过程中对内存占用情况决定的。
+
+从目前看来， e820[] 中的数据应该都是来自boot-loader，kernel初始化阶段占用的内存区域
+直接通过 memblock_reserve 记录到 memblock.reserved 结构中。
+
+以下函数将从 e820[]中的 E820_RAM 类型entries中得到 在 MAX_ARCH_PFN 上限内的最大
+可用物理页面作为 max_pfn。注意，MAX_ARCH_PFN 是取决于硬件。
+max_pfn = e820_end_of_ram_pfn(); 
+
+但是，最大物理内存不一定能直接被内核 direct mapped，也就是建立了线性的一一映射。
+首先，32位软件对地址，指针的描述也是32位数。假设MMU启用，对于OS 而言，它能
+使用的VM地址位只有 32位，也就只能使用 4GB 的虚拟空间。如果全部物理内存的访问都
+采用线性的 direct mapping，最多只能访问4G物理内存。在现今连手机内存容量都超过了4G
+的年代，多出的物理内存岂不是没法使用！
+
+因此对于32位的内核来说（应该不会出现 64位内核运行在32位CPU上吧），不会对超过 4G的
+物理内存建立direct mapping，只会使用4G 线性空间中的部分来建立direct mapping。
+准确的说，没有4G线性空间那么多用于direct mapping。因为用户态还需要线性空间。
+早期内核都是以 3G 作为内核与用户线性空间的分界。目前已经不是这样了，我们可以通过
+内核选项配置分界线是 1G, 2G, 3G。 此宏的定义就是x86_32的分界：
+arch/x86/include/asm/pgtable_32_types.h中
+#define __PAGE_OFFSET		_AC(CONFIG_PAGE_OFFSET, UL)
+
+
+5.1 32位内核中 low memory 和high memory 的划分
+
+不管分界线是多少，实际效果是线性空间分为了至少两块。
+相应的，内存物理空间也至少分为两段。内核称呼对应 direct mapping的内存范围为
+low memory, 其它更高的memory 范围为high memory。
+因此就存在了 max_low_pfn ， min_low_pfn, max_pfn， high_memory等关键变量。
+
+这些变量如何确定的？？ 回答了这个问题，他们的含义就明显了。
+
+1) 关键数据结构说明
+
+对于x86_32, 有以下相关定义
+arch/x86/Makefile:45:        CHECKFLAGS += -D__i386__
+
+i) arch/x86/mm/pgtable_32.c中
+unsigned int __VMALLOC_RESERVE = 128 << 20;
+
+ii)
+
+arch/x86/include/asm/fixmap.h中
+#define FIXADDR_SIZE	(__end_of_permanent_fixed_addresses << PAGE_SHIFT)
+#define FIXADDR_START		(FIXADDR_TOP - FIXADDR_SIZE)
+
+arch/x86/include/asm/pgtable_32_types.h中
+* PKMAP_BASE对齐 PMD 边界， 在 FIXADDR_START以下，至少以一个page分隔
+#ifdef CONFIG_X86_PAE
+#define LAST_PKMAP 512
+#else
+#define LAST_PKMAP 1024
+#endif
+#define PKMAP_BASE ((FIXADDR_START - PAGE_SIZE * (LAST_PKMAP + 1))	\
+		    & PMD_MASK)
+
+* 使用 HIGHMEM时， VMALLOC_END 在 PKMAP_BASE之下，间隔2页的隔离带。
+#ifdef CONFIG_HIGHMEM
+# define VMALLOC_END	(PKMAP_BASE - 2 * PAGE_SIZE)
+#else
+# define VMALLOC_END	(FIXADDR_START - 2 * PAGE_SIZE)
+#endif
+对于CONFIG_HIGHMEM, depends on X86_32 && (HIGHMEM64G || HIGHMEM4G)
+
+iii)
+#define MAXMEM	(VMALLOC_END - PAGE_OFFSET - __VMALLOC_RESERVE)
+
+以上定义只是针对 x86_32。 对于x86_64, 在 arch/x86/include/asm/pgtable_64_types.h有
+# define MAX_PHYSMEM_BITS	46
+#define MAXMEM		 _AC(__AC(1, UL) << MAX_PHYSMEM_BITS, UL)
+
+iv) arch/x86/include/asm/setup.h中
+#define MAXMEM_PFN	PFN_DOWN(MAXMEM)
+
+对于x86_32有下图
+
+  --------------（UL)-1
+
+   fixed addr area
+  --------------  FIXADDR_START
+    >= one page
+  --------------  ? Top of PKMAP area (对齐 PMD)
+
+   PKMAP  （ total LAST_PKMAP pages)
+
+  --------------- ? PKMAP_BASE (对齐 PMD）
+    2 pages
+  ---------------- ? VMALLOC_END (CONFIG_HIGHMEM时）
+
+   __VMALLOC_RESERVE（128M）
+
+  -----------------   MAXMEM
+
+
+#define VMALLOC_OFFSET	(8 * 1024 * 1024)
+#define VMALLOC_START	((unsigned long)high_memory + VMALLOC_OFFSET)
+
+也就是对于x86_32, VMALLOC_START是非常量。 在high memory 与low memory 分界线以上，
+有 8M的隔离。因为low memory 取决于 memory size,因此一般情况下，VMALLOC_START与物理
+内存size有关。
+
+   
+补充一点，
+
+2) 函数 find_low_pfn_range 
+
+void __init find_low_pfn_range(void)
+{
+	/* it could update max_pfn */
+
+	if (max_pfn <= MAXMEM_PFN)
+		lowmem_pfn_init();
+	else
+		highmem_pfn_init();
+}
+
+如果 max_pfn <= MAXMEM_PFN，表示当前物理内存 较少，没有超过 允许 direct mapped的页数。
+此时，理论上max_low_pfn = max_pfn，也就是全部可用内存都在 low memory区。但是即便
+物理内存较少的情况下，CONFIG_HIGHMEM 也可能enable了。在CONFIG_HIGHMEM enable的前提
+下，如果还配置了 highmem_pages (high memory区的最大页容量），那么就得考虑在当前物理
+内存区中尽可能的留出来要求的 highmem_pages，并调整 max_low_pfn。
+具体参考 lowmem_pfn_init。
+在这种情况下，highmem_pages 尽管配置时是不依赖于 CONFIG_HIGHMEM，但实际该配置的
+生效是依赖于 CONFIG_HIGHMEM的。
+实际上，在 物理内存小于1G的情况下，一般不配置 HIGHMEM4G(4G以内） 或 HIGHMEM64G的。
+
+
+下面回到较为常见的情景，进入 highmem_pfn_init（物理内存较大时）。
+＊max_low_pfn = MAXMEM_PFN
+＊对此种情形，再强调一下，highmem_pages 是否可配置是不依赖于CONFIG_HIGHMEM的！
+如果配置了 highmem_pages，表示 high memory 区的size。
+如果没有配置，highmem_pages = max_pfn - MAXMEM_PFN；
+也就是 highmem_pages 的容量是 扣除 low memory外的剩余可用内存。
+如果配置了但是 max_pfn不足以支持 要求的 highmem_pages,那 highmem_pages 会被置为0；
+超过了，max_pfn会被设置为 max_pfn = MAXMEM_PFN + highmem_pages（降低了）
+
+* 如果CONFIG_HIGHMEM 没enable， 会强制 max_pfn 为 MAXMEM_PFN。
+* 如果 CONFIG_HIGHMEM enable了，但是 max_pfn > 4G但没有配置 HIGHMEM64G，那 max_pfn
+置为 MAX_NONPAE_PFN，也就是最多 4G的物理页。
+
+对于 x86_32, 调用find_low_pfn_range 后， max_pfn, max_low_pfn就确定了。
+max_low_pfn 不会大于 MAXMEM_PFN，在max_pfn不大于 MAXMEM_PFN时，受
+HIGHMEM， highmem_pages 配置影响。
+max_pfn 在大于 MAXMEM_PFN时，受 HIGHMEM， highmem_pages 配置影响。
+
+但是对于x86_64,没有HIGHMEM的配置项，max_low_pfn完全取决与 max_pfn当前值是否
+大于 4G。如下：
+
+	if (max_pfn > (1UL<<(32 - PAGE_SHIFT)))
+		max_low_pfn = e820_end_of_low_ram_pfn();
+	else
+		max_low_pfn = max_pfn;
+
+可见，max_low_pfn 被确定为 4G以下最大的可用页面。
+但是，在 之后的 init_mem_mapping中，对于x86_64进行了调整，如下：
+
+	if (max_pfn > max_low_pfn) {
+		/* can we preseve max_low_pfn ?*/
+		max_low_pfn = max_pfn;
+	}
+看起来是不区分 low 和 high了...
+
+
+总的来说， max_low_pfn是 low memory的上限， max_pfn是 整个可用物理内存的上限。
+max_low_pfn 必定 <= max_pfn。
+
+6. 完整direct mapping的创建
+
+函数 init_mem_mapping 主要完成此功能。
+
+6.1） 为什么需要 identity mapping
+
+在CPU上电开始运行后，x86会进入real mode，此时PC指向的是物理地址。正常情况下，
+bootloader跳转到OS后的初始阶段，寻址空间还是物理地址(不知道现在UEFI大行其道后，
+会否跳到虚拟空间....)。 对于ARMv8，启动的初始阶段也是访问的物理地址。
+
+也就是说，OS初始阶段，分页机制默认是没有启动的。需要OS 在完成诸如页表创建，页BASE
+基址寄存器设置等处理后才enable。
+那么，分页机制enable后，程序就运行在虚拟地址空间了？？
+并不是这样的。 
+在各个arch架构的CPU中，都有指令能改变PC/IP寄存器的值。譬如x86中的 call， armv8中的
+br等，而enable分页的操作并不会直接改变PC/IP的值。毕竟，该设置PC/IP为何值应该由程序
+告知。 因此，从激活分页到真正设置PC/IP到虚拟地址，至少还是需要几条指令的。
+实际OS实现过程中，对于x86来说，使用页表是在 MMU enable后（X86_CR0_PG）的，但是程序
+运行在物理空间还是虚拟空间，不是由 MMU决定。MMU只是决定是否使用页表来进行分页以及相应
+的页保护处理。实际上，MMU enable后，程序还可以运行在物理空间。 x86_64中的 arch/x86/
+boot/compressed/head_64.S应该就是还运行在物理空间。但是因为 CR0_PG，CR0_PE被enable
+了，MMU需要页表，因此 identity mapping就必需了。
+
+
+对于BSP CPU, MMU enable处理应该如下：
+
+	movl	$MSR_EFER, %ecx
+	rdmsr
+	btsl	$_EFER_LME, %eax
+	wrmsr
+
+
+6.2) 初始化早期(start_kernel之前）的direct mapping
+对于x86_64,这个页表是在 arch/x86/kernel/head_64.S中完全设置的。
+页表是通过几个定义在kernel image中的物理页来保存的。
+
+#define EARLY_DYNAMIC_PAGE_TABLES	64
+
+** 这里的section 不同于 level3_kernel_pgt，是__init的，内核起来后会释放。
+** 通过entries 511 指向 level3_kernel_pgt, 将覆盖处于最后 512GB线性空间
+内的 __START_KERNEL_map (kernel text mapping).
+** 前面的 511 entries 将建立 direct mapping，并会使用 early_dynamic_pgts 
+中的pages作为下一级的page tables. 因此这些空间会被定义为 _init section
+	__INITDATA
+NEXT_PAGE(early_level4_pgt)
+	.fill	511,8,0
+	.quad	level3_kernel_pgt - __START_KERNEL_map + _PAGE_TABLE
+
+NEXT_PAGE(early_dynamic_pgts)
+	.fill	512*EARLY_DYNAMIC_PAGE_TABLES,8,0
+
+	.data
+......
+
+**这里的entries 510 对应了 __START_KERNEL_map 的空间（1GB,但是默认内核只是使用
+KERNEL_IMAGE_SIZE --512MB）
+** entries 511 是最后1G, 倒数第6个PMD(2M)更多的是给 early fixmap使用(譬如
+early_iomem)
+NEXT_PAGE(level3_kernel_pgt)
+	.fill	L3_START_KERNEL,8,0
+	/* (2^48-(2*1024*1024*1024)-((2^39)*511))/(2^30) = 510 */
+	.quad	level2_kernel_pgt - __START_KERNEL_map + _KERNPG_TABLE
+	.quad	level2_fixmap_pgt - __START_KERNEL_map + _PAGE_TABLE
+
+NEXT_PAGE(level2_kernel_pgt)
+	/*
+	 * 512 MB kernel mapping. We spend a full page on this pagetable
+	 * anyway.
+	 *
+	 * The kernel code+data+bss must not be bigger than that.
+	 *
+	 * (NOTE: at +512MB starts the module area, see MODULES_VADDR.
+	 *  If you want to increase this then increase MODULES_VADDR
+	 *  too.)
+	 */
+	PMDS(0, __PAGE_KERNEL_LARGE_EXEC,
+		KERNEL_IMAGE_SIZE/PMD_SIZE)
+
+NEXT_PAGE(level2_fixmap_pgt)
+	.fill	506,8,0
+	.quad	level1_fixmap_pgt - __START_KERNEL_map + _PAGE_TABLE
+	/* 8MB reserved for vsyscalls + a 2MB hole = 4 + 1 entries */
+	.fill	5,8,0
+
+NEXT_PAGE(level1_fixmap_pgt)
+	.fill	512,8,0
+
+初始化完成后，OS的PGD表是 init_level4_pgt，不再是被释放掉的 early_level4_pgt。
+
+补充一下，x86_32中的 页表是创建到 4K page对应的PTE，不同于 x86_64创建到 PMD(2M)。
+
+6.3) 页表相关的几个重要概念
+
+CPU硬件来说，所有数据，指令访问都是物理地址；
+虚拟地址（对于linux来说是线性地址）是OS，也就是软件使用的；只是CPU可以基于OS创建的
+页表将PC/IP的虚拟地址转为物理地址后发出硬件总线操作；
+
+基于这个前提，问题就来了。 CPU硬件是使用物理地址的，也就是其访问页表也是使用物理地址
+的。那么CPU怎么知道页表在哪里？
+
+于是所有使用页表的硬件架构都有页表基址寄存器，用于指定访问页表时的起始物理地址，实际
+就是最高level的页表的base physical address。
+区别只是 armv8中有两个这样的基址，x86中只有 CR3。
+
+好了，页表基址知道了，就可以找到最高页表。然后对需要进行转换的VA所有比特进行分段，
+最高段，譬如9位，对应的值作为 最高页表的 entries索引，从而在最高页表中找到对应
+entry，于是可以在该entry的数据中提取出下一级页表的物理基址。 ok, 如此循环下去，
+直到找到VA比特划分中倒数第二段对应的entry，得到该VA对应的物理页基址。注意，这里
+是物理页不再是下一级页表的基址了！ 然后 + 最后比特段 的值(称为offset)，就得到了
+VA对应的PA了。
+
+MMU进行转换的基本原理就是这样。想看到更加直观的图，手册中就有了。
+
+前面说过，页表是OS创建的。但是似乎存在一个悖论。 页表是存放在物理页面上的，假设
+初始化这些页面的处理都是在保护模式下进行的，也就是都是使用VA来读写这些页。但是
+页表都没有初始化好，OS怎么能却设置？？
+
+实际上这个问题很好解决，OS可以在初始化前期，直接使用物理地址啊！ 因此在 head_64.S，
+head_32.S中，都对 kernel image所在的物理地址范围创建了页表。同时约定了某个 VA常量
+对应起始物理地址常量（应该是物理加载地址。这里的VA不一定是 PAGE_OFFSET--- x86_32才
+是对应这个常量）。
+
+因此在 init_mem_mapping 运行之前，已经有部分物理空间是有对应的构建好的页表了，于是
+可以使用这部分页表所映射的VA页中的idle页来创建更多新页表了。
+
+那为什么不在OS初始阶段就一次性将所有内存对应的页表都创建好？？
+
+我理解：
+1) 写汇编不爽；
+2) 前期的处理不应该做过多复杂的处理；你要创建所有页表，那系统有哪些物理空间对内核
+可用？ 哪些物理页可用来存储页表？ 哪些物理空间范围需要创建对应的页表？ 这些问题如果
+都给OS前期处理，那好像没必要有后期处理了吧。 OS的维护，扩展会成为麻烦问题。好像这
+就是架构的问题了吧。
+
+好。前期建好的页表必须覆盖部分idle的可用物理页。否则就没可用的页来创建新页表了。
+随意搞一个没有建立了映射的物理页来存储新页表数据，kernel就panic了！
+那我从已经有映射的物理页中选择。显然不能选择已经存储了其它数据或已经规划了特定用途的
+页，譬如内核image, 已经创建的页表数据。否则，这些已有的重要系统数据就会被overwirte
+了，灾难！
+
+因此,选择的原则必须记住：
+1） 已经映射在页表的；
+2） 没有被使用，没有被规划或预留的；
+
+注意第二点，即便某个物理页目前没有被使用，但是它被预留了其它用途，那也是不能用作
+新页表的存储页。
+
+整个页表映射的原理不复杂，复杂全在这两条约束的遵循上了。
+看着像是一个小的内存管理系统.... 还是资源管理问题！！
+
+6.4) init_mem_mapping 的具体处理
+
+本来，这个函数是分析重点。 但是此函数涉及的诸多“莫名”判断，结构很难line by line的
+说明，很多时候是需要自行好好根据上面的原则去沉思，领会的。我好像也没有那么多时间
+逐行的分析。
+主要说明几点。
+
+1) x86在此函数中构建的是自PAGE_OFFSET为起始的内核VA范围；
+2) 对应的物理地址范围，x86_64是 max_pfn << PAGE_SHIFT，也就是所有内核可见物理内存，
+也就是memblock.memory 中的regions。x86_32 是 max_low_pfn << PAGE_SHIFT，也就是
+low memory区域；
+3) x86_64没有HIGHMEM,没有4G VA空间的限制，因此 FIX_KMAP_BEGIN， FIX_KMAP_END在
+x86_64上不存在； --> early_ioremap_page_table_range_init
+4) page table通过 alloc_low_pages 来分配。其背后是两个机制， early_alloc_pgt_buf中
+涉及的 INIT_PGT_BUF_SIZE 个页；受 min_pfn_mapped 和 max_pfn_mapped 约束了
+可分配范围的memblock_find_in_range；
+两个机制都是确保满足上面描述的两个原则。
+5) 为什么区分 bottom_up 和 up_bottom？
+实际这两种方式由 memblock机制中的空闲页分配关联。 bottom_up表示先分配可用的低地址
+页或范围，up_bottom则相反。
+我们都知道，x86 kernel一般被加载到低地址。因为 前期建立了映射的物理空间有限，大部分
+都被kernel image占用了。 如果还是从低地址开始建立新页表映射。 kernel image对应的
+物理空间段可能会消耗为数不多的可用且已映射idle页。 反过来，如果先建立高地址区域的
+页表，那容易通过最多3个页能映射至少2M新的可用物理空间。这样就不愁后面没有可用页了。
+但是为了支持bottom_up，映射处理时需要做特殊处理。具体就自看代码了。
+反正原则是 使用尽可能少的页去映射更大的物理空间范围，这样才有“盈余”以备后用。
+6） x86对于前期针对某些物理空间域已经正确建立好的page table entries，采取保留的策略。
+这个不同于 armv8. 个人觉得这样更好，起码TLB中不会有针对同一地址的多条cache数据的风险。
+
+
+对下面重置 max_low_pfn为max_pfn的处理，还没有看到这样处理的依据。遗留着吧
+#ifdef CONFIG_X86_64
+	if (max_pfn > max_low_pfn) {
+		/* can we preseve max_low_pfn ?*/
+		max_low_pfn = max_pfn;
+	}
+
+
+7. 线性空间划分
+
+对于x86_64,参考 Documentation/x86/x86_64/mm.txt
+
+
+下面的宏定义决定了VM 区域的划分。
+
+#define __PAGE_OFFSET           _AC(0xffff880000000000, UL)
+
+
+/* See Documentation/x86/x86_64/mm.txt for a description of the memory map. */
+#define __PHYSICAL_MASK_SHIFT	46
+#define __VIRTUAL_MASK_SHIFT	47
+
+# define MAX_PHYSMEM_BITS	46
+
+ffff880000000000 - ffffc7ffffffffff (=64 TB) direct mapping of all phys. memory
+
+
+#define __START_KERNEL_map	_AC(0xffffffff80000000, UL)
+
+#define KERNEL_IMAGE_SIZE_DEFAULT      (512 * 1024 * 1024)
+
+
+ffffffff80000000 - ffffffffa0000000 (=512 MB)  kernel text mapping, from phys 0
+
+
+#define VSYSCALL_ADDR (-10UL << 20)
+
+#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+			 PAGE_SIZE)
+
+
+
+
+
+
+8. x86下的内存管理模型
+
+
+8.1 几个内存管理模型相关的 配置项
+
+对于x86， 在 arch/x86/Kconfig中有
+config ARCH_SPARSEMEM_ENABLE
+        def_bool y
+        depends on X86_64 || NUMA || X86_32 || X86_32_NON_STANDARD
+        select SPARSEMEM_STATIC if X86_32
+        select SPARSEMEM_VMEMMAP_ENABLE if X86_64
+
+在mm/Kconfig中有：
+NEED_MULTIPLE_NODES
+         def_bool y
+         depends on DISCONTIGMEM || NUMA
+
+
+config SPARSEMEM
+        def_bool y
+        depends on (!SELECT_MEMORY_MODEL && ARCH_SPARSEMEM_ENABLE) || SPARSEMEM_MANUAL
+
+
+因此对于x86, SPARSEMEM一般是enable的。
+
+config HAVE_MEMORY_PRESENT
+        def_bool y
+        depends on ARCH_HAVE_MEMORY_PRESENT || SPARSEMEM
+
+
+
+对于NUMA，在 arch/x86/Kconfig中有
+
+config X86_BIGSMP
+        bool "Support for big SMP systems with more than 8 CPUs"
+        depends on X86_32 && SMP
+
+config NUMA
+        bool "Numa Memory Allocation and Scheduler Support"
+        depends on SMP
+        depends on X86_64 || (X86_32 && HIGHMEM64G && X86_BIGSMP)
+        default y if X86_BIGSMP
+
+因此，NUMA对于x86_64差不多是标配，对于x86_32，如果SMP且内存较大，也推荐配置。
+
+
+考虑到目前server领域内存都较大，后面的分析主要以 SPARSEMEM，NUMA为对象。
+
+
+
+SPARSEMEM对memory的分割
+
+Each such bank is called a node (pg_data_t) For UMA archs like desktop PC
+we have only one pg_data_t. Each node is divided into a number of blocks
+called zones, which represents different memory ranges. A zone could be of
+type ZONE_DMA, ZONE_NORMAL, ZONE_HIGHMEM. Each node contains one mem_map
+array to hold physical page frames present in that node called struct page.
+
+
+
+
+# define SECTION_SIZE_BITS	27 /* matt - 128 is convenient right now */
+# define MAX_PHYSADDR_BITS	44
+# define MAX_PHYSMEM_BITS	46
+
+
+#define SECTIONS_SHIFT	(MAX_PHYSMEM_BITS - SECTION_SIZE_BITS)
+
+
+8.2  SPARSEMEM 机制
+
+1. section 与 root 的映射建立
+
+
+paging_init 中有以下调用关系
+
+sparse_memory_present_with_active_regions(MAX_NUMNODES);
+sparse_init();
+
+
+sparse_memory_present_with_active_regions 的核心是调用 
+memory_present(this_nid, start_pfn, end_pfn)
+
+该函数在 numa_32.c 以及 sparse.c中有定义。因为 numa_32.c中是依赖于
+CONFIG_DISCONTIGMEM的，而 CONFIG_DISCONTIGMEM 已经过时，被sparsemem替代。
+我们只是关心 sparse的。
+
+实际 sparse_memory_present_with_active_regions 会遍历 memblock.memory中的有效
+memory range, 得到系统内存的分布情况，然后逐一调用 memory_present。
+
+在 memory_present中，完成：
+1） 根据pfn范围， 确定 该范围覆盖了哪些 sections。
+2) 如果 SPARSEMEM_EXTREME, 调用sparse_index_init。 对每个section确认对应 的root，
+分配 SECTIONS_PER_ROOT * sizeof(struct mem_section)，作为 mem_section[][]这个
+二维数组中 mem_section[root]的值。
+SPARSEMEM_EXTREME 的引入主要是为了节省内存消耗。
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+extern struct mem_section *mem_section[NR_SECTION_ROOTS];
+#else
+extern struct mem_section mem_section[NR_SECTION_ROOTS][SECTIONS_PER_ROOT];
+#endif
+
+显然，如果root覆盖的内存范围不存在，那就不会占用 mem_section[][SECTIONS_PER_ROOT]
+的空间。 对于大内存系统， SECTIONS_PER_ROOT 个 struct mem_section 应该会消耗些内存。
+
+3） 设置 struct mem_section结构中的section_mem_map 保存 此section 所属的 node id.
+实际上 section_mem_map 在初始化早期用于保存 node id，后期建立了mem map后，就不用于
+存放 node id了。 因此 section_mem_map 的低 SECTION_NID_SHIFT 比特用于表示 
+section_mem_map 的用途 或状态；
+
+3. 函数 sparse_init
+
+sparse_init 才是 sparse 初始化的核心。
+主要功能是建立 各个section 下的物理page 对应的page frame结构（struct page)。 因为
+struct page是与物理page对应的，访问频率很高。因此需要实现对它们的高效访问。
+sparse_int 就构建了 pfn与 struct page的映射数据结构，实现了 pfn 与 对应 struct page
+的快速转换。
+
+
+这里需要提及 memory model。
+
+CONFIG_FLATMEM
+此种模型，主要用于PC中。 适用于系统内存数量不太大，内存只属于一个CPU，不存在NUMA
+的访问时间差异。且内存区域没有holes或者 分布很是紧密的情况。
+strcut page对应的映射结构是 mem_map，参见 alloc_node_mem_map中的处理。
+memory_model.h (include\asm-generic)中定义了 pfn 与 struct page 之间转换的宏。
+可以参考。
+
+DISCONTIGMEM
+
+老式的模型。有诸多约束，已经被sparse mem替代。
+
+SPARSEMEM
+
+使用与 NUMA，稀疏的内存分布模型。
+如果还是采用FLATMEM的映射模式，struct page会浪费较多内存空间。且不适合支持 memory
+hotplug等。
+
+
+从下面的配置项定义，可以看到 三者是exclusive的。
+config DISCONTIGMEM
+        def_bool y
+        depends on (!SELECT_MEMORY_MODEL && ARCH_DISCONTIGMEM_ENABLE) || DISCONTIGMEM_MANUAL
+
+config SPARSEMEM
+        def_bool y
+        depends on (!SELECT_MEMORY_MODEL && ARCH_SPARSEMEM_ENABLE) || SPARSEMEM_MANUAL
+
+config FLATMEM
+        def_bool y
+        depends on (!DISCONTIGMEM && !SPARSEMEM) || FLATMEM_MANUAL
+
+config FLAT_NODE_MEM_MAP
+        def_bool y
+        depends on !SPARSEMEM
+
+
+
+
+用于sparse mem的配置项。
+CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER  表示struct page所需要的物理空间是连续
+分配的；
+
+在sparse_init 中，描述 物理page 的数据结构分成两部分，
+第一部分通过  alloc_usemap_and_memmap(sparse_early_usemaps_alloc_node, 完成所
+需要内存的分配。这些内存用于存放 NR_PAGEBLOCK_BITS 比特的 page block flags. 每个
+section 可以划分为 (1UL << (PFN_SECTION_SHIFT - pageblock_order)) 个 page blocks,
+每个block 需要使用 NR_PAGEBLOCK_BITS 比特记录此 block的flags。
+
+有必要说明一下 alloc_usemap_and_memmap 的算法。
+该函数会遍历所有memory section, 哪些sections 有效存在实际在 memory_present中 已经
+完成了设置。对于有效存在的sections，可以确定此section属于的node。
+alloc_usemap_and_memmap找到同一个node中连续的sections，也就是连续的内存区域，然后
+调用 诸如 sparse_early_usemaps_alloc_node 的钩子函数完成针对这些内存的数据结构
+创建。所分配的内存应该也是在相同的 node中。
+需要注意的是，同一个node的非连续 section会作为不同的 管理域分配不同的内存来保存
+数据结构。
+
+
+剩下需要关注的是 CONFIG_SPARSEMEM_VMEMMAP 机制。 
+该配置项 引入的目的是减少 内存管理结构的内存消耗，相对于非 CONFIG_SPARSEMEM_VMEMMAP，
+能更加高效的完成 pfn 与 struct page的转换。
+
+CONFIG_SPARSEMEM_VMEMMAP 核心思想是 将所有 page的struct page需要的物理空间（对于
+同一个section应该是连续的）映射到专用的连续虚拟空间段。 该虚拟空间段对于x86_64是
+
+#define VMEMMAP_START	 _AC(0xffffea0000000000, UL)
+#define vmemmap ((struct page *)VMEMMAP_START)
+位于vmalloc区之后的1TB空间。
+
+核心的处理函数是 vmemmap_populate -> vmemmap_populate_hugepages，会建立vmemmap对应
+的页表，也就是 PA <----> VA的映射。
+
+而对于 非 CONFIG_SPARSEMEM_VMEMMAP，使用的是 _va得到 struct page所存储空间对应的
+内核VA。然后此 VA会保存到 struct mem_section 结构的section_mem_map中。参见 
+sparse_init_one_section 的处理。然后在 __page_to_pfn 和 __pfn_to_page 处理时，
+通过 __section_mem_map_addr(__nr_to_section(__sec))) 等获取到 该section对应的
+struct page区的起始地址。
+
+而 基于 CONFIG_SPARSEMEM_VMEMMAP 的，不需要访问 struct mem_section来完成转换：
+#define __pfn_to_page(pfn)	(vmemmap + (pfn))
+#define __page_to_pfn(page)	(unsigned long)((page) - vmemmap)
+
+
+9. 
+
+对于x86_32, native_pagetable_init
+对于x86_64, paging_init
+
+
+9.1  永久map
+
+我们先分析 x86_32。
+
+下面调用只是在 CONFIG_HIGHMEM 时有效
+paging_init   --> pagetable_init --> permanent_kmaps_init
+
+函数完成 PKMAP_BASE ～PKMAP_BASE + PAGE_SIZE*LAST_PKMAP 范围内各级页表的创建。
+注意的是，此函数结束后，该范围内的 各个L3 页表（PTE）在物理上是连续的。这样处理的
+好处是后续OS访问某个 PKMAP 页的 pte entries时，不需要进行逐级访问了，pte都是
+连续数组元素，可以直接 根据index得到对应的entries了。
+
+该连续PTE的起始地址保存在 pkmap_page_table。
+需要记住， PKMAP 区域不属于FIXADDR范围。
+
+9.2 FIX_KMAP 
+
+对于x86_32有效。
+函数 kmap_init 针对 FIX_KMAP_BEGIN ～FIX_KMAP_END的线性空间范围。
+因为 FIXADDR area 对应的页表在 head_32.S中已经有
+
+
+9.3 movable memory的初始化处理
+
+required_movablecore
+由 movablecore=nn[KMG] 的启动参数设定
+
+required_kernelcore
+由 kernelcore=nn[KMG] 的启动参数设定, 表示不可移动，不可回收的内存页数
+
+zone_movable_pfn[nid]
+表示 某个指定 nid中movable 内存的最小pfn 
+目前为了支持memory migration, 引入了一个新的zone类型 ZONE_MOVABLE, 用于表示哪些
+memory可以migrate到其它内存。
+
+首先，通过 find_usable_zone_for_movable 从多种 zone 中选择可以用作ZONE_MOVABLE的
+zone。 其zone id设置到 movable_zone变量中，表示 movable region能从不低于这个zone
+的其它zone中获得movable memory（自动选择movable区时）。
+目前选择机制是选择zone id 最高的非 ZONE_MOVABLE的zone。此zone中的可用memory，最终
+可能是部分划入ZONE_MOVABEL，可能全部划入，也可能全不划入。
+具体参考 find_zone_movable_pfns_for_nodes
+
+在该函数中， arch_zone_lowest_possible_pfn[movable_zone] 是一个全局的值，不会因为
+node id不同而有不同的值。此值实际上是 某个zone的下界线。node中不同的memory regions
+将使用全局性的zone界线数组 arch_zone_lowest_possible_pfn[],
+arch_zone_highest_possible_pfn[]划分为不同的 zone 区。
+
+自动选择 MOVABLE区域时，对于小于 arch_zone_lowest_possible_pfn[movable_zone]的
+memory region, 都归入到 kernelcore，不作为 ZONE_MOVABLE的内存，因此 表示 当前
+node的 movable zone 起始地址的 zone_movable_pfn[nid] 会被设置为 该memory region的
+end_pfn； 直到当前node的某个 memory region包含了
+arch_zone_lowest_possible_pfn[movable_zone] 或 完全大于 它。此时，如果均衡摊派到
+每个node的 kernelcore_remaining 量在之前处理过程中没有满足，将 使用该memory region
+中的有效内存，部分满足或完全满足 kernelcore_remaining的要求。 如果本memory region的
+全部页空间还不足以满足 kernelcore_remaining， 更新zone_movable_pfn[nid]为该region的
+end页后，将继续下一个 memory region的均衡处理。如果完全满足，那更新
+zone_movable_pfn[nid] 为刚好满足剩余 kernelcore_remaining时所需要占用的内存部分
+的最后一个页，然后完成当前node的遍历处理。
+
+总结的说，某个node中所有小于 arch_zone_lowest_possible_pfn[movable_zone]的regions
+都被划入 kernelcore，包含或大于 arch_zone_lowest_possible_pfn[movable_zone]的
+regions，优先满足 均衡分配量 kernelcore_remaining的需求。直到 kernelcore_remaining
+被满足，否则全部memory regions都会划入 kernelcore，从而在该node中没有ZONE_MOVABLE。
+
+zone_movable_pfn[nid] 就是作为该nid的ZONE_MOVABLE的起始界线。如果该nid的全部
+memory regions都不足以满足 kernelcore_remaining的均衡需求，那全部 memory regions
+都会被作为 kernelcore。此时 zone_movable_pfn[nid] 就是该nid最大的pfn, 效果就相当于
+该nid没有movable zone。
+
+
+9.4 page的flags
+
+1. page flags的比特分布
+
+在 include/linux/page-flags-layout.h 中定义了 section, node, zone, LAST_PID,
+LAST_CPU 在 8 * sizeof(unsigned long) 比特中占据多少。
+
+#ifdef CONFIG_SPARSEMEM
+#include <asm/sparsemem.h>
+
+/* SECTION_SHIFT	#bits space required to store a section # */
+#define SECTIONS_SHIFT	(MAX_PHYSMEM_BITS - SECTION_SIZE_BITS)
+
+#endif /* CONFIG_SPARSEMEM */
+
+#if defined(CONFIG_SPARSEMEM) && !defined(CONFIG_SPARSEMEM_VMEMMAP)
+#define SECTIONS_WIDTH		SECTIONS_SHIFT
+#else
+#define SECTIONS_WIDTH		0
+#endif
+
+#define ZONES_WIDTH		ZONES_SHIFT
+
+#if SECTIONS_WIDTH+ZONES_WIDTH+NODES_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
+#define NODES_WIDTH		NODES_SHIFT
+#else
+#ifdef CONFIG_SPARSEMEM_VMEMMAP
+#error "Vmemmap: No space for nodes field in page flags"
+#endif
+#define NODES_WIDTH		0
+#endif
+
+NR_PAGEFLAGS 定义在 bounds.c (kernel):	DEFINE(NR_PAGEFLAGS, __NR_PAGEFLAGS);
+__NR_PAGEFLAGS 定义在 enum pageflags中；
+
+1) section 的比特width只是对 CONFIG_SPARSEMEM 有意义，否则 SECTIONS_WIDTH，
+SECTIONS_SHIFT均为0. 因为 section number需要保存在 page flags 以支持pfn 与
+struct page的转换；
+2)  zone width 等于 ZONES_SHIFT，实际上取决于 MAX_NR_ZONES的配置值
+（也就是__MAX_NR_ZONES）。 不管哪种模式，zone width都应该存在。
+
+#if MAX_NR_ZONES < 2
+#define ZONES_SHIFT 0
+#elif MAX_NR_ZONES <= 2
+#define ZONES_SHIFT 1
+#elif MAX_NR_ZONES <= 4
+#define ZONES_SHIFT 2
+#else
+#error ZONES_SHIFT -- too many zones configured adjust calculation
+#endif
+
+3） NODES占据比特的定义取决与 CONFIG_NODES_SHIFT，否则为0
+在 numa.h中：
+#define NODES_SHIFT     CONFIG_NODES_SHIFT
+
+而 include/linux/page-flags-layout.h 中的宏定义表明，NODES是否占据page flags中
+的比特是不确定的。如果 page flags中必须优先分配的比特满足后剩余比特 >= NODES_SHIFT,
+那么 NODES_WIDTH 就是 NODES_SHIFT，否则为0. 
+但是 NODE id是MM管理所必需的数据，因此会采用以下定义来保存 node id.
+
+在 page-flags-layout.h 中：
+#if !(NODES_WIDTH > 0 || NODES_SHIFT == 0)
+#define NODE_NOT_IN_PAGE_FLAGS
+#endif
+
+在sparse.c中：
+
+#ifdef NODE_NOT_IN_PAGE_FLAGS
+/*
+ * If we did not store the node number in the page then we have to
+ * do a lookup in the section_to_node_table in order to find which
+ * node the page belongs to.
+ */
+#if MAX_NUMNODES <= 256
+static u8 section_to_node_table[NR_MEM_SECTIONS] __cacheline_aligned;
+#else
+static u16 section_to_node_table[NR_MEM_SECTIONS] __cacheline_aligned;
+#endif
+
+
+将会使用 section_to_node_table[NR_MEM_SECTIONS]来记录 section 与 node id的映射关系。
+该数组下标是 section no.值是 node id。
+
+4) LAST_CPUID也采用类似于 NODES_WIDTH的策略
+
+#if SECTIONS_WIDTH+ZONES_WIDTH+NODES_SHIFT+LAST_CPUPID_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
+#define LAST_CPUPID_WIDTH LAST_CPUPID_SHIFT
+#else
+#define LAST_CPUPID_WIDTH 0
+#endif
+
+#if defined(CONFIG_NUMA_BALANCING) && LAST_CPUPID_WIDTH == 0
+#define LAST_CPUPID_NOT_IN_PAGE_FLAGS
+#endif
+----------------------------------
+2. 宏之间关系说明
+
+在 include/linux/mm.h 定义了以下宏：
+
+#define SECTIONS_PGOFF		((sizeof(unsigned long)*8) - SECTIONS_WIDTH)
+#define NODES_PGOFF		(SECTIONS_PGOFF - NODES_WIDTH)
+#define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
+#define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
+这些宏被后面的宏使用.
+
+#define SECTIONS_PGSHIFT	(SECTIONS_PGOFF * (SECTIONS_WIDTH != 0))
+#define NODES_PGSHIFT		(NODES_PGOFF * (NODES_WIDTH != 0))
+#define ZONES_PGSHIFT		(ZONES_PGOFF * (ZONES_WIDTH != 0))
+#define LAST_CPUPID_PGSHIFT	(LAST_CPUPID_PGOFF * (LAST_CPUPID_WIDTH != 0))
+这些比特表示对应标志有定义（非0）时，在page flags中的起始比特位置.
+
+它们之间的关系可以参考 mminit_verify_pageflags_layout
+
+nr_node_ids 表示 node_possible_map 中最大 node id + 1.
+参见 setup_nr_node_ids.
+
+
+10. zone的初始化
+
+由free_area_init_nodes 完成。
+
+find_zone_movable_pfns_for_nodes 将完成 zone_movable_pfn[nid]的设置。
+zone_movable_pfn[nid]表示某个指定 node 中的起始 movable pfn;
+目前支持两种方式配置，一种是通过 ACPI的 srat配置设定哪些 memory是hotplug的；
+一种是通过设定 required_kernelcore 后通过内核自动均衡计算得到。
+后者应该不是用的那么多。具体参考 9.3的描述。
+
+
+然后遍历所有online的node：
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+		free_area_init_node(nid, NULL,
+				find_min_pfn_for_node(nid), NULL);
+
+		/* Any memory on that node */
+		if (pgdat->node_present_pages)
+			node_set_state(nid, N_MEMORY);
+		check_for_memory(pgdat, nid);
+	}
+
+find_min_pfn_for_node 会得到指定的node中最少的可用pfn。
+最后 通过 node_set_state(nid, N_MEMORY) 设置 node_states[N_MEMORY] 表示此node
+存在可用内存页。
+
+因此重点在于 free_area_init_node 
+
+10.1  get_pfn_range_for_nid 
+获得指定 node 的内存所覆盖的 pfn 范围，也就是 所有在 memblock.memory中的regions
+的最小，最大 pfn； ---- 获得物理地址范围
+
+10.2 calculate_node_totalpages 
+
+通过此函数完成 指定node的 node_spanned_pages 和 node_present_pages 设置。
+
+1. 几个重要结构成员的说明：
+
+pgdat->node_start_pfn 表示 此 node的起始pfn；
+pgdat->node_present_pages 表示 此node中的可用 pages数；
+pgdat->node_spanned_pages 表示此node覆盖的 page范围（包括holes);
+pgdat->node_id 表示 此结构描述的是node id；
+pgdat->nr_zones 表示该node中具有非0的页覆盖范围的zone中ZONE_TYPE最大的那个zone id;
+
+
+pgdat->node_size_lock  为了支持 HOT_PLUG而引入的锁；
+
+
+2. ZONE_MOVABLE的影响
+arch_zone_lowest_possible_pfn[zone_type] 
+arch_zone_highest_possible_pfn[zone_type] 
+指定了系统 针对 zone_type所设定的 pfn 分界线，落入到此范围内的memory regions具有
+zone_type属性，超出此范围的不会属于zone_type；
+系统使用此数组来从 node的memory regions中提取出属于 此zone_type的 sub-regions;
+从而知道在此node中此 zone_type的内存size。
+如果没有引入 ZONE_MOVABLE,那么 每个node的zone范围就是由全局的
+(arch_zone_lowest_possible_pfn[zone_type],arch_zone_highest_possible_pfn[zone_type])
+与此node 的［node_start_pfn，node_end_pfn）的最小重叠范围决定了。
+但是引入ZONE_MOVABLE后，产生的 zone_movable_pfn[nid] 会影响此nid下的zone的范围（某些
+zone会被分割出来部分作为ZONE_MOVABLE). 函数 adjust_zone_range_for_zone_movable 
+就是完成相应的调整。
+
+
+3. 计算node下所有ZONE的页范围
+某个node下zone的spanned_pages 和 present_pages 在函数 free_area_init_core 中完成。
+
+实际上，在目前的实现中， 依赖于zone_spanned_pages_in_node 和
+zone_absent_pages_in_node两个函数完成ZONE页范围的计算。 node的页范围也是这样。
+只是计算node的页范围时，将各个zone的页范围相加起来了。
+目前的处理使得 calculate_node_totalpages 似乎冗余。
+
+
+函数 zone_spanned_pages_in_node 遍历 所有 MAX_NR_ZONES 个zone_type，对每个zone_type
+的理论pfn范围（包括holes)进行属于此zone_type的范围界定。
+请注意，返回的size是理论范围，是基于范围内内存都是连续，也就是没有holes的假设的。
+
+ZONE_MOVABLE类型 没有对应的 arch_zone_lowest_possible_pfn[]分界线（都被设置为0），
+也就是没有定义该zone的pfn范围。实际上，ZONE_MOVABLE 是在zone初始化过程中生成的，
+不是程序静态配置。 在确定 zone_movable_pfn[nid] 后，大于 zone_movable_pfn[nid]的
+范围就是ZONE_MOVABLE。其它zone type也根据 zone_movable_pfn[nid] 与 
+（arch_zone_lowest_possible_pfn[], arch_zone_highest_possible_pfn[])的大小
+关系，调整其范围，避免与 ZONE_MOVABLE重叠。
+参考 adjust_zone_range_for_zone_movable的处理。
+
+最后，通过 zone_absent_pages_in_node 的处理，结合 该node的memblock.memory中的
+regions的实际范围，计算出 不在 memblock.memory中的该zone的pfn范围。从而得到该
+zone实际的pgdat->node_present_pages。
+
+alloc_node_mem_map 只是对 CONFIG_FLAT_NODE_MEM_MAP 有效，不予太多关注。
+
+zone->zone_start_pfn 表示此zone理论覆盖范围的起始pfn，并不是实际存在的属于该zone的
+页对应的pfn；
+
+10.3 memmap_init
+
+此函数的主要功能是初始化指定 zone下覆盖pfn的对应 struct page，并会设置pageblock的
+flags,存放该 pageblock的 migrate type在flags中（参考 set_pfnblock_flags_mask）。
+这里的pfn不是memory中实际存在的页所对应的 pfn，也就是包含了holes的（span page region).
+因此，如果不做任何约束的话，将会对holes中的pfn也初始化 struct page.
+
+在memmap_init_zone 中会进行一个filter处理，如下：
+		if (context == MEMMAP_EARLY) {
+			if (!early_pfn_valid(pfn))
+				continue;
+			if (!early_pfn_in_nid(pfn, nid))
+				continue;
+		}
+此处的判断在pfn属于 某个拥有实际memory pfn的section时，会返回TRUE. 也就是说当前pfn
+属于某个已经初始化的section时，才会继续后续处理。
+因此这个判断不是针对page级的，而是section级的。在holes小于section时，没有什么效果；
+
+
+11. zone 的处理
+
+
+
+
+11.1 zone的类型 与 GFP_ZONE_TABLE
+
+CONFIG_ZONE_DMA 与CONFIG_ZONE_DMA32 不是互斥的。前者是针对 DMA访址在16MB以内，后者
+是 4G以内。 不过 CONFIG_ZONE_DMA32 是x86_64才使用。
+
+目前的 __MAX_NR_ZONES 不超过 4, 与 ZONES_SHIFT 存在捆绑关系。
+
+
+
+系统采用 BITS_PER_LONG 比特记录zone allocation policy。 因为zone type枚举至少需要
+ZONES_SHIFT来描述，因此将 BITS_PER_LONG按照 ZONES_SHIFT划分，对于 x86_32可以支持
+16种policy. 对于 64位系统，ZONES_SHIFT倒是可以大于2。
+
+系统使用4个比特通过组合来表达 支持哪些 zone policy。 定义如下：
+#define ___GFP_DMA		0x01u
+#define ___GFP_HIGHMEM		0x02u
+#define ___GFP_DMA32		0x04u
+#define ___GFP_MOVABLE		0x08u
+
+组合的原则：
+1) 前3个比特是 zone specifier，不能用于组合 zone allocation policy;
+2) __GFP_MOVABLE 是zone speciier 和 zone allocation policy，因此可以独立表示
+zone allocation policy，也可与其他 zone specifier组合表示 zone allocation policy；
+
+
+
+GFP_ZONE_TABLE 的某个 zone allocation policy 段中的 specifier是enum zone_type，
+具体如何使用？（待跟踪）
+可以参考 gfp_zone 中如何使用 GFP_ZONE_TABLE.
+传入的是 gfp_t flags， 只是关心lowest 4 比特,然后通过 该值得到对应的段,使用 ZONES_SHIFT
+将specifier 取出。也可以参考 gfp_zone(gfp_t flags)。该函数返回的是 GFP_ZONE_TABLE
+中某个 ZONES_SHIFT段中保存的 enum zone_type，表示 分配page时只能从 <= 此处指定zone_type
+的zone中分配。参见 for_each_zone_zonelist 这个宏。
+
+
+
+11.2 zone 与 CPU, node关系
+
+
+1. current_zonelist_order 的设置
+
+set_zonelist_order 主要设置 current_zonelist_order。 在CONFIG_NUMA时， 
+current_zonelist_order 由 user_zonelist_order 的配置决定。（也就是启动参数
+numa_zonelist_order=??)
+在没有配置 NUMA时，置为 ZONELIST_ORDER_ZONE。
+
+函数 build_all_zonelists 在booting up以及 memory hotplug时会被触发。
+
+
+2. 各个node的状态数组 node_states[] 
+
+nr_online_nodes 定义在page_alloc.c，每次 node_set_online 和 node_set_offline时
+会更新 nr_online_nodes。 也就是nr_online_nodes = num_node_state(N_ONLINE)。
+
+3. nr_node_ids
+
+如果 使用NUMA, 在page_alloc.c 中将有以下定义：
+#if MAX_NUMNODES > 1
+int nr_node_ids __read_mostly = MAX_NUMNODES;
+int nr_online_nodes __read_mostly = 1;
+
+否则
+nodemask.h (src\include\linux):#define nr_node_ids		1
+
+至于设置此变量，参考
+
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+
+#if MAX_NUMNODES > 1
+/*
+ * Figure out the number of possible node ids.
+ */
+void __init setup_nr_node_ids(void)
+{
+	unsigned int node;
+	unsigned int highest = 0;
+
+	for_each_node_mask(node, node_possible_map)
+		highest = node;
+	nr_node_ids = highest + 1;
+}
+#endif
+也就是取决于 node_possible_map。
+而 node_possible_map 通过 numa_register_memblks 完成设置。
+
+
+
+
+以下分析依赖于  percpu
+
+4. CPU 与 node的关系： x86_cpu_to_node_map
+
+DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
+
+
+
+
+5.  CPU与node的关系： node_to_cpumask_map[]
+
+定义在 numa.c中，如下：
+cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+
+
+在配置 CONFIG_CPUMASK_OFFSTACK 的情况下， cpumask_var_t定义为指针
+typedef struct cpumask *cpumask_var_t;
+此种情况是采用动态分配内存的方式，能避免 堆栈overflow的风险。
+否则是
+typedef struct cpumask cpumask_var_t[1];
+
+因此，在 CONFIG_CPUMASK_OFFSTACK 情况下，setup_node_to_cpumask_map 将对每个 node
+进行cpumask的内存分配。
+
+
+
+此数组建立 node 与 struct cpumask 之间的关系。 元素下标是 node idex. 一个cpu可以
+对应多个node.
+通过 numa_add_cpu设置。
+
+对于 非CONFIG_NUMA_EMU 且 CONFIG_DEBUG_PER_CPU_MAPS，会在 identify_cpu 中调用 numa_add_cpu 设置
+node_to_cpumask_map[]. 
+
+否则通过  numa_add_cpu -> early_cpu_to_node （topology.h中） 完成设置。
+
+
+11.3 zone的几个关键结构
+
+1. struct pglist_data
+
+
+在arch/x86/mm/numa.c中有定义：
+struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
+该指针在 alloc_node_data 中设置。
+
+通过 NODE_DATA(nid) 能取得 指定 nid的 node_data[] 指向的 struct pglist_data
+
+#define NODE_DATA(nid)		(node_data[nid])
+
+此结构是某个node对应的起始结构。 任何一个node中可以按照系统统一的zone分界线划分出
+不同的zone。 实际上，此node结构下的 struct zone node_zones[MAX_NR_ZONES] 等关键
+结构成员的初始化 在下面路径中完成：
+
+setup_arch -> paging_init -> zone_sizes_init -> free_area_init_nodes ->
+free_area_init_node -> memmap_init
+
+同时，此调用路径会完成 memmap的创建，也就是建立 struct page与 pfn，以及 virtual page
+的关系。 在paging_init中调用 zone_sizes_init之前，已经调用 
+	sparse_memory_present_with_active_regions(MAX_NUMNODES);
+	sparse_init();
+完成了 sparse memory的初始化处理。
+
+struct pglist_data 中的成员
+	int node_id;
+记录了此node结构对应的node id.
+
+
+2. struct zonelist
+
+struct zoneref {
+	struct zone *zone;	/* Pointer to actual zone */
+	int zone_idx;		/* zone_idx(zoneref->zone) */
+};
+
+#define MAX_ZONES_PER_ZONELIST (MAX_NUMNODES * MAX_NR_ZONES)
+
+struct zonelist {
+	struct zonelist_cache *zlcache_ptr;		     // NULL or &zlcache
+	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+#ifdef CONFIG_NUMA
+	struct zonelist_cache zlcache;			     // optional ...
+#endif
+};
+
+使用此结构的变量作为 node的 struct pglist_data中的 
+	struct zonelist node_zonelists[MAX_ZONELISTS];
+而存在。
+
+此结构主要在 for_each_zone_zonelist 中使用。
+
+此宏是遍历 zlist 指向的 某个 struct zonelist （通过诸如 node_zonelist(numa_node_id() 获得）
+中的有效 zoneref节点（每个_zonerefs[]对应一个zone)，检测其对应 zoneidx <= highidx,则
+返回 此zone对应的 struct zone 指针到 zone 中。 此宏中的 zlist是遍历对象，highidx是
+指定过滤条件，z是中间变量，指向 struct zoneref, zone是返回所选择的struct zone的指针
+#define for_each_zone_zonelist(zone, z, zlist, highidx) \
+	for_each_zone_zonelist_nodemask(zone, z, zlist, highidx, NULL)
+
+
+#define for_each_zone_zonelist_nodemask(zone, z, zlist, highidx, nodemask) \
+	for (z = first_zones_zonelist(zlist, highidx, nodemask, &zone);	\
+		zone;							\
+		z = next_zones_zonelist(++z, highidx, nodemask),	\
+			zone = zonelist_zone(z))			\
+
+static inline struct zoneref *first_zones_zonelist(struct zonelist *zonelist,
+					enum zone_type highest_zoneidx,
+					nodemask_t *nodes,
+					struct zone **zone)
+{
+	struct zoneref *z = next_zones_zonelist(zonelist->_zonerefs,
+							highest_zoneidx, nodes);
+	*zone = zonelist_zone(z);
+	return z;
+}
+
+/* Returns the next zone at or below highest_zoneidx in a zonelist */
+struct zoneref *next_zones_zonelist(struct zoneref *z,
+					enum zone_type highest_zoneidx,
+					nodemask_t *nodes)
+{
+	/*
+	 * Find the next suitable zone to use for the allocation.
+	 * Only filter based on nodemask if it's set
+	 */
+	if (likely(nodes == NULL))
+		while (zonelist_zone_idx(z) > highest_zoneidx)
+			z++;
+	else
+		while (zonelist_zone_idx(z) > highest_zoneidx ||
+				(z->zone && !zref_in_nodemask(z, nodes)))
+			z++;
+
+	return z;
+}
+
+static inline int zref_in_nodemask(struct zoneref *zref, nodemask_t *nodes)
+{
+#ifdef CONFIG_NUMA
+	return node_isset(zonelist_node_idx(zref), *nodes);
+#else
+	return 1;
+#endif /* CONFIG_NUMA */
+}
+
+请注意 for_each_zone_zonelist_nodemask(zone, z, zlist, highidx, nodemask)，
+此宏还引入了一个 nodemask 的过滤条件，如果待选的zone所属于的 node不在 nodemask
+指定的bitmap中，将被过滤掉。
+
+3. struct zonelist_cache
+
+build_zonelist_cache 会初始化 pg_data_t 结构中的 node_zonelists[0].zlcache
+struct zonelist_cache {
+	unsigned short z_to_n[MAX_ZONES_PER_ZONELIST];		/* zone->nid */
+	DECLARE_BITMAP(fullzones, MAX_ZONES_PER_ZONELIST);	/* zone full? */
+	unsigned long last_full_zap;		/* when last zap'd (jiffies) */
+};
+
+此结构的z_to_n[] 下标就是 zonelist->_zonerefs[]的下标。
+
+
+5. zone的遍历
+
+
+for_each_zone 将从首个 online node开始，遍历该node下的有效zone, 然后开始下一个online 
+node下zone的遍历，直到所有 node下所有zone都处理完成。
+
+
+
+
+11.4 build_all_zonelists
+
+start_kernel中在percpu初始化后，会调用此函数。
+启动阶段，会调用 build_all_zonelists_init；否则将进行 MEMORY_HOTPLUG 的处理。
+
+最终调用的是 __build_all_zonelists(void *data)
+传入的参数是 指向 pg_data_t 结构（某个node)。如果 data非NULL,将首先对此指定的node
+进行 build_zonelists 和 build_zonelist_cache 处理。 否则，将遍历 for_each_online_node(nid)，
+逐一进行同样的处理。
+
+
+#define ZONELIST_ORDER_DEFAULT  0
+表示构建 struct zonelist的_zonerefs[]时，优先添加一个node下所有有效zone_type（从高
+到低）到_zonerefs[]中，然后是其它的邻近node的zone. 也就是先遍历zone_type; build_zonelists_in_node_order
+#define ZONELIST_ORDER_NODE     1
+表示构建 struct zonelist的_zonerefs[]时，优先将按照zone_type（从高到低）对应的
+有效zone检索之前已经按照distance从低到高排好序的node添加该zone,直到所有zone_type
+完成处理。也就是 先遍历node； build_zonelists_in_zone_order
+#define ZONELIST_ORDER_ZONE     2
+
+不管哪种方式，第一个node应该是local node中zonelist的首个zone。参见 
+local_memory_node。
+
+
+
+
+
+
+
+
+
+
+

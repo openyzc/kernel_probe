@@ -1,0 +1,204 @@
+
+in drivers/acpi/acpica/tbxface.c
+This macro, #define DEFINE_ACPI_GLOBALS, is defined.
+
+So, the ACPI_GLOBAL in drivers/acpi/acpixf.h is variable definition for
+/drivers/acpi/acpica/acglobal.h
+
+This macro will be used in drivers/acpi/acpica/acglobal.h
+such as these :
+
+ACPI_GLOBAL(struct acpi_table_list, acpi_gbl_root_table_list);
+
+in drivers/acpi/acpica/utglobal.c, will :
+#include <acpi/acpi.h>
+#include "accommon.h"
+
+in drivers/acpi/acpi.h :
+include/acpi/acpi.h:64:#include <acpi/acpixf.h>
+
+and in accommon.h :
+#include "acglobal.h"		/* All global variables */
+
+So, all  the ACPI_GLOBAL in acglobal.h will be exteneded into global variable
+definitions.
+
+
+=================================
+
+1. acpi_boot_table_init
+
+start_kernel -> setup_arch -> acpi_boot_table_init
+
+1.1 acpi_table_init
+
+static bool acpi_verify_table_checksum __initdata = false;
+
+kernel parameter of acpi_force_table_verification can set the above variable.
+
+1) set acpi_gbl_verify_table_checksum based on acpi_verify_table_checksum
+2) call acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0)
+here, the initial_tables is an staic array with struct acpi_table_desc
+elements.
+
+All the initial_tables are cleared as ZERO, then initialize the gobal
+variable:
+
+ACPI_GLOBAL(struct acpi_table_list, acpi_gbl_root_table_list)
+
+struct acpi_table_list {
+	struct acpi_table_desc *tables;	/* Table descriptor array */
+	u32 current_table_count;	/* Tables currently used in the array */
+	u32 max_table_count;	/* Max tables array  will hold. Total count */
+	u8 flags;
+};
+
+acpi_os_get_root_pointer() will get RSDP by the methods defined in ACPI spec
+6.0;
+The RSDP is physical address points to struct acpi_table_rsdp, then you can
+traverse all the system description tables with RSDT or XSDT.
+The header signature of RSDP is "RSD PTR" (ACPI_SIG_RSDP).
+
+acpi_tb_fix_string(local_header.oem_id, ACPI_OEM_ID_SIZE) just replace the
+non-printable characters as '?'.
+
+The core function of acpi_init_table is acpi_tb_parse_root_table().
+it will do these :
+2.1) acpi_os_map_memory
+map the physical address of RSDP to virtual address.
+2.2) acpi_tb_print_table_header
+replace all non-printable characters in RSDP, then output to the terminal for
+debug.
+2.3) decide to use RSDT or XSDT?
+according to the revision, two physical addresses, control flag from
+configure, then choose to use RSDT or XSDT.
+
+acpi_gbl_do_not_use_xsdt can be set as TRUE with two ways:
+"acpi=rsdt"  or
+acpidump -x
+
+when acpi_gbl_do_not_use_xsdt is TRUE, only can use RSDT, and
+gbl_do_not_dump_xsdt is TRUE too.
+
+After this processing, will only output the header of RSDT or XSDT.
+
+2.4) get the length of RSDT/XSDT
+These two tables have the standard struct acpi_table_header
+
+so, length = table->length;
+Then will check the length validity.
+
+2.5) acpi_tb_verify_checksum
+
+checksum verification
+
+2.6) traverse to get the address entry
+for (i = 0; i < table_count; i++) {
+	...
+
+acpi_tb_get_root_table_entry will get or convert the address value from
+RSDT/XSDT entries array.
+
+the next core function is acpi_tb_install_standard_table. we will discuss it
+in the next chater.
+
+For FADT, will have special process by acpi_tb_parse_fadt.
+
+acpi_gbl_fadt_index = table_index;
+
+Here, table_index is the index of RSDT/XSDT address entries.
+
+
+1.2 acpi_tb_install_standard_table
+
+
+1) acpi_tb_acquire_temp_table
+
+This function will initialize the local struct acpi_table_desc with the data
+in standard system table header of ACPI.
+
+struct acpi_table_desc {
+	acpi_physical_address address;
+	struct acpi_table_header *pointer;
+	u32 length;		/* Length fixed at 32 bits (fixed in
+				   table header) */
+	union acpi_name_union signature;
+	acpi_owner_id owner_id;
+	u8 flags;
+};
+besides the pointer, owner_id, the others will be set in this step.
+
+
+
+2) special process for  SSDT (ACPI_SIG_SSDT)
+
+variable acpi_gbl_disable_ssdt_table_install can be set as TRUE with kernel parameter
+"acpi_no_static_ssdt"
+
+if reload = F and acpi_gbl_disable_ssdt_table_install = T, then SSDT will be
+skipped here.
+
+3) acpi_tb_verify_temp_table(&new_table_desc, NULL)
+
+This function will check the table data if acpi_gbl_verify_table_checksum is
+TRUE based on checksum.
+
+in this function, acpi_tb_validate_temp_table will be called at first. Some
+fields of input struct acpi_table_desc parameter will be updated there.
+
+if table_desc->pointer is not set (ZERO), will be mapped as virtual address.
+But the mapping region size is decided by acpi_gbl_verify_table_checksum.
+When acpi_gbl_verify_table_checksum is FALSE, only mapping the system table
+header.
+
+Then in acpi_tb_verify_temp_table, will no  checksum verification.
+
+4) when reload is TRUE, only for SSDT or "OEM"
+
+acpi_tb_compare_tables(&new_table_desc, i)
+will compare the whole table, if equal, return non-zero.
+
+5) acpi_tb_install_table_with_override(&new_table_desc, override, table_index)
+
+this is the core function.
+
+
+5.1) acpi_tb_override_table(new_table_desc)
+since the input parameter override of acpi_tb_install_table_with_override is
+1, this function will be called.
+
+the apci_os_table_override will be called. But there are two function
+declaratioins in kernel. Which one is the right one?
+
+drivers/acpi/acpica/osl.c
+
+the other is in tools/power/acpi/os-specific/server_layers/osunixxf.c
+(this should be for tools such as acpidump)
+
+When CONFIG_ACPI_CUSTOM_DSDT is not configured, this acpi_os_table_override is
+nearly empty... So, it is just for CONFIG_ACPI_CUSTOM_DSDT.
+
+in normal cases, we do not enable CONFIG_ACPI_INITRD_TABLE_OVERRIDE too. So,
+this function will not do nothing.
+
+5.2) set the acpi_gbl_root_table_list.tables[i]
+
+acpi_tb_init_table_descriptor(&acpi_gbl_root_table_list.tables[i],
+
+OK. This function will set acpi_gbl_root_table_list.tables[i] with the
+new_table_desc data fields.
+
+After this, *table_index = i; It means the selected array index will be back
+in *table_index.
+
+
+
+
+then early_acpi_boot_init
+
+
+
+
+then acpi_boot_init
+
+

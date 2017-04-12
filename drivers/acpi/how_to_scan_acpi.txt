@@ -1,0 +1,42 @@
+1. acpi_bus_type
+
+int acpi_match_device_ids(struct acpi_device *device,
+			  const struct acpi_device_id *ids)
+
+The first paramter is from acpi_device, the second is from acpi_driver.
+
+The match process are:
+1) traverse the hwid from pnp.ids, for each hwid
+
+	2) compare with each id in struct acpi_device_id from acpi_driver
+
+	if does not match,
+	3) compare the class (it is id->cls). here, the last 3 bytes will be
+	compared with hwid->id[] where two char represent one hexadecimal byte
+	of class.
+
+for the matched acpi_driver, acpi_device_probe will call the ops->add which
+defined in struct acpi_driver.
+
+But what is the functionality of this ops->add() callback??
+
+2. handler attach
+
+acpi_scan_attach_handler(struct acpi_device *device)
+
+
+struct acpi_scan_handler has a struct acpi_device_id *ids,
+acpi_scan_match_handler(const char *idstr, const struct acpi_device_id
+			**matchid)
+will find a matched acpi_scan_handler.
+
+In this function, the first parameter is from hwid of acpi_device, the second
+is the output which is the matched struct acpi_device_id defined in the struct
+acpi_scan_handler.
+
+
+
+
+
+
+

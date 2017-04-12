@@ -1,0 +1,285 @@
+初始化调用路径如下：
+
+start_kernel -> mm_init -> kmem_cache_init
+
+在此之前，buddy allocator, percpu都已经ready.
+
+
+1. 几个关键结构
+
+
+1.1 struct kmem_cache
+
+定义在 include/linux/slab_def.h 中的  struct kmem_cache
+
+
+
+	size_t colour;			/* cache colouring range */
+	unsigned int colour_off;	/* colour offset */
+	struct kmem_cache *freelist_cache;
+	unsigned int freelist_size;
+参考 __kmem_cache_create 中的设置
+
+	cachep->colour_off = cache_line_size();
+	/* Offset must be a multiple of the alignment. */
+	if (cachep->colour_off < cachep->align)
+		cachep->colour_off = cachep->align;
+	cachep->colour = left_over / cachep->colour_off;
+	cachep->freelist_size = freelist_size;
+
+因此, colour 是此 kmem_cache最大能支持多少cache colour;
+colour_off是 每两个colour之间的colour偏移增量；
+freelist_size 是 用于管理slab的数据长度。如果是 非 OFF_SLAB，那么就是 从colour_off
+开始的freelist_size 字节是管理信息，其后才是 obj数据；参见 alloc_slabmgmt。
+
+
+
+	unsigned int batchcount;
+	unsigned int limit;
+	unsigned int shared;
+
+在 kmem_cache_init_late -> enable_cpucache -> __do_tune_cpucache 中设置；
+
+
+
+
+1.2 
+
+暂且以slab为对象
+
+在 include/linux/slab.h 中：
+#define KMALLOC_SHIFT_HIGH	((MAX_ORDER + PAGE_SHIFT - 1) <= 25 ? \
+				(MAX_ORDER + PAGE_SHIFT - 1) : 25)
+#define KMALLOC_SHIFT_MAX	KMALLOC_SHIFT_HIGH
+#ifndef KMALLOC_SHIFT_LOW
+#define KMALLOC_SHIFT_LOW	5
+#endif
+以上的 KMALLOC_SHIFT_LOW， KMALLOC_SHIFT_MAX 确定了 slab对象的log2(size)范围。
+
+#define KMALLOC_MAX_ORDER	(KMALLOC_SHIFT_MAX - PAGE_SHIFT)
+同时 KMALLOC_MAX_ORDER 在 calculate_slab_order 限定了可以用作slab空间的最大page
+order;
+
+
+#ifndef KMALLOC_MIN_SIZE
+#define KMALLOC_MIN_SIZE (1 << KMALLOC_SHIFT_LOW)
+#endif
+
+
+#define SLAB_OBJ_MIN_SIZE      (KMALLOC_MIN_SIZE < 16 ? \
+                               (KMALLOC_MIN_SIZE) : 16)
+
+
+在 mm/slab.c 中：
+此宏表示是否使用byte 来指示某个slab 对象在 kmem chache空间中的序号。 因此，
+如果采用 byte来表示，那么最多有256个对象object。如果一个page不足以容纳256
+个 SLAB_OBJ_MIN_SIZE 的对象，那么实际可支持的object数只能小于256,从而一个
+byte来记录index足够了。否则需要16比特来记录某个object的index了。
+#define FREELIST_BYTE_INDEX (((PAGE_SIZE >> BITS_PER_BYTE) \
+				<= SLAB_OBJ_MIN_SIZE) ? 1 : 0)
+
+#if FREELIST_BYTE_INDEX
+typedef unsigned char freelist_idx_t;
+#else
+typedef unsigned short freelist_idx_t;
+#endif
+
+表示某个order的page最大可容纳的 object数
+#define SLAB_OBJ_MAX_NUM ((1 << sizeof(freelist_idx_t) * BITS_PER_BYTE) - 1)
+
+
+1.3 
+
+static int slab_early_init = 1;
+此变量在slab初始化起始阶段是1，之后才会被置0.
+
+
+
+1.4 
+
+struct kmem_cache *kmem_cache;
+
+在 kmem_cache_init 中，有：
+	kmem_cache = &kmem_cache_boot;
+也就是使用了静态结构变量 kmem_cache_boot
+然后在 create_boot_cache中进行初始化设置。
+将新初始化好的 kmem_cache挂入到 slab_caches链中：
+	list_add(&kmem_cache->list, &slab_caches);
+	slab_state = PARTIAL;
+
+
+
+1.5
+
+struct kmem_cache *kmalloc_caches[KMALLOC_SHIFT_HIGH + 1];
+
+#define INDEX_NODE kmalloc_index(sizeof(struct kmem_cache_node))
+
+static __always_inline int kmalloc_index(size_t size)
+{
+	if (!size)
+		return 0;
+
+	if (size <= KMALLOC_MIN_SIZE)
+		return KMALLOC_SHIFT_LOW;
+
+	if (KMALLOC_MIN_SIZE <= 32 && size > 64 && size <= 96)
+		return 1;
+	if (KMALLOC_MIN_SIZE <= 64 && size > 128 && size <= 192)
+		return 2;
+
+可见，此函数是有size 得到对应的 kmalloc_caches[]的下标。
+
+
+static __always_inline int kmalloc_size(int n)
+{
+#ifndef CONFIG_SLOB
+	if (n > 2)
+		return 1 << n;
+
+	if (n == 1 && KMALLOC_MIN_SIZE <= 32)
+		return 96;
+
+	if (n == 2 && KMALLOC_MIN_SIZE <= 64)
+		return 192;
+#endif
+	return 0;
+}
+此函数则与 kmalloc_index相反，得到下标对应的size上限;
+
+
+此外，也能得到某个size对应的 kmem_cache下标。参见 kmalloc_slab
+
+size_index[size_index_elem(size)]
+
+以上 三个函数建立了 size 与 kmem_cache[]的index之间的关系。kmalloc_slab 在 
+create_kmalloc_caches 之后，将与 kmalloc_size, kmalloc_index 一致。
+注意， create_kmalloc_caches 会 根据KMALLOC_MIN_SIZE 的大小变更size_index[]中
+某些元素值。
+注意这里的size是 slab object的大小，不包括对齐与 debug产生的其它冗余空间。因此
+实际消耗的 size一般都要大些。
+
+
+1.6
+
+static struct kmem_cache_node __initdata init_kmem_cache_node[NUM_INIT_LISTS];
+
+struct kmem_cache_node {
+	spinlock_t list_lock;
+
+#ifdef CONFIG_SLAB
+	struct list_head slabs_partial;	/* partial list first, better asm code */
+	struct list_head slabs_full;
+	struct list_head slabs_free;
+	unsigned long free_objects;
+	unsigned int free_limit;
+	unsigned int colour_next;	/* Per-node cache coloring */
+	struct array_cache *shared;	/* shared per node */
+	struct alien_cache **alien;	/* on other nodes */
+	unsigned long next_reap;	/* updated without locking */
+	int free_touched;		/* updated without locking */
+#endif
+
+#ifdef CONFIG_SLUB
+	unsigned long nr_partial;
+	struct list_head partial;
+#ifdef CONFIG_SLUB_DEBUG
+	atomic_long_t nr_slabs;
+	atomic_long_t total_objects;
+	struct list_head full;
+#endif
+#endif
+
+}
+
+具体以上结构的设置，参考 cache_grow。
+
+	struct list_head slabs_partial;
+	struct list_head slabs_full;
+	struct list_head slabs_free;
+
+以上链表中的节点是 struct page结构，该结构指向已经分配的用于slab的页面。
+cache_grow 后新分配的页面是在 slabs_free中，且page->active = 0,
+经过 ____cache_alloc_node 后分配slab object后，会挂入到 slabs_partial 或
+slabs_full中；参见 ____cache_alloc_node 中的处理。
+
+
+以下 array缓冲 在 alloc_kmem_cache_node 中设置。
+	struct array_cache *shared;	/* shared per node */
+	struct alien_cache **alien;	/* on other nodes */
+
+
+
+2. page 与 slab
+
+在 alloc_slabmgmt 中设置. s_mem指向 第一个 slab object.
+		void *s_mem;
+指向 slab 管理信息，在on_slab中，是 slab对应的page + colour_off之后；
+		void *freelist;
+将 page 与 slab关联起来
+		struct kmem_cache *slab_cache;
+最后两个成员，在 slab_map_pages 中设置。
+
+表示当前page已经被分配出去的objects数，参见 ____cache_alloc_node -> slab_get_obj:
+			unsigned int active;
+
+
+函数 ____cache_alloc_node 中的 	list_del(&page->lru); 处理不需要每次都执行，当前
+是 slabs_partial 且 page->active > 0时是不需要list_del；
+
+
+ON SLAB
+
+
+______________________________________________________________________________
+|着色偏移|freelist_size(slab管理信息）|RED_ZONE第一个longlong|poison data(覆盖obj data+longlong RED_ZONE|
+|____________________________________________________________________
+
+______________________________________________________________________________
+|STORE_USER(最大REDZONE_ALIGN）｜
+
+
+
+3. 一个使用kmalloc_cache的例子
+pgtable_init -> ptlock_cache_init
+
+page_ptl_cachep = kmem_cache_create("page->ptl", sizeof(spinlock_t)
+
+先通过 kmem_cache_create -> do_kmem_cache_create { -> kmem_cache_zalloc
+						 -> __kmem_cache_create
+
+
+================================SLUB=================
+slub 与 slab 一样是用于 kmalloc的。只是slub更加简单，更加节省内存消耗。
+slab.h, slab_common.c都是两种机制共享的。
+
+
+在struct page 中有以下成员，用于建立 page 与 slub之间的联系。可参考 allocate_slab
+
+					struct { /* SLUB */
+						unsigned inuse:16;
+						unsigned objects:15;
+						unsigned frozen:1;
+					};
+
+此外，还有 （参考 new_slab ）
+		void *freelist;
+
+		struct kmem_cache *slab_cache;
+
+
+
+
+4. SLUB与 slab的区别
+
+SLUB 不再使用专门的 slab管理数据，尤其没有针对每个slab object有一个offset来记录该
+object的序号。 
+SLUB在每个 object 起始的 s->offset 处,保存一个指向下一个 object 起始地址（在分配的
+pages中某个位置）。s->offset定义在 struct kmem_cache 中的int offset；
+参见 new_slab 中的  set_freepointer(s, p, p + s->size)，会设置好所分配的pages中的
+下一个slub对象object的地址在各个slub objects中。而第一个 object是在 pages起始地址
+位置。
+
+
+参见 __slab_alloc 中：
+	c->freelist = get_freepointer(s, freelist);

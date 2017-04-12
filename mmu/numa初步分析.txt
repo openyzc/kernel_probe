@@ -1,0 +1,229 @@
+
+
+e820获得phy pfn范围	构建 memblock.memory	page tables创建		numa初始化
+e820_end_of_ram_pfn ---- memblock_x86_fill ---- init_mem_mapping ---- initmem_init
+
+	zone的初始化（划分）
+---- x86_init.paging.pagetable_init ----
+
+
+回到 start_kernel中：
+设置 nr_cpu_ids		percpu初始化
+setup_nr_cpu_ids ---- setup_per_cpu_areas ---- smp_prepare_boot_cpu ----
+
+build_all_zonelists ---- mm_init
+
+
+---- check_bugs
+
+
+max_pfn 在 setup_arch中通过 诸如 e820_end_of_ram_pfn 等函数进行了设置，对于x86_32,
+还在 find_low_pfn_range 等中进行了调整。 这个变量取决于 e820，体系支持的最大内存页
+等等因素。
+
+之后 memblock_x86_fill会将 e820.map[]中的数据转移到 memblock.memory 中，此时，所有
+block的nid都是 MAX_NUMNODES。
+据此， numa_register_memblks -> numa_meminfo_cover_memory 中的 
+if ((s64)(e820ram - numaram) >= (1 << (20 - PAGE_SHIFT))) 这个判断条件的依据还
+不是那么明确。总体应该是 numa 配置所覆盖的memory应该 等于或 接近 e820中的内存总量。
+
+在numa_init调用之前，memblock.memory 中的ranges[]已经完成初始化，理论上不应该
+还有减少。应该是numa 对node ranges处理导致的差异？
+
+numa_register_memblks -> memblock_set_node(mb->start, mb->end - mb->start,
+				  &memblock.memory, mb->nid)
+主要是根据某个numa node对应的 struct numa_meminfo所覆盖的blk[]调整memblock中的
+ranges[]的start,end, nid。
+
+
+
+numa_init -> numa_register_memblks -> alloc_node_data 会 node_data[nid] = nd并
+node_set_online(nid)。
+对于numa来说， numa_init -> numa_init_array 会 建立 node 与 cpu 的映射, 包括
+x86_cpu_to_node_map 和 numa_node 等percpu变量。
+
+
+static void __init numa_init_array(void)
+{
+	int rr, i;
+
+	rr = first_node(node_online_map);
+	for (i = 0; i < nr_cpu_ids; i++) {
+		if (early_cpu_to_node(i) != NUMA_NO_NODE)
+			continue;
+		numa_set_node(i, rr);
+		rr = next_node(rr, node_online_map);
+		if (rr == MAX_NUMNODES)
+			rr = first_node(node_online_map);
+	}
+}
+
+但是 nr_cpu_ids 似乎在 大于 node_online_map 中的node数时， node会被自动重复对应到
+某个 cpu 中，这是否合理？？
+
+注: nr_cpu_ids 在 setup_nr_cpu_ids 中会被设置。对应 cpu_possible_mask 中的置1
+比特数.
+
+
+setup_arch -> initmem_init -> x86_numa_init -> numa_init(x86_acpi_numa_init)
+
+以上调用是在 x86_init.paging.pagetable_init （实际是native_pagetable_init）->
+paging_init 之前发生的。
+
+
+1. 一些关键变量，结构初始化
+
+1.1 numa_meminfo 
+
+static struct numa_meminfo numa_meminfo
+
+对于ACPI来说，通过以下调用完成设置。
+
+x86_numa_init -> numa_init -> x86_acpi_numa_init -> 
+acpi_parse_memory_affinity -> acpi_numa_memory_affinity_init -> numa_add_memblk
+
+以上来自ACPI的numa_meminfo 是原始硬件配置，还需要通过 numa_cleanup_meminfo 进行
+净化处理。 需要强调的是，该处理应该是基于 原始numa_meminfo是无序的，也就是后面的
+blk[]的范围可与之前的blk[]存在重叠或 小于它。但是属于不同node的blk[]不能存在overlap。
+
+函数 numa_cleanup_meminfo 的主要功能是 将 numa_meminfo中的原始blk[]，按照 node进行
+归一化处理。 对于node 中不同的ranges, 如果该node相邻ranges(不管是否overlap)之间的
+范围没有与其它node的range发生overlap，也就是同一个node的ranges没有被其它node的
+range分割，那么就合并该node 的相邻ranges（扩大start,end为最小，最大，不管其间的
+holes）。同时将被合并的range从 numa_meminfo.blk[]中删除。
+
+
+最后，如果 CONFIG_NUMA_EMU 配置了， numa_emulation 还会被调用。
+config NUMA_EMU
+        bool "NUMA emulation"
+        depends on NUMA
+numa_emulation 还会重构 numa_meminfo，将原来的物理meminfo 按照指定的划分方式，重新
+分割构建numa_meminfo，其中的blk[].nid也不保留原来生成的 nid，而是重新从0开始分配了。
+为了建立 apicid 与 node id之间的关系，还引入了 emu_nid_to_phys[]。
+
+
+__apicid_to_node[i]
+
+
+
+1.2 numa_nodes_parsed
+定义为
+nodemask_t numa_nodes_parsed __initdata;
+
+是一个bitmap。 表示 硬件(ACPI)已经定义的 node。
+来自于 SRAT的配置。 acpi_numa_x2apic_affinity_init， acpi_numa_processor_affinity_init，
+acpi_numa_memory_affinity_init 会调用 node_set(node, numa_nodes_parsed) 设置。
+
+1.3  __apicid_to_node[] 与 pxm_to_node_map[]
+分别定义为
+
+s16 __apicid_to_node[MAX_LOCAL_APIC] = {
+	[0 ... MAX_LOCAL_APIC-1] = NUMA_NO_NODE
+};
+
+static int pxm_to_node_map[MAX_PXM_DOMAINS] =
+
+通过 acpi_numa_x2apic_affinity_init， acpi_numa_processor_affinity_init中调用
+set_apicid_to_node(apic_id, node) 完成设置。也就是表示了 硬件中的 cpu 或 x2的local
+apic 与 phy node id的关系。
+		__apicid_to_node[]
+apic_id    ------------------------->   node
+
+下标是 来自硬件配置的apic_id， 此apic_id 与 proximity_domain都是在硬件配置中呈现。
+
+
+pxm_to_node_map[] 建立了 proximity_domain 与 node idx之间的关系。
+
+			pxm_to_node_map[]
+proximity_domain   ----------------------->   node
+
+通过 setup_node(pxm) 完成 pxm_to_node_map[]的设置。
+
+需要强调的是， setup_node(pxm) 与 node_set(node, numa_nodes_parsed) 在 
+acpi_numa_memory_affinity_init 中都会被调用，也就是说，进行 numa的node硬件配置
+时， 可以指定不同于 x2apic或 cpu 的proximity_domain来引入一个新的node.
+因此 __apicid_to_node[]应该被 pxm_to_node_map[] 的node包含。
+
+
+1.4 node_possible_map 
+定义为
+#define node_possible_map 	node_states[N_POSSIBLE]
+
+而在 mm/page_alloc.c 中定义了
+nodemask_t node_states[NR_NODE_STATES] __read_mostly =
+
+也就是 node_states[]是一个 nodemask_t的数组，每个状态下的node都以 bitmap方式保存
+到node_stats[]中。
+
+此bitmap的设置是在 numa_register_memblks 中通过以下处理完成的。
+
+	node_possible_map = numa_nodes_parsed;
+	numa_nodemask_from_meminfo(&node_possible_map, mi);
+
+因此 node_possible_map是以 numa_nodes_parsed 为基础。 如果没有 numa_emulation，
+node_possible_map 似乎 与numa_nodes_parsed 相等。但是 经过 numa_emulation 对
+numa_meminfo的重构后，node_possible_map 较大可能是 包含 numa_nodes_parsed。
+
+表示所有具有 numa_meminfo定义的 node。
+
+
+1.5 node_online_map
+
+类似于node_possible_map，定义为
+#define node_online_map 	node_states[N_ONLINE]
+
+在 numa_register_memblks 中通过 
+for_each_node_mask(nid, node_possible_map) {
+	......
+		if (start >= end)
+			continue;
+
+		/*
+		 * Don't confuse VM with a node that doesn't have the
+		 * minimum amount of memory:
+		 */
+		if (end && (end - start) < NODE_MIN_SIZE)
+			continue;
+
+		alloc_node_data(nid);
+}
+完成 node_online_map 以及 nr_online_nodes 的设置（通过node_set_online）
+表示 哪些 nodes 存在有效内存range。
+
+
+
+2. CPU与 node
+
+
+cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+
+
+
+2.1 CPU 探测
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

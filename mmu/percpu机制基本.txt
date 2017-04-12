@@ -1,0 +1,338 @@
+
+
+setup_per_cpu_areas 中对 pcpu_embed_first_chunk 的调用是关键。
+最后是 对一些全局关键变量 __per_cpu_offset[cpu]，pcpu_unit_offsets[cpu] 的设置。
+
+
+
+mm/percpu.c  中会定义一些关键的全局变量。
+
+
+1. kernel中的 percpu section
+在 vmlinux.lds.S中对于 x86_64 与 x86_32 有以下不同的脚本：
+
+#if defined(CONFIG_X86_64) && defined(CONFIG_SMP)
+	/*
+	 * percpu offsets are zero-based on SMP.  PERCPU_VADDR() changes the
+	 * output PHDR, so the next output section - .init.text - should
+	 * start another segment - init.
+	 */
+	PERCPU_VADDR(INTERNODE_CACHE_BYTES, 0, :percpu)
+	ASSERT(SIZEOF(.data..percpu) < CONFIG_PHYSICAL_START,
+	       "per-CPU data too large - increase CONFIG_PHYSICAL_START")
+#endif
+
+
+#if !defined(CONFIG_X86_64) || !defined(CONFIG_SMP)
+	PERCPU_SECTION(INTERNODE_CACHE_BYTES)
+#endif
+
+对于 x86_64, .data..percpu 的 VMA是 0, LMA 是relocate前的缺省物理地址。
+而 x86_32 的 .data..percpu 的VMA 没有设置，将沿用 local counter的值。
+因此对于  x86_64, __per_cpu_start 是0。
+
+
+2. setup_per_cpu_areas的定义
+
+在 mm/percpu.c中，有两处 setup_per_cpu_areas的定义。
+分别对应 !CONFIG_HAVE_SETUP_PER_CPU_AREA ＆ CONFIG_SMP 以及 non-SMP。
+我们只是关心 CONFIG_SMP的情况。
+
+对于x86架构， HAVE_SETUP_PER_CPU_AREA 这个配置项是默认为Y的。也就是说，不会使用
+mm/percpu.c中的函数定义。
+
+在 arch/x86/kernel/setup_percpu.c中也有 setup_per_cpu_areas的定义。
+对于x86应该使用的是此处的函数定义。
+setup_percpu.c的编译规则定义为：
+arch/x86/kernel/Makefile:65:obj-$(CONFIG_SMP)		+= setup_percpu.o
+
+对于arm,arm64,应该使用的是 mm/percpu.c中的定义。
+
+
+3. 
+
+
+
+3.1 pcpu_embed_first_chunk 与 pcpu_page_first_chunk
+
+在 percpu.c中，pcpu_embed_first_chunk 在 defined(BUILD_EMBED_FIRST_CHUNK) 的情况
+下定义；
+而pcpu_page_first_chunk 在 #ifdef BUILD_PAGE_FIRST_CHUNK 下定义。
+
+
+#if defined(CONFIG_NEED_PER_CPU_EMBED_FIRST_CHUNK) || \
+	!defined(CONFIG_HAVE_SETUP_PER_CPU_AREA)
+#define BUILD_EMBED_FIRST_CHUNK
+#endif
+
+/* build pcpu_page_first_chunk() iff needed by the arch config */
+#if defined(CONFIG_NEED_PER_CPU_PAGE_FIRST_CHUNK)
+#define BUILD_PAGE_FIRST_CHUNK
+#endif
+
+在 x86架构下， NEED_PER_CPU_PAGE_FIRST_CHUNK 与 NEED_PER_CPU_EMBED_FIRST_CHUNK
+都默认配置为 Y. 也就是说，以上两个函数都有定义。具体使用哪个，取决于 pcpu_chosen_fc。
+pcpu_embed_first_chunk 中，分配percpu unit区需要的空间时，调用
+pcpu_fc_alloc(cpu, gi->nr_units * ai->unit_size, atom_size)一次性的将需要的
+空间分配好，也就是空间是连续的，返回的是 kernel direct mapping的虚拟地址。
+
+而 pcpu_page_first_chunk 中尽管也会调用 pcpu_fc_alloc 来分配空间，但是传入的参数
+不同了，
+pcpu_fc_alloc(cpu, PAGE_SIZE, PAGE_SIZE)
+每次只是分配一个page的物理空间，然后通过 pcpup_populate_pte， __pcpu_map_pages 将
+unit_pages 个struct page对应的物理页空间（可能非连续）映射为连续的 VMALLOC空间。
+
+
+
+而arm架构下， 以上两个配置项都没有配置，但是 CONFIG_HAVE_SETUP_PER_CPU_AREA 也是没有
+配置的，因此将使用 pcpu_embed_first_chunk 函数。
+实际上， mm/percpu.c的 setup_per_cpu_areas 确实调用的是 pcpu_embed_first_chunk 而
+不是pcpu_page_first_chunk。
+
+3.2 pcpu_build_alloc_info 的分析
+
+无论 pcpu_page_first_chunk 还是 pcpu_embed_first_chunk 都会调用
+pcpu_build_alloc_info。
+
+	static int group_map[NR_CPUS] __initdata;
+	static int group_cnt[NR_CPUS] __initdata;
+group_map[NR_CPUS] 的下标是 cpu id, value是 该cpu 所属于的 percpu group;
+group_cnt[group] 的下标是 group id, value是该group 中包含的 possible cpu数；
+
+划分 percpu group的原则:
+对两个possible cpu进行pcpu_cpu_distance 计算得到 <= LOCAL_DISTANCE的distance 值；
+否则，此两个cpu属于不同的 group。
+
+经过划分后，属于同一个group的不同possible cpu可以分享 alloc_size 中的 内存，每个
+cpu 占用 ai->unit_size 的内存segment用作percpu 区。
+否则， alloc_size 因为alignment的要求而浪费了过多内存，尤其在 SMP下CPU 较多时。
+
+3.2.1 alloc_size的确定
+
+	min_unit_size = max_t(size_t, size_sum, PCPU_MIN_UNIT_SIZE);
+
+	alloc_size = roundup(min_unit_size, atom_size);
+可见，alloc_size是对齐 atom_size的。每个cpu的percpu 区将使用 alloc_size中的空间
+来存放各自的percpu变量/结构。
+但是 alloc_size可能较大，足以容纳多个 cpu的percpu区。 
+每个percpu区的内存需求量称为 unit_size。 因此 alloc_size可能可以被多个cpu使用。
+
+具体多少个， 后面会计算。
+
+目前看来，alloc_size取决于 min_unit_size，实际上是
+	const size_t static_size = __per_cpu_end - __per_cpu_start;
+
+	size_sum = PFN_ALIGN(static_size + reserved_size +
+			    max_t(size_t, dyn_size, PERCPU_DYNAMIC_EARLY_SIZE));
+也就是 vmlinux.lds.h中确定的 percpu section的大小，这是每个cpu都必须有一份的，所以
+是static。
+
+对于 pcpu_embed_first_chunk， 传入给 pcpu_build_alloc_info 的reserved_size 是
+PERCPU_FIRST_CHUNK_RESERVE， dyn_size 是 
+		const size_t dyn_size = PERCPU_MODULE_RESERVE +
+			PERCPU_DYNAMIC_RESERVE - PERCPU_FIRST_CHUNK_RESERVE;
+因为 pcpu_build_alloc_info 中计算 size_sum时 已经包括了 reserved_size，因此
+传入的 dyn_size 就 减去了 PERCPU_FIRST_CHUNK_RESERVE，避免多要求了 
+PERCPU_FIRST_CHUNK_RESERVE。
+
+3.2.2 alloc_size可支持的最大 unit
+
+因为 possible cpu 的距离亲和性 可能相差较大，可能属于某个 percpu group的 cpu数较多，
+而别的group中的cpu较少。也就是分布比较sparse，如果unit取值较大，那么在cpu数较少的
+group中不使用的 unit就多了。导致浪费。合理的选择每个group的unit数，使得 idle的unit
+数不超过总possible cpu数的1/3，然后总 alloc_size的个数 也不增长（总memory消耗不增）。
+
+
+3.2.3 结构 struct pcpu_alloc_info
+函数 pcpu_build_alloc_info 最终返回的是 struct pcpu_alloc_info 结构指针。
+通过 pcpu_alloc_alloc_info(nr_groups, nr_units) 分配，而在 pcpu_build_alloc_info 中
+完成设置。
+
+struct pcpu_group_info {
+	int			nr_units;	/* aligned # of units */
+	unsigned long		base_offset;	/* base address offset */
+	unsigned int		*cpu_map;	/* unit->cpu map, empty
+						 * entries contain NR_CPUS */
+};
+
+struct pcpu_alloc_info {
+	size_t			static_size;
+	size_t			reserved_size;
+	size_t			dyn_size;
+	size_t			unit_size;
+	size_t			atom_size;
+	size_t			alloc_size;
+	size_t			__ai_size;	/* internal, don't use */
+	int			nr_groups;	/* 0 if grouping unnecessary */
+	struct pcpu_group_info	groups[];
+};
+
+其中， struct pcpu_group_info	groups[]; 由 nr_groups决定。每个 group对应一个
+struct pcpu_group_info groups[]的结构变量。
+
+然后，struct pcpu_group_info 中的 nr_units 由下面语句设置。 容纳属于该group的
+有效 unit后，对齐 3.2.2中确定的 unit数后得到的最终unit值。 表示该group能容纳的最大
+unit数。
+gi->nr_units = roundup(gi->nr_units, upa);
+
+因此需要在 *cpu_map中记录此group实际容纳哪些 cpu。 这里的 cpu_map指向大小为 upa的
+数组。
+
+gi->base_offset 应该表示 某个group的第一个 unit 在整个percpu 区间（所有group所需要
+的连续memory空间）中的偏移（以0为起始）。
+gi->base_offset = unit * ai->unit_size;
+需要注意的是， pcpu_embed_first_chunk 中会调整 gi->base_offset，表示 此 group 的
+起始地址相对于 所有group的最小 地址的偏移；
+ai->groups[group].base_offset = areas[group] - base;
+如此处理后， base_offset就可以用来表示 整个 percpu区的size了。参见 pcpu_embed_first_chunk
+中的处理。
+
+ai->alloc_size 表示 每个对齐 atom_size 区的大小，此区只会容纳同一个group的unit。
+也就是说，同一个group的unit不会跨越不同的 atom 区。同时，一个atom_size区是unit_size
+的倍数，也就是说，能容纳整数个unit，不会剩余小于unit_size的内存空间。要么用光，要么
+剩下整数个unit_size。 这点必须保证。
+
+
+
+3.3  函数 pcpu_setup_first_chunk 分析
+
+3.3.1 一些全局变量
+
+有不少全局变量定义在 percpu.c中，记录一些关键数据信息。
+
+表示一个 percpu area（对应 最多存放 alloc_size / unit_size 个 unit)的一个unit占用的page数
+static int pcpu_unit_pages __read_mostly;
+表示一个percpu area中一个unit需要占用的内存size，应该等于 unit_size
+static int pcpu_unit_size __read_mostly;
+表示当前系统所有有效groups能容纳的总unit数
+static int pcpu_nr_units __read_mostly;
+等于 ai->atom_size
+static int pcpu_atom_size __read_mostly;
+
+static size_t pcpu_chunk_struct_size __read_mostly;
+设置为：
+	pcpu_chunk_struct_size = sizeof(struct pcpu_chunk) +
+		BITS_TO_LONGS(pcpu_unit_pages) * sizeof(unsigned long);
+表示一个percpu 对应的 struct pcpu_chunk的结构size.
+
+/* cpus with the lowest and highest unit addresses */
+记录偏移地址最小的cpu id
+static unsigned int pcpu_low_unit_cpu __read_mostly;
+记录偏移地址最大的cpu id
+static unsigned int pcpu_high_unit_cpu __read_mostly;
+
+/* the address of the first chunk which starts with the kernel static area */
+记录整个 percpu 区（对所有groups)的起始地址（最低）
+void *pcpu_base_addr __read_mostly;
+
+表示某个cpu的percpu空间 对应哪个 unit id. 指向一个数组，下标是cpu id,val是 unit id
+static const int *pcpu_unit_map __read_mostly;		/* cpu -> unit */
+表示某个cpu的percpu空间 起始地址 相对于 所有valid groups 分配的内存的最小地址（base）的偏移。下标是cpu id
+const unsigned long *pcpu_unit_offsets __read_mostly;	/* cpu -> unit offset */
+
+/* group information, used for vm allocation */
+表示当前系统有效 group数
+static int pcpu_nr_groups __read_mostly;
+记录某个group 的percpu区起始地址相对于 base的偏移（注意，一个group的percou区分配了足以容纳所有该group units的空间）
+static const unsigned long *pcpu_group_offsets __read_mostly;
+记录某个group的percpu区总size，包括没有被unit占用的
+static const size_t *pcpu_group_sizes __read_mostly;
+
+
+表示 pcpu_slot指向的 链表数组的总entires数
+static int pcpu_nr_slots __read_mostly;
+static struct list_head *pcpu_slot __read_mostly; /* chunk list slots */
+
+参见： 
+	pcpu_nr_slots = __pcpu_size_to_slot(pcpu_unit_size) + 2;
+可见， pcpu_nr_slots 是不小于3的。
+
+在 percpu.c中定义了：
+unsigned long __per_cpu_offset[NR_CPUS] __read_mostly;
+对于x86，应该是定义在 setup_percpu.c中：
+unsigned long __per_cpu_offset[NR_CPUS] __read_mostly = {
+此变量记录了 
+
+
+在 arch/x86/include/asm/percpu.h中定义了以下percpu静态变量：
+记录某个指定 cpu 对应的 percpu区起始地址相对于 __per_cpu_start 的偏移。据此，后续可以
+使用per_cpu(percpu_variable, cpu)得到某个static percpu变量在对应cpu的percpu区的地址。
+DECLARE_PER_CPU_READ_MOSTLY(unsigned long, this_cpu_off);
+参见 setup_per_cpu_areas 中的处理：
+		per_cpu_offset(cpu) = delta + pcpu_unit_offsets[cpu];
+
+在 arch/x86/kernel/setup_percpu.c中定义了：
+记录 此percpu属于哪个cpu id
+DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number);
+参见 setup_per_cpu_areas 中的处理：
+		per_cpu(cpu_number, cpu) = cpu;
+
+值得注意的是，x86_32中使用了 gdt 来访问 percpu区。 参见
+		setup_percpu_segment(cpu);
+		setup_stack_canary_segment(cpu);
+中的初始化处理。
+
+
+3.4 pcpu_alloc
+
+此函数比较麻烦。主要功能是 支持系统运行过程中动态的从 pcpu_slot[]中分配满足要求的
+percpu 内存block。 参数 reserved 表示本次分配请求只能从 pcpu_reserved_chunk中分配。
+size_t align 表示分配成功后返回的 地址 需要align对齐。
+
+关键是理解 
+
+struct pcpu_chunk {
+	struct list_head	list;		/* linked to pcpu_slot lists */
+	int			free_size;	/* free bytes in the chunk */
+	int			contig_hint;	/* max contiguous size hint */
+	void			*base_addr;	/* base address of this chunk */
+
+	int			map_used;	/* # of map entries used before the sentry */
+	int			map_alloc;	/* # of map entries allocated */
+	int			*map;		/* allocation map */
+	struct work_struct	map_extend_work;/* async ->map[] extension */
+
+	void			*data;		/* chunk data */
+	int			first_free;	/* no free below this */
+	bool			immutable;	/* no [de]population allowed */
+	int			nr_populated;	/* # of populated pages */
+	unsigned long		populated[];	/* populated bitmap */
+};
+
+
+map_alloc 表示 int *map 指向的数组在当前有效分配的元素数；
+map_used 表示已经使用的有效 元素数；
+参见 pcpu_need_to_extend ， pcpu_extend_area_map
+
+free_size 表示当前chunk 中还剩余可用的memory空间size；
+contig_hint 表示当前 chunk中free的 map[](最后比特为0）容纳的最大空间size，用于提升
+pcpu_alloc_area的处理效率；
+参见 pcpu_alloc_area
+如果map[]的val最后bit为1，表示该val为起始的range已经被分配使用。
+
+
+
+void __percpu *__alloc_percpu(size_t size, size_t align)
+{
+	return pcpu_alloc(size, align, false, GFP_KERNEL);
+}
+
+
+
+
+3.5 percpu_init_late
+这个函数在 mm_init中调用。 主要功能是替换 pcpu_chunk中的map，使用 pcpu_mem_zalloc
+分配kmalloc的内存，而不再使用静态定义在 pcpu_setup_first_chunk 中的数组。
+
+因此，此函数只能在 kmem_cache_init 之后调用。
+
+
+
+
+
+
+
+
+
+
+

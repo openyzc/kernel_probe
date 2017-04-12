@@ -1,0 +1,309 @@
+
+起始函数是 start_kernel -> boot_cpu_init
+
+这里的  boot_cpu_init会调用 smp_processor_id， 此时 percpu还没有初始化，cpu_number
+还没有被设置为合适的值，似乎会存在风险。 但是 cpu_number的初始值应该为0.
+
+
+
+ACPI 的调用路径
+
+在 setup_arch 中完成 direct mapping后，调用 acpi_boot_table_init 完成ACPI表格
+的scanning。然后在 initmem_init 后，调用 acpi_boot_init 开始扫描通过ACPI定义的
+CPU。需要注意的是，initmem_init中会完成numa的初始化处理,也就是 numa的初始化在
+CPU探测之前？
+
+
+
+
+1. percpu变量的定义
+
+
+在当前内核中，存在 EARLY_PER_CPU 与 PER_CPU 的定义。
+我们只是关心 CONFIG_SMP。 非 SMP差异如下：
+
+#ifdef CONFIG_SMP
+#define PER_CPU_BASE_SECTION ".data..percpu"
+#else
+#define PER_CPU_BASE_SECTION ".data"
+#endif
+
+
+
+1.1 DEFINE_EARLY_PER_CPU_READ_MOSTLY 的定义
+#define DEFINE_EARLY_PER_CPU_READ_MOSTLY(_type, _name, _initvalue)	\
+	DEFINE_PER_CPU_READ_MOSTLY(_type, _name) = _initvalue;		\
+	__typeof__(_type) _name##_early_map[NR_CPUS] __initdata =	\
+				{ [0 ... NR_CPUS-1] = _initvalue };	\
+	__typeof__(_type) *_name##_early_ptr __refdata = _name##_early_map
+
+
+#define DEFINE_PER_CPU_READ_MOSTLY(type, name)				\
+	DEFINE_PER_CPU_SECTION(type, name, "..read_mostly")
+
+而 DEFINE_PER_CPU_SECTION 定义在 percpu-defs.h中。 有两个定义，但是对于x86,arm，
+一般不需要
+#if defined(ARCH_NEEDS_WEAK_PER_CPU) || defined(CONFIG_DEBUG_FORCE_WEAK_PER_CPU)
+
+因此，采用如下定义：
+
+#define DEFINE_PER_CPU_SECTION(type, name, sec)				\
+	__PCPU_ATTRS(sec) PER_CPU_DEF_ATTRIBUTES			\
+	__typeof__(type) name
+
+#define __PCPU_ATTRS(sec)						\
+	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
+	PER_CPU_ATTRIBUTES
+以上宏的__percpu用于checker检测，PER_CPU_ATTRIBUTES 为null。因此主要功能是
+定义 percpu变量所在的 section为 .data..percpu + sec，譬如 
+.data..percpu..read_mostly
+
+
+1.2 DEFINE_PER_CPU_READ_MOSTLY 的定义
+
+#define DEFINE_PER_CPU_READ_MOSTLY(type, name)				\
+	DEFINE_PER_CPU_SECTION(type, name, "..read_mostly")
+
+我们比较 EARLY_PER_CPU 与 PER_CPU的差异。
+
+以 DEFINE_PER_CPU_READ_MOSTLY(int, cpu_number)
+和 DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_cpu_to_apicid, BAD_APICID)
+为例。
+
+可见， EARLY_PER_CPU 多了 以下全局的 变量定义。
+
+	__typeof__(_type) _name##_early_map[NR_CPUS] __initdata =	\
+				{ [0 ... NR_CPUS-1] = _initvalue };	\
+	__typeof__(_type) *_name##_early_ptr __refdata = _name##_early_map 
+
+include/linux/init.h:43:#define __initdata	__section(.init.data)
+include/linux/init.h:77:#define __refdata        __section(.ref.data)
+（这里是避免_name##_early_ptr指向 .init或 .exit的数据而告警-- modpost check)
+#define DATA_DATA							\
+	*(.data)							\
+	*(.ref.data)							\
+
+且 EARLY_PER_CPU是有 _initvalue 作为early percpu变量的初始值的。
+
+
+
+1.3 DEFINE_EARLY_PER_CPU 定义
+
+#define	DEFINE_EARLY_PER_CPU(_type, _name, _initvalue)			\
+	DEFINE_PER_CPU(_type, _name) = _initvalue;			\
+	__typeof__(_type) _name##_early_map[NR_CPUS] __initdata =	\
+				{ [0 ... NR_CPUS-1] = _initvalue };	\
+	__typeof__(_type) *_name##_early_ptr __refdata = _name##_early_map
+
+#define DEFINE_PER_CPU(type, name)					\
+	DEFINE_PER_CPU_SECTION(type, name, "")
+
+也就是 DEFINE_PER_CPU定义的 percpu变量，都是在 .data..percpu 这个section中了。
+具体各个 percpu相关section在image中的顺序，参考 vmlinux.lds.h中的PERCPU_INPUT定义。
+
+1.4 early_per_cpu变量的访问
+
+一般通过下面的宏来完成：
+
+#define	early_per_cpu_ptr(_name) (_name##_early_ptr)
+#define	early_per_cpu_map(_name, _idx) (_name##_early_map[_idx])
+#define	early_per_cpu(_name, _cpu) 				\
+	*(early_per_cpu_ptr(_name) ?				\
+		&early_per_cpu_ptr(_name)[_cpu] :		\
+		&per_cpu(_name, _cpu))
+
+
+2. cpu的探测
+
+目前在 setup_arch 中存在下面的 调用：
+	acpi_boot_init();
+	sfi_init();
+	x86_dtb_init();
+
+这三个函数提供了三种cpu探测的处理。 acpi是优先的。 acpi_boot_init 是在 X86_LOCAL_APIC
+配置了的情况下有效的。
+
+config X86_LOCAL_APIC
+        def_bool y
+        depends on X86_64 || SMP || X86_32_NON_STANDARD || X86_UP_APIC || PCI_MSI
+        select GENERIC_IRQ_LEGACY_ALLOC_HWIRQ
+
+
+setup_arch -> dmi_scan_machine -> 
+这里的 dmi_scan_machine  是在 CONFIG_DMI 有效时才有定义。
+
+
+setup_arch -> acpi_boot_init -> acpi_process_madt 
+
+
+
+2.1 ACPI 中相关的处理
+
+register_lapic_address 中会 根据 local apic 的 phy address 完成 mp_lapic_addr 的设置，
+并建立 set_fixmap_nocache 的VA 和 PA 映射后，通过 read_apic_id 读取 APIC_ID 更新
+到 boot_cpu_physical_apicid 中。 此外， 在 apic 的 phy address 发生变更时，也
+会更新 boot_cpu_physical_apicid。
+
+cpu 的配置来自 MADT 表中的 “Processor Local APIC structure”。
+对应处理函数是  acpi_register_lapic -> generic_processor_info 
+
+
+early percpu变量 x86_cpu_to_apicid， x86_bios_cpu_apicid， x86_cpu_to_logical_apicid
+都在 generic_processor_info 中设置。
+
+
+2.2 cpu_possible_mask 和 cpu_possible_bits
+
+定义在 kernel/cpu.c中：
+const struct cpumask *const cpu_possible_mask = to_cpumask(cpu_possible_bits);
+因此, cpu_possible_mask 实际是 cpu_possible_bits 这个bitmap对应的数组。
+
+
+cpu_possible_bits通过 set_cpu_possible 完成设置。
+调用路径如下：
+
+1) boot_cpu_init 
+2) generic_processor_info 
+我们暂时关心 ACPI,对应的caller是 acpi_parse_lapic -> acpi_register_lapic
+-> generic_processor_info
+
+acpi_parse_madt_lapic_entries 中：
+在 CONFIG_X86_X2APIC时， acpi_parse_x2apic 处理 MADT中的 ACPI_MADT_TYPE_LOCAL_X2APIC；
+acpi_parse_lapic 中处理 MADT 的 ACPI_MADT_TYPE_LOCAL_APIC；
+
+acpi_parse_sapic 中处理 MADT 的 ACPI_MADT_TYPE_LOCAL_SAPIC；
+在 CONFIG_ACPI_HOTPLUG_CPU 时， acpi_processor_add -> acpi_processor_get_info
+-> acpi_processor_hotadd_init
+-> acpi_map_cpu -> _acpi_map_lsapic 
+
+static struct acpi_scan_handler __refdata processor_handler = {
+	.ids = processor_device_ids,
+	.attach = acpi_processor_add,
+#ifdef CONFIG_ACPI_HOTPLUG_CPU
+	.detach = acpi_processor_remove,
+#endif
+	.hotplug = {
+		.enabled = true,
+	},
+};
+
+
+因此，在启动阶段，应该是通过 acpi_parse_madt_lapic_entries -> acpi_parse_lapic 完成
+cpu_possible_bits的设置。并且在最后 setup_arch 的 acpi_boot_init 之后，由
+prefill_possible_map 根据kernel 启动参数调整 cpu_possible_bits以及 nr_cpu_ids 为
+允许的 possible。
+注意，prefill_possible_map 的处理与 generic_processor_info 有不同， prefill_possible_map
+中将 cpu_possible_bits中前 nr_cpu_ids个比特置1，其它不可用的cpu对应的bits都清零。
+不同于 generic_processor_info 中是取 cpu_present_mask 第一个0的bit来作为新发现的
+cpu的cpu id并设置 对应的比特。
+
+
+2.3 nr_cpu_ids
+
+此变量在 SMP时，定义在 kernel/smp.c中：
+int nr_cpu_ids __read_mostly = NR_CPUS;
+
+从代码看来，在真正根据硬件配置正确设置 nr_cpu_ids之前，此变量值为初始值。
+参考 smp_sanity_check， 在没有配置 CONFIG_X86_BIGSMP 的情况下， x86_32 最大只能
+支持8个CPU。
+
+真正的设置是在 setup_nr_cpu_ids 中，通过下面语句完成：
+nr_cpu_ids = find_last_bit(cpumask_bits(cpu_possible_mask),NR_CPUS) + 1;
+
+因此，nr_cpu_ids 是在 setup_arch 之后完成的，取决于  cpu_possible_mask，也就是
+cpu_possible_bits。
+
+2.4 max_physical_apicid
+定义在 arch\x86\kernel\apic\acpi.c:
+
+static unsigned int max_physical_apicid;
+
+表示 当前硬件配置中最大的 APIC id。参考 generic_processor_info 中的设置。
+
+2.5 cpu_present_mask 与 cpu_present_bits 
+类似于 cpu_possible_bits，都是在 generic_processor_info 中通过以下处理进行设置：
+	set_cpu_possible(cpu, true);
+	set_cpu_present(cpu, true); 
+
+2.6 num_processors 
+定义在 arch/x86/kernel/apic/apic.c 中：
+unsigned int num_processors;
+表示当前平台硬件配置下，enable的CPU数目。
+
+2.7 phys_cpu_present_map
+物理存在的cpu所对应的 apic id所对应的 bitmap，也在 generic_processor_info 中
+设置。
+
+
+在 arch/x86/include/asm/mpspec.h中：
+#define PHYSID_ARRAY_SIZE	BITS_TO_LONGS(MAX_LOCAL_APIC)
+
+struct physid_mask {
+	unsigned long mask[PHYSID_ARRAY_SIZE];
+};
+
+typedef struct physid_mask physid_mask_t
+
+physid_mask_t phys_cpu_present_map;
+
+
+3. CPU 与 NODE 关系
+
+3.1 x86_cpu_to_node_map
+
+x86_cpu_to_node_map 这个percpu变量 保存了 cpu与 node 的映射关系。
+
+有两个定义：
+arch/x86/mm/numa.c  中：
+DEFINE_EARLY_PER_CPU(int, x86_cpu_to_node_map, NUMA_NO_NODE);
+arch/x86/include/asm/topology.h中：
+DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+
+
+此变量通过 numa_init ->numa_init_array -> numa_set_node  或
+init_cpu_to_node -> numa_set_node
+
+注意，后者是通过 setup_arch调用的。且是在 NUMA 初始化 和 MADT 处理均完成后。
+此路径应该是正常的处理路径。
+前者是 将node 一对一的映射到 CPU. 应该是针对NUMA emulation之类的一种 特殊处理。
+在start_kernel 的末段，通过 
+check_bugs -> identify_cpu 会 调用 this_cpu->c_init(c) 等钩子函数。
+对于x86,就是 init_intel ->srat_detect_node 完成 CPU与node关系的调整。
+
+我们聚焦到 init_cpu_to_node。
+此函数 根据 CPU 探测时生成的 x86_cpu_to_apicid 找到某个 cpu对应的 apic id
+（在 x86_cpu_to_apicid中）,然后根据 numa处理时（对于x86是 ACPI的 SRAT, SLIT等配置)
+建立的 node 与 apic id的对应关系（在 __apicid_to_node[]中），从而建立 cpu 与 node的关系。
+也就是以 apic id 为媒介。
+
+
+罗嗦一句，在setup_arch中，调用init_cpu_to_node 后有init_apic_mappings。 此函数
+将在 CONFIG_X86_LOCAL_APIC 时有定义。主要功能是 对 smp_found_config 还没有设置
+的场景进行 处理（正常情况下，在 acpi_boot_init 中会根据ACPI的配置，已经完成了
+对 LOCAL APIC的探测和初始化设置）。譬如 非 APIC的 MP 1.4。
+
+
+3.2 node_to_cpumask_map[]
+只是 CONFIG_NUMA时使用此结构变量。
+
+定义在 arch/x86/mm/numa.c中，是一个结构指针：
+cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+
+在 CONFIG_CPUMASK_OFFSTACK 时， 通过 setup_node_to_cpumask_map 会分配内存给
+node_to_cpumask_map[]（下标是node id)，避免占用过多的 stack 空间。否则， 以上定义
+的是一个二维数组。 
+
+typedef struct cpumask cpumask_var_t[1];
+所以就是：
+struct cpumask node_to_cpumask_map[MAX_NUMNODES][1]
+
+
+设置应该是通过 numa_add_cpu -> cpumask_set_cpu 或 numa_add_cpu -> numa_set_cpumask
+->debug_cpumask_set_cpu -> cpumask_set_cpu完成。
+后者是针对 CONFIG_DEBUG_PER_CPU_MAPS，前者是非 CONFIG_DEBUG_PER_CPU_MAPS 且非 
+CONFIG_NUMA_EMU  的。
+
+因此，设置接口是 numa_add_cpu。 该函数被 identify_cpu 调用。
+
+
+

@@ -1,0 +1,32 @@
+我们以 scripts/basic目录下的文件为例，跟踪分析linux kernel编译的make，Kbuild过程。
+
+在 Makefile中有以下规则：
+
+scripts_basic:
+	$(Q)$(MAKE) $(build)=scripts/basic
+
+实际在此规则之前，已经include了另外一个makefile来定义一些变量等。
+
+$(srctree)/scripts/Kbuild.include: ;
+include $(srctree)/scripts/Kbuild.include
+
+在该 Kbuild.include中，定义了simple变量 build，
+###
+# Shorthand for $(Q)$(MAKE) -f scripts/Makefile.build obj=
+# Usage:
+# $(Q)$(MAKE) $(build)=dir
+build := -f $(srctree)/scripts/Makefile.build obj
+
+因此上面规则的recipe就是
+$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.build obj=scripts/basic
+
+所以，将嵌套调用make，基于 scripts/Makefile.build完成 指定 obj目录下程序的编译。
+
+在 Makefile.build中，
+
+src := $(obj)
+
+
+
+
+

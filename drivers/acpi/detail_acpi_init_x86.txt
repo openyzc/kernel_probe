@@ -1,0 +1,2772 @@
+
+The ACPI driver is important part of kernel booting.
+This article will focus on all the aspectives of ACPI driver initialization.
+
+
+1. setup_arch -> acpi_boot_table_init()
+
+1.1 the acpi kernel booting paramters
+
+in arch/x86/kernel/acpi/boot.c, there is a global variable:
+
+static int __initdata acpi_force = 0;
+int acpi_disabled
+EXPORT_SYMBOL(acpi_disabled);
+
+in boot.c, function of parse_acpi will process the 'acpi=', a early_param:
+acpi=off will disable acpi;
+acpi=force will enable acpi forcedly.
+
+1.2 acpi_table_init(void)
+
+1.2.1 some relevant variables
+
+1)  acpi_gbl_verify_table_checksum
+
+drivers/acpi/tables.c :
+
+static bool acpi_verify_table_checksum __initdata = false;
+
+This variable is BOOL, can set by early_param:
+early_param("acpi_force_table_verification", acpi_force_table_verification_setup);
+
+Then this acpi_verify_table_checksum will decide the setting of variable,
+     acpi_gbl_verify_table_checksum which is defined in
+     /include/acpi/acpixf.h:
+ACPI_INIT_GLOBAL(u8, acpi_gbl_verify_table_checksum, TRUE);
+
+If acpi_verify_table_checksum is T,then acpi_gbl_verify_table_checksum is alos
+set as T.
+
+2) initial_tables
+
+The core processing of acpi_table_init is :
+status = acpi_initialize_tables(initial_tables, ACPI_MAX_TABLES, 0);
+
+Where is the definition of initial_tables??
+in /drivers/acpi/tables.c :
+
+static struct acpi_table_desc initial_tables[ACPI_MAX_TABLES] __initdata;
+
+So, initial_tables is an array of struct acpi_table_desc.
+
+It will be initilized by acpi_initalize_tables
+
+Please note that during the booting initialization, the parameter of
+allow_resize is FALSE.
+
+There is another variable tightly relevant to initial_tables :
+
+ACPI_GLOBAL(struct acpi_table_list, acpi_gbl_root_table_list);
+
+This acpi_gbl_root_table_list is initialized in acpi_initialize_tables by its
+input parameters.
+
+
+3) how to debug
+
+include/acpi/platform/acenv.h will define the macro of ACPI_DEBUG_OUTPUT:
+
+#ifdef ACPI_ASL_COMPILER
+#define ACPI_DEBUG_OUTPUT
+#endif
+
+#ifdef ACPI_NAMES_APP
+#define ACPI_DEBUG_OUTPUT
+
+
+#ifdef ACPI_FULL_DEBUG
+#define ACPI_DEBUG_OUTPUT
+#define ACPI_DEBUGGER 1
+#define ACPI_DISASSEMBLER 1
+#endif
+
+for ACPI_FULL_DEBUG, the definitions are :
+
+#ifdef ACPI_LIBRARY
+#define ACPI_USE_LOCAL_CACHE
+#define ACPI_FULL_DEBUG
+#endif
+
+#ifdef ACPI_EXEC_APP
+#define ACPI_FULL_DEBUG
+#endif
+
+So, The ACPI_DEBUG_OUTPUT is decided by ACPI_ASL_COMPILER / ACPI_EXEC_APP /
+ACPI_LIBRARY.
+
+But, I do not know where are their definitions now.
+Probably they are defined by some ACPI tools.
+
+you can refer to this path:
+
+tools/power/acpi/tools
+
+
+
+As for the ACPI debug tools, can refer to :
+
+https://www.kernel.org/doc/Documentation/acpi/debug.txt
+
+https://lwn.net/Articles/237085/
+
+http://my.oschina.net/fgq611/blog/101839
+
+
+1.2.2 initialize acpi_gbl_root_table_list
+
+1) if the input parameter of initial_table_array is NULL
+
+acpi_initialize_tables -> acpi_allocate_root_table
+
+drivers/acpi/acpica/tbxface.c :
+
+acpi_status acpi_allocate_root_table(u32 initial_table_count)
+
+this function will allocate more ACPI_ROOT_TABLE_SIZE_INCREMENT struct
+acpi_table_desc, then set the acpi_gbl_root_tables_list in
+acpi_tb_resize_root_table_list() :
+
+	acpi_gbl_root_table_list.tables = tables;
+	acpi_gbl_root_table_list.max_table_count =
+		    table_count + ACPI_ROOT_TABLE_SIZE_INCREMENT;
+    	acpi_gbl_root_table_list.flags |= ACPI_ROOT_ORIGIN_ALLOCATED;
+
+Please note that the acpi_gbl_root_table_list.flags for this case will be
+added ACPI_ROOT_ORIGIN_ALLOCATED.
+
+2) else initial_table_array is from global variable
+
+	acpi_gbl_root_table_list.tables = initial_table_array;
+	acpi_gbl_root_table_list.max_table_count = initial_table_count;
+	acpi_gbl_root_table_list.flags = ACPI_ROOT_ORIGIN_UNKNOWN;
+	if (allow_resize)
+	{
+		acpi_gbl_root_table_list.flags |= ACPI_ROOT_ALLOW_RESIZE;
+	}
+here, allow_resize is a flag whose value is 0 during acpi_table_init.
+And more important is that without ACPI_ROOT_ORIGIN_ALLOCATED is set in
+acpi_gbl_root_table_list.flags;
+
+1.2.3 acpi_os_get_root_pointer
+
+This fucntion will get the RSDP address.
+How to get it, you can refer to ACPI specification.
+
+1.2.4 acpi_tb_parse_root_table(rsdp_address)
+
+acpi_os_map_memory(rsdp_address, sizeof(struct acpi_table_rsdp))
+	This function will map memory from rsdp_address. The
+	acpi_os_map_memory is defined in osl.c
+
+1) map the struct acpi_table_rsdp for rsdp table header
+
+2) get the rsdt_physical_address or xsdt_physical_address based on the
+rsdp->revision and the xsdt_physical_address of rsdp
+
+3) mapp whole RSDT/XSDT table
+
+4) scan the last field of RSDT/XSDT, for each entry, do this processing:
+
+	status = acpi_tb_install_standard_table(address,
+		ACPI_TABLE_ORIGIN_INTERNAL_PHYSICAL,
+		FALSE,
+		TRUE,
+		&table_index);
+
+to handle all the other tables
+
+Please note that the reload is FALSE, override is TRUE.
+The table_index will return the table index of
+acpi_gbl_root_table_list.tables[].
+
+5) when the current entry is for FADT, will call
+	acpi_gbl_fadt_index = table_index;
+	acpi_tb_parse_fadt();
+
+1.2.5 acpi_tb_install_standard_table
+
+This function will be called by acpi_tb_parse_root_table.
+
+1) acpi_tb_acquire_temp_table(&new_table_desc, address, flags)
+
+The new_table_desc is local variable of struct acpi_table_desc.
+
+This acpi_tb_acquire_temp_table is defined in /drivers/acpi/acpica/tbdata.d
+
+-> acpi_tb_init_table_descriptor :
+	table_desc->address = address;
+	table_desc->length = table->length;
+	table_desc->flags = flags;
+	ACPI_MOVE_32_TO_32(table_desc->signature.ascii,	table->signature);
+
+	The real  work is set table_desc with current struct acpi_table_header
+
+2) acpi_gbl_disable_ssdt_table_install variable
+
+acpi_gbl_disable_ssdt_table_install is defined as :
+
+ACPI_INIT_GLOBAL(u8, acpi_gbl_disable_ssdt_table_install, FALSE);
+
+will be set based on this :
+
+early_param("acpi_no_static_ssdt", acpi_no_static_ssdt_setup);
+
+3) probably not process “Secondary System Description Table"
+	if (!reload &&
+	    acpi_gbl_disable_ssdt_table_install &&
+    	    ACPI_COMPARE_NAME(&new_table_desc.signature, ACPI_SIG_SSDT)) {
+
+will skip SSDT if this condition matches.
+
+4) call acpi_tb_verify_temp_table to verify the current table
+
+Major is for status, signature, checksum
+
+5) if reload is TRUE, will only process "SSDT", "OEMx", NULL
+signature.ascii[]
+
+for (i = 0; i < acpi_gbl_root_table_list.current_table_count; ++i ) {
+	if (!acpi_tb_compare_tables(&new_table_desc, i)) {
+		continue;
+	}
+### acpi_tb_compare_tables will get the struct acpi_table_header with the
+###	information from acpi_gbl_root_table_list.tables[table_index] and
+###	compare the new struct acpi_table_header with the &new_table_desc,
+###	If the length and all the data are same, then return TRUE.
+
+and if acpi_gbl_root_table_list.tables[i].flags without ACPI_TABLE_IS_LOADED,
+    this existing table index will be returned with status AE_OK for
+    reloading.
+
+if there is no same table in current
+	acpi_gbl_root_table_list, will goto step 6 too.
+
+6) acpi_tb_install_table_with_override(&new_table_desc, override, table_index)
+
+---
+acpi_tb_get_next_table_descriptor(&i, NULL)
+	will select an idle index from acpi_gbl_root_table_list.tables[].
+	normally, it should be acpi_gbl_root_table_list.current_table_count
+
+
+acpi_tb_validate_temp_table will set the struct acpi_table_header *pointer of
+struct acpi_table_desc. This pointer is to the mapping of whole table.
+
+	acpi_tb_verify_temp_table -> acpi_tb_validate_temp_table ->
+	acpi_tb_validate_table -> acpi_tb_acquire_table
+
+---
+	if (override) {
+		acpi_tb_override_table(new_table_desc);
+	}
+
+	acpi_tb_override_table will override the new_table_desc with something
+ 	such as CONFIG_ACPI_CUSTOM_DSDT, CONFIG_ACPI_INITRD_TABLE_OVERRIDE
+	configuration.
+
+--- At last, will update acpi_gbl_root_table_list.tables[] :
+	acpi_tb_init_table_descriptor(&acpi_gbl_root_table_list.tables[i],
+				      new_table_desc->address,
+      				      new_table_desc->flags,
+      				      new_table_desc->pointer);
+
+--- Since acpi_tb_parse_fadt should had been called before dsdt table, so
+	if (i == acpi_gbl_dsdt_index) {
+		acpi_ut_set_integer_width(new_table_desc->pointer->revision);
+	}
+	will be called for the table initlialzation.
+	acpi_ut_set_integer_width will set those varaibles:
+		acpi_gbl_integer_bit_width = 32 or 64;
+		acpi_gbl_integer_nybble_width = 8 or 16;
+		acpi_gbl_integer_byte_width = 4 or 8;
+	if the revision >= 2, then bit_width is 64.
+
+
+1.2.6 The special process for FADT
+
+Now, we go back to the FADT table initialization.
+
+in acpi_tb_parse_root_table, if the current table entry of RSDP is for FADT,
+   then :
+
+	if (ACPI_SUCCESS(status) &&
+		ACPI_COMPARE_NAME(&acpi_gbl_root_table_list.tables[table_index].signature,
+			      ACPI_SIG_FADT)) {
+		acpi_gbl_fadt_index = table_index;
+		acpi_tb_parse_fadt();
+	}
+
+So, acpi_tb_parse_fadt is coming.
+
+1) some important global variables:
+
+in acglobal.h :
+ACPI_INIT_GLOBAL(u32, acpi_gbl_dsdt_index, ACPI_INVALID_TABLE_INDEX);
+ACPI_INIT_GLOBAL(u32, acpi_gbl_fadt_index, ACPI_INVALID_TABLE_INDEX);
+
+in acpixf.h :
+ACPI_GLOBAL(struct acpi_table_fadt, acpi_gbl_FADT);
+ACPI_INIT_GLOBAL(u8, acpi_gbl_reduced_hardware, FALSE);
+
+## These two variable are set in acpi_tb_create_local_fadt
+
+These are the index of table acpi_gbl_root_table_list.tables[]. will be set
+during the table intialization.
+
+truct acpi_table_desc {
+	acpi_physical_address address;
+	struct acpi_table_header *pointer;
+	u32 length;		/* Length fixed at 32 bits (fixed in table header) */
+	union acpi_name_union signature;
+	acpi_owner_id owner_id;
+	u8 flags;
+};
+
+The address is the physical address of this table;
+pointer is the mapped address of this table.
+
+
+2) move the table data to global variable of acpi_gbl_FADT
+memcpy(&acpi_gbl_FADT, table,
+       ACPI_MIN(length, sizeof(struct acpi_table_fadt)));
+3) set acpi_gbl_reduced_hardware according to the acpi_gbl_FADT.flags &
+ACPI_FADT_HW_REDUCED
+
+4) acpi_tb_convert_fadt
+
+Please note that, in struct acpi_table_fadt, there are some struct
+acpi_generic_address structures from xpm1a_event_block
+
+But old ACPI only support 32 bit address. So, we need to convert those old
+address styles into struct acpi_generic_address.
+
+This function just do these work.
+After convertion, the new acpi_generic_address will stored in the fields of
+struct acpi_table_fadt from xpm1a_event_block.
+
+xpm1a_event_block is corresponding to fadt_info_table[0].
+
+5) install DSDT
+
+acpi_tb_install_fixed_table((acpi_physical_address) acpi_gbl_FADT.Xdsdt,
+			    ACPI_SIG_DSDT,
+			    &acpi_gbl_dsdt_index);
+
+
+6) if acpi_gbl_reduced_hardware is FALSE,
+
+	call acpi_tb_install_fixed_table to install FACS, the corresponding
+	table index will be saved in acpi_gbl_xfacs_index.
+
+
+1.3 acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf)
+
+	This will process "Simple Boot Flag Table". The Signature is "BOOT".
+	It is raised by MicroSoft.
+
+1.4 acpi_blacklisted
+
+This function will check whether currently discovered table is in
+acpi_blacklist[]. If yes, using ACPI is risky.
+
+2. setup_arch -> early_acpi_boot_init
+
+This function will parse MADT.
+
+2.1 acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)
+
+It is possible there are two MADT, acpi_get_table_with_size will select the
+right one based on acpi_apic_instance.
+
+This global variable can be set with early_parma:
+early_param("acpi_apic_instance", acpi_parse_apic_instance);
+
+check_multiple_madt will modify acpi_apic_instance as 0 if there is no two
+MADT in ACPI  namespace.
+
+for the matched MADT, will call acpi_parse_madt to set acpi_lapic_addr and set
+this pointer variable :
+
+struct apic __read_mostly *apic = &apic_flat;
+
+with the matching apicdriver from __apicdrivers to __apicdrivers_end.
+
+
+2.2 early_acpi_parse_madt_lapic_addr_ovr
+
+This function will get the matched struct acpi_subtable_header from MADT's
+entries[] for ACPI_MADT_TYPE_LOCAL_APIC_OVERRIDE.
+
+acpi_parse_lapic_addr_ovr will be called for the matched entry.
+
+
+=================
+3. acpi_boot_init
+
+This function will process these ACPI tables:
+
+acpi_table_parse(ACPI_SIG_BOOT, acpi_parse_sbf);
+acpi_table_parse(ACPI_SIG_FADT, acpi_parse_fadt);
+
+acpi_process_madt();
+
+acpi_table_parse(ACPI_SIG_HPET, acpi_parse_hpet);
+
+3.1 some important variables
+
+#ifdef CONFIG_X86_LOCAL_APIC
+static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
+#endif
+
+this acpi_lapic_addr is the base physical address of LAPIC.
+You can override this default address by ACPI_MADT_TYPE_LOCAL_APIC_OVERRIDE
+entry of MADT. Please refer to :
+
+	count = acpi_table_parse_madt(ACPI_MADT_TYPE_LOCAL_APIC_OVERRIDE,
+				      acpi_parse_lapic_addr_ovr, 0);
+
+in arch/x86/kernel/apic/apic.c :
+unsigned long mp_lapic_addr;
+
+this variable is the physical address of LAPIC, set in register_lapic_address.
+
+unsigned int boot_cpu_physical_apicid = -1U;
+EXPORT_SYMBOL_GPL(boot_cpu_physical_apicid);
+
+This is the acpiid of BSP, bootstrap processor.
+set as :
+
+boot_cpu_physical_apicid  = read_apic_id();
+
+Please note that apic->read will be called in these operations.
+This global struct apic *apic will be set by acpi_parse_madt ->
+default_acpi_madt_oem_check based on the madt->header.oem_id and
+madt->header.oem_table_id;
+
+
+
+3.2 acpi_parse_madt_lapic_entries
+
+will process LAPIC entries at first.
+
+
+3.3 acpi_parse_madt_ioapic_entries
+
+will process IOAPIC entries after LAPIC.
+
+
+
+
+
+
+4. start_kernel -> acpi_early_init
+
+4.1 some important variables
+
+acpi_gbl_verify_table_checksum = TRUE;
+acpi_gbl_permanent_mmap = 1;
+
+
+acpi_strict is defined in /arch/x86/kernel/acpi/boot.c :
+
+int acpi_strict
+
+This variable is set by kernel parameter :
+early_param("acpi", parse_acpi);
+
+when "acpi=strict".
+
+but for arm64, it is macro defined as :
+
+#define acpi_strict 1
+
+in arch/arm64/include/asm/acpi.h
+
+So, acpi_strict is 0 for x86 in default, 1 for arm64.
+
+This variable will decide the global variable :
+
+ACPI_INIT_GLOBAL(u8, acpi_gbl_enable_interpreter_slack, FALSE);
+
+If acpi_strict is 0 in X86, then :
+	if (!acpi_strict)
+		acpi_gbl_enable_interpreter_slack = TRUE;
+
+4.2 acpi_reallocate_root_table
+
+This function is defined in /drivers/acpi/acpica/tbxface.c
+
+The core is calling acpi_tb_resize_root_table_list after set :
+acpi_gbl_root_table_list.flags |= ACPI_ROOT_ALLOW_RESIZE;
+
+After this function, will update :
+
+	acpi_gbl_root_table_list.tables = tables;
+	acpi_gbl_root_table_list.max_table_count =
+	    table_count + ACPI_ROOT_TABLE_SIZE_INCREMENT;
+    	acpi_gbl_root_table_list.flags |= ACPI_ROOT_ORIGIN_ALLOCATED;
+
+The extention is based on the acpi_gbl_root_table_list.current_table_count to
+increase ACPI_ROOT_TABLE_SIZE_INCREMENT elements.
+
+4.3 acpi_initialize_subsystem
+
+defined in /drivers/acpi/acpica/utxfinit.c
+
+4.3.1 some variables
+
+in acglobal.h :
+
+ACPI_INIT_GLOBAL(u32, acpi_gbl_startup_flags, 0);
+
+This variable shows the initial stage of ACPI.
+
+in acpi_initialize_subsystem, this variable will be set as :
+acpi_gbl_startup_flags = ACPI_SUBSYSTEM_INITIALIZE;
+
+4.3.2 acpi_os_initialize
+
+in osl.c;
+
+This function will based on the processing of acpi_tb_parse_fadt ->
+acpi_tb_create_local_fadt -> acpi_tb_convert_fadt
+
+the struct acpi_generic_address is same as the "5.2.3.2 Generic Address
+Structure" of ACPI v6.1;
+
+This function majorly build the mapping for those address spaces defined in
+FADT. But only process for ACPI_ADR_SPACE_SYSTEM_MEMORY, for other space_id no
+any processing will happen.
+
+The core is acpi_os_map_generic_address calling. in this
+acpi_os_map_generic_address, will -> acpi_os_map_iomem(addr, gas->bit_width /
+		8) -> acpi_map -> acpi_os_ioremap -> ioremap_cache(phys, size)
+for ram / ioremap(phys, size) for non-ram
+
+All these mapping range will be linked to :
+list_add_tail_rcu(&map->list, &acpi_ioremaps);
+
+
+4.3.3 acpi_ut_init_globals
+
+4.3.3.1 some important variables
+
+in drivers/acpi/acpica/acglobal.h :
+
+ACPI_GLOBAL(struct acpi_address_range *,
+		    acpi_gbl_address_range_list[ACPI_ADDRESS_RANGE_MAX]);
+
+Some system caches pointers:
+
+ACPI_GLOBAL(acpi_cache_t *, acpi_gbl_namespace_cache); //struct acpi_namespace_node
+ACPI_GLOBAL(acpi_cache_t *, acpi_gbl_state_cache); //union acpi_generic_state
+ACPI_GLOBAL(acpi_cache_t *, acpi_gbl_ps_node_cache); //struct acpi_parse_obj_common
+ACPI_GLOBAL(acpi_cache_t *, acpi_gbl_ps_node_ext_cache); //struct acpi_parse_obj_named
+ACPI_GLOBAL(acpi_cache_t *, acpi_gbl_operand_cache); //union acpi_operand_object
+
+These are created by acpi_os_create_cache().
+
+If ACPI_DBG_TRACK_ALLOCATIONS defiend :
+ACPI_GLOBAL(struct acpi_memory_list *, acpi_gbl_global_list); //struct acpi_memory_list
+ACPI_GLOBAL(struct acpi_memory_list *, acpi_gbl_ns_node_list); //struct
+acpi_memory_list, object size is sizeof(struct acpi_namespace_node)
+
+These are created by acpi_ut_create_list() which was defined in
+/drivers/acpi/acpica/uttrack.c;
+
+4.3.4 acpi_ut_mutex_initialize
+
+defined in /drivers/acpi/acpica/utmutex.c;
+
+This function majorly create some global variables as mutex mechanism.
+
+including these variables:
+
+ACPI_GLOBAL(struct acpi_mutex_info, acpi_gbl_mutex_info[ACPI_NUM_MUTEX]);
+
+the struct is :
+
+	struct acpi_mutex_info {
+		acpi_mutex mutex;
+		u32 use_count;
+		acpi_thread_id thread_id;
+	};
+acpi_ut_create_mutex will create and initialize array element one by one.
+
+
+ACPI_GLOBAL(acpi_spinlock, acpi_gbl_gpe_lock);	/* For GPE data structs and
+						   registers */
+ACPI_GLOBAL(acpi_spinlock, acpi_gbl_hardware_lock);	/* For ACPI H/W except
+							   GPE registers */
+ACPI_GLOBAL(acpi_spinlock, acpi_gbl_reference_count_lock);
+
+ACPI_GLOBAL(acpi_mutex, acpi_gbl_osi_mutex);
+ACPI_GLOBAL(struct acpi_rw_lock, acpi_gbl_namespace_rw_lock);
+
+acpi_ut_create_rw_lock is defined in /drivers/acpi/acpica/utlock.c
+
+4.3.5 acpi_ns_root_initialize()
+
+in /drivers/acpi/acpica/nsaccess.c;
+
+some important variables:
+
+ACPI_GLOBAL(struct acpi_namespace_node, acpi_gbl_root_node_struct);
+ACPI_GLOBAL(struct acpi_namespace_node *, acpi_gbl_root_node);
+ACPI_GLOBAL(struct acpi_namespace_node *, acpi_gbl_fadt_gpe_device);
+ACPI_GLOBAL(union acpi_operand_object *, acpi_gbl_module_code_list);
+
+At the beginning:
+acpi_gbl_root_node = &acpi_gbl_root_node_struct;
+and acpi_gbl_root_node_struct is initialized in acpi_ut_init_globals() as:
+	acpi_gbl_root_node_struct.descriptor_type = ACPI_DESC_TYPE_NAMED;
+	acpi_gbl_root_node_struct.type = ACPI_TYPE_DEVICE;
+
+
+	for (init_val = acpi_gbl_pre_defined_names; init_val->name; init_val++) {
+
+		/* _OSI is optional for now, will be permanent later */
+		if (!strcmp(init_val->name, "_OSI")
+		    && !acpi_gbl_create_osi_method) {
+			continue;
+	}
+
+	So, the core is traversing the acpi_gbl_pre_defined_names, only
+		exclude the _OSI if acpi_gbl_create_osi_method is FALSE.
+
+4.3.5.1 acpi_ns_lookup
+
+in /drivers/acpi/acpica/nsaccess.c :
+
+acpi_status
+acpi_ns_lookup(union acpi_generic_state *scope_info,
+	       char *pathname,
+	       acpi_object_type type,
+	       acpi_interpreter_mode interpreter_mode,
+       	       u32 flags,
+       	       struct acpi_walk_state *walk_state,
+      	       struct acpi_namespace_node **return_node)
+
+1) decide the prefix_node
+
+according to the scope_info->scope.node.
+If scope_info->scope.node is NULL:
+	prefix_node = acpi_gbl_root_node;
+else
+	prefix_node = scope_info->scope.node;
+	and this prefix_node must be ACPI_DESC_TYPE_NAMED. i.e. namespace node;
+	if (!(flags & ACPI_NS_PREFIX_IS_SCOPE)), then
+		check prefix_node is ACPI_NS_NEWSCOPE or ACPI_TYPE_ANY
+		otherwise, prefix_node=prefix_node->parent;
+	it means that the final prefix_node must ACPI_NS_NEWSCOPE or
+		ACPI_TYPE_ANY
+
+	Does it means that the qualified node must be SCOPE node???
+
+2) decide the starting node for lookup
+
+This processing is dependent on input *pathname;
+
+if the prefix characters of path is '\',
+	this_node = acpi_gbl_root_node;
+if the prefix characters of path is '^',
+	this_node = prefix_node;
+	and for each '^', update the this_node:
+	this_node = this_node->parent;
+
+for both cases,
+	search_parent_flag = ACPI_NS_NO_UPSEARCH;
+means that the lookup is strictly started from this_node, should not upsearch
+	to the parents.
+
+3) decide the num_segments
+
+if the first character remaining is '.',
+	num_segments = 2;
+if the first character remaining is '/',
+	num_segments = the next character followed '/'
+
+for both cases,
+	search_parent_flag = ACPI_NS_NO_UPSEARCH;
+
+if the first character remaining is not '', not '.', not '/',
+	num_segments = 1;
+
+
+4) lookup processing
+
+	current_node = this_node;
+	while (num_segments && current_node) {
+
+### for non-final segment, directly search:
+	status =
+	    acpi_ns_search_and_enter(simple_name, walk_state,
+				     current_node, interpreter_mode,
+				     this_search_type, local_flags,
+				     &this_node);
+
+	if the this_node matched is ACPI_TYPE_LOCAL_ALIAS &&
+		(this_node->object)->type is ACPI_NS_NEWSCOPE,
+		this_node = (struct acpi_namespace_node *)this_node->object;
+
+### When the current this_node is the final segment,
+	this_search_type = type;
+
+	update local_flags according the input flags and search_parent_flag,
+	       then the new local_flags is as input parameter of last call for
+		       acpi_ns_search_and_enter
+
+
+4.3.5.2 acpi_ns_lookup -> acpi_ns_search_and_enter
+
+this function is the core of acpi_ns_lookup.
+
+1) acpi_ns_search_one_scope(target_name, node, type, return_node)
+
+for the target_name which is waiting to add, should  return AE_NOT_FOUND, then
+	if ((interpreter_mode != ACPI_IMODE_LOAD_PASS1) &&
+	    (flags & ACPI_NS_SEARCH_PARENT))
+		status =
+		    acpi_ns_search_parent_tree(target_name, node, type,
+    					       return_node);
+		if status is AE_OK, return directly.
+This branch is for the flags when ACPI_NS_SEARCH_PARENT is set;
+	if (interpreter_mode == ACPI_IMODE_EXECUTE) {
+		return AE_NOT_FOUND;
+
+else
+	new_node = acpi_ns_create_node(target_name);
+	acpi_ns_install_node(walk_state, node, new_node, type);
+	*return_node = new_node;
+	return AE_OK;
+
+	acpi_ns_create_node is defined in /drivers/acpi/acpica/nsalloc.c
+		just allocate a struct acpi_namespace_node from cache list of
+		acpi_gbl_namespace_cache, then update acpi_gbl_ns_node_list;
+	ACPI_SET_DESCRIPTOR_TYPE(node, ACPI_DESC_TYPE_NAMED);
+
+	acpi_ns_install_node will setup the relationship between new_node and
+		the parent node. All the parent, child, peer will be set in
+		this function.
+
+4.3.6 operand object attached to namespace object
+
+After the namespace node is created, will create the relevant operand objects.
+
+acpi_ut_create_internal_object(init_val->type)
+
+then initialize the operand object according its type.
+
+acpi_ns_attach_object(new_node, obj_desc,
+		       obj_desc->common.type);
+
+
+At last, attach the operand object with namespace object.
+
+
+4.3.6.1 acpi_ut_create_internal_object
+
+acpi_ut_create_internal_object -> acpi_ut_create_internal_object_dbg
+
+acpi_ut_create_internal_object_dbg is defined in
+/drivers/acpi/acpica/utobject.c
+
+in this function, if have secondary object, then :
+
+second_object->common.type = ACPI_TYPE_LOCAL_EXTRA;
+object->common.next_object = second_object;
+
+object->common.type = (u8) type;
+
+here, type is the input parameter.
+
+
+4.3.7 Get the "_GPE" namespace, save the pointer in acpi_gbl_fadt_gpe_device
+
+status = acpi_ns_get_node(NULL, "\\_GPE", ACPI_NS_NO_UPSEARCH,
+		  &acpi_gbl_fadt_gpe_device);
+
+
+4.4 acpi_load_tables()
+
+This function is defined in /drivers/acpi/acpica/tbxfload.c
+
+4.4.1 some variables
+
+in /include/acpi/acpixf.h :
+
+ACPI_INIT_GLOBAL(u8, acpi_gbl_group_module_level_code, TRUE);
+
+
+4.4.2 acpi_ev_install_region_handlers
+
+in /drivers/acpi/acpica/evhandler.c;
+
+The core is :
+	for (i = 0; i < ACPI_NUM_DEFAULT_SPACES; i++) {
+		status = acpi_ev_install_space_handler(acpi_gbl_root_node,
+				       acpi_gbl_default_address_spaces[i],
+				       ACPI_DEFAULT_HANDLER,
+				       NULL, NULL);
+in acpi_ev_install_space_handler, these processings will happen:
+
+1) decide the handler and setup hooks according to the input space_id, i.e.
+acpi_gbl_default_address_spaces[i].
+
+2) acpi_ns_get_attached_object(node)
+
+check the input paramter node (struct acpi_namespace_node) has the valid union
+acpi_operand_object *object;
+
+If the namespace node have the operand object, will return the qulified
+	operand object. But normally, this object should has no
+	obj_desc->common_notify.handler.
+so the next step is executed.
+
+3) obj_desc = acpi_ut_create_internal_object(type);
+
+The type should be ACPI_TYPE_DEVICE or node->type (the type of namespace node)
+
+#define acpi_ut_create_internal_object(t) acpi_ut_create_internal_object_dbg
+(_acpi_module_name,__LINE__,_COMPONENT,t)
+
+It is worth to describe acpi_ut_create_internal_object_dbg in detail.
+
+--- acpi_ut_allocate_object_desc_dbg
+	will allocate an operand object from cache list of
+	acpi_gbl_operand_cache. This object's common.descriptor_type will be
+	set as ACPI_DESC_TYPE_OPERAND;
+--- when input type is ACPI_TYPE_REGION | ACPI_TYPE_BUFFER_FIELD |
+	ACPI_TYPE_LOCAL_BANK_FIELD
+	secondary operand object will be created too:
+		second_object =
+		    acpi_ut_allocate_object_desc_dbg(module_name, line_number,
+   						     component_id);
+		second_object->common.type = ACPI_TYPE_LOCAL_EXTRA;
+		object->common.next_object = second_object;
+		( secondary object will be link to the front operand object)
+--- set the first operand object common.type:
+	object->common.type = (u8) type;
+	object->common.reference_count = 1;
+
+After the acpi_ut_create_internal_object(type), this is not needed anymore:
+	obj_desc->common.type = (u8)type;
+
+4) acpi_ns_attach_object
+status = acpi_ns_attach_object(node, obj_desc, type);
+
+This function is defined in /drivers/acpi/acpica/nsobject.c;
+
+--- if the input operand object is namespace node ( decriptor_type is
+		ACPI_DESC_TYPE_NAMED), then get the real operand object :
+	obj_desc = ((struct acpi_namespace_node *)object)->object;
+	object_type = ((struct acpi_namespace_node *)object)->type;
+	##(ACPI_GET_DESCRIPTOR_TYPE(object) == ACPI_DESC_TYPE_NAMED) is not
+	##needed since it had been checked just before.
+--- else
+	obj_desc = (union acpi_operand_object *)object;
+	object_type = type;
+
+--- Then all the operand object currently in node->object list will be
+	appended to the common.next_object of obj_desc.
+
+	node->type = (u8) object_type;
+	node->object = obj_desc;
+It means that the new operand object of obj_desc will be as the first operand
+	object of node->object.
+	the union acpi_operand_object *object of struct acpi_namespace_node
+	will be set in this function.
+
+5) an operand object for handler  will be created :
+	handler_obj =
+	    acpi_ut_create_internal_object(ACPI_TYPE_LOCAL_ADDRESS_HANDLER);
+This handler_obj's common.type is ACPI_TYPE_LOCAL_ADDRESS_HANDLER,
+     descriptor_type is ACPI_DESC_TYPE_OPERAND.
+
+The most important are these processings :
+	handler_obj->address_space.next = obj_desc->common_notify.handler;
+	obj_desc->common_notify.handler = handler_obj;
+It means that the new handler object will be linked to obj_desc->common_notify
+	as the first node.
+
+So, Up to now, what acpi_ev_install_space_handler done is to create an operand
+object for the input namespace node, and set the
+obj_desc->common_notify.handler of that operand object.
+
+
+The last step is acpi_ns_walk_namespace. this function is important, we
+describe it in separate chapter.
+
+The acpi_ev_install_handler will be called for each namespace nodes whose type
+is matched.
+
+in acpi_ev_install_handler, there is condistion:
+	if ((node->type != ACPI_TYPE_DEVICE) &&
+			de->type != ACPI_TYPE_REGION) && (node !=
+				acpi_gbl_root_node))
+			de->type != ACPI_TYPE_REGION) && (node !=
+				acpi_gbl_root_node))
+	    (node->type != ACPI_TYPE_REGION) && (node != acpi_gbl_root_node))
+So, It means that for non-root node, the node->type must be ACPI_TYPE_DEVICE |
+	ACPI_TYPE_REGION
+
+
+4.4.3 acpi_ns_walk_namespace
+
+	status = acpi_ns_walk_namespace(ACPI_TYPE_ANY, node,
+					ACPI_UINT32_MAX, ACPI_NS_WALK_UNLOCK,
+					acpi_ev_install_handler, NULL,
+					handler_obj, NULL);
+
+acpi_ev_install_handler is defined in /drivers/acpi/acpica/evhandler.c;
+
+This function is defined in /drivers/acpi/acpica/nswalk.c;
+
+4.4.3.1 Get the child node of input start_node
+
+	parent_node = start_node;
+	child_node = acpi_ns_get_next_node(parent_node, NULL);
+The NULL means the scan is from the first child node of parent_node;
+
+if the input type is not ACPI_TYPE_ANY, must save the current node type of
+child_node into child_type. This variable will be compare with input type.
+
+	if status == AE_CTRL_DEPTH,
+		will skip the walk on all the descendants.
+
+
+	for each node whose type matchs with the input type, will :
+		status = descending_callback(child_node,
+				level, context,
+				return_value);
+	it means this callback function will process for the matched
+		child_node, and the union acpi_operand_object pointer from
+		context;
+
+4.4.3.2 the deepth scan first
+
+!!!All the matched nodes from the namespace branch rooted on input node of
+acpi_ns_walk_namespace will be processed relatvie to the same union
+	acpi_operand_object.
+
+The major functionality of acpi_ns_walk_namespace is done the same thing with
+callback function from the namespace branch rooted on the input node.
+This is for all matched nodes.
+
+4.4.4 acpi_tb_load_namespace() -> acpi_ns_load_table
+
+defined in /drivers/acpi/acpica/tbxfload.c;
+
+What is done in this function? Just as the note said:
+	Load the namespace from the DSDT and all SSDTs/PSDTs found in the
+	RSDT/XSDT.
+
+The core is acpi_ns_load_table(u32 table_index, struct acpi_namespace_node
+		*node)
+It is defined in /drivers/acpi/acpica/nsload.c;
+
+4.4.4.1 acpi_tb_allocate_owner_id(table_index)
+This function will allocate a idle index (0~255) to
+acpi_gbl_root_table_list.tables[table_index].owner_id.
+
+Why this small range is engough???
+
+4.4.4.2 acpi_ns_parse_table(table_index, node)
+in /drivers/acpi/acpica/nsparse.c
+
+is comprised of two stages:
+
+acpi_ns_one_complete_parse(ACPI_IMODE_LOAD_PASS1, table_index, start_node);
+acpi_ns_one_complete_parse(ACPI_IMODE_LOAD_PASS2, table_index, start_node);
+
+Here, we are focus on acpi_ns_one_complete_parse()
+
+4.4.4.2.1 preparation
+---
+acpi_get_table_by_index(table_index, &table)
+
+this function will create the mapping of the table physical address if it is
+not done. Please note that the mapping cover whole table including the data.
+
+---
+	aml_start = (u8 *)table + sizeof(struct acpi_table_header);
+	aml_length = table->length - sizeof(struct acpi_table_header);
+
+	status = acpi_tb_get_owner_id(table_index, &owner_id);
+These processes will get the starting point of aml segment, and the owner_id
+	for this table.
+
+4.4.4.2.2 create a union acpi_parse_object
+
+	parse_root = acpi_ps_create_scope_op(aml_start);
+
+this is a union structure defined as that:
+	union acpi_parse_object {
+		struct acpi_parse_obj_common common;
+		struct acpi_parse_obj_named named;
+		struct acpi_parse_obj_asl asl;
+	};
+
+	--> acpi_ps_alloc_op(AML_SCOPE_OP, aml);
+	--> op_info = acpi_ps_get_opcode_info(opcode);
+
+It is worth to describe this gobla array:
+struct acpi_opcode_info acpi_gbl_aml_op_info[AML_NUM_OPCODES]
+
+#define ACPI_OP(name, Pargs, Iargs, obj_type, class, type, flags) \
+	{name, (u32)(Pargs), (u32)(Iargs), (u32)(flags), obj_type, class, type}
+
+So, the countdown 3rd is class,
+	countdown 4th is object_type,
+	countdown 2nd is type,
+	last parameter is flags.
+
+Most fields of op->common are set as:
+	op->common.descriptor_type = ACPI_DESC_TYPE_PARSER;
+	op->common.aml_opcode = opcode;
+	op->common.aml = aml;
+	op->common.flags = flags;
+
+	op->named.name = ACPI_ROOT_NAME;
+
+So, the major work of acpi_ps_create_scope_op(aml_start) is to intialize the
+	union acpi_parse_object;
+
+
+4.4.4.2.3  create struct acpi_walk_state
+
+The major work of this function is to create a struct acpi_walk_state.
+
+walk_state = acpi_ds_create_walk_state(owner_id, NULL, NULL, NULL);
+
+Please note that only one valid input paramter here. It means that the new
+created struct acpi_walk_state will be initialized only this field:
+	walk_state->owner_id = owner_id;
+
+	then
+	walk_state->descriptor_type = ACPI_DESC_TYPE_WALK;
+	acpi_ds_method_data_init(walk_state);
+## this function will initialize these two arrays:
+	walk_state->arguments[i], whose flags = ANOBJ_METHOD_ARG;
+	walk_state->local_variables[i], whose flags = ANOBJ_METHOD_LOCAL;
+
+	since thread is NULL, the new walk_state will not be linked to
+		thread->walk_state_list by this calling:
+	-->	acpi_ds_push_walk_state(walk_state, thread);
+
+
+4.4.4.3 acpi_ds_init_aml_walk
+
+in /drivers/acpi/acpica/dswstate.c;
+
+The major work is to initialize walk_state->parser_state of struct
+	acpi_walk_state.
+
+walk_state->parser_state->scope will be set by acpi_ps_init_scope;
+walk_state->parse_state->start_op is set as the union acpi_parse_object
+	created in acpi_ps_create_scope_op.
+
+But it seems that walk_state->parse_state->start_node is NULL.
+otherwise, will call acpi_ds_scope_stack_push to allocate an union
+acpi_generic_state and initialize as :
+
+	scope_info->common.descriptor_type = ACPI_DESC_TYPE_STATE_WSCOPE;
+	scope_info->scope.node = node;
+	scope_info->common.value = (u16) type;
+
+	Then linked it to walk_state->scope_info;
+
+	Actually, if the input paramter of start_node of
+	acpi_ns_one_complete_parse is not NULL and not acpi_gbl_root_node,
+	will set the walk_state->scope_info like that:
+		if (start_node && start_node != acpi_gbl_root_node) {
+			status =
+			    acpi_ds_scope_stack_push(start_node, ACPI_TYPE_METHOD,
+	    					     walk_state);
+
+At last, will set some callbacks in acpi_ds_init_callbacks according to the
+	parse id:
+
+	walk_state->descending_callback = ??;
+	walk_state->ascending_callback = ??;
+
+4.4.4.4 acpi_ps_parse_aml(walk_state)
+
+The first thing is to allocate union acpi_generic_state with descriptor_type
+of ACPI_DESC_TYPE_STATE_THREAD,
+	state->thread.thread_id = acpi_os_get_thread_id();
+then set :
+	walk_state->thread = thread;
+
+and link the walk_state into thread->walk_state_list:
+	acpi_ds_push_walk_state(walk_state, thread);
+
+ok. Next is the core function :
+
+	acpi_ps_parse_loop(walk_state);
+
+
+4.4.5 acpi_ps_parse_loop(walk_state)
+
+4.4.5.1 acpi_ps_create_op
+
+acpi_ps_create_op(walk_state, aml_op_start, &op);
+
+1. acpi_ps_get_aml_opcode(walk_state)
+
+It is defined in /drivers/acpi/acpica/psobject.c;
+
+--- In  this function, will :
+	walk_state->aml = walk_state->parser_state.aml;
+	walk_state->opcode = acpi_ps_peek_opcode(&(walk_state->parser_state));
+Then will set walk_state->opcode and walk_state->arg_types according to the
+	walk_state->op_info->class. This op_info->class is from
+	acpi_gbl_aml_op_info by invokation of
+	acpi_ps_get_opcode_info(walk_state->opcode);
+
+You can refer to acpi_gbl_aml_op_info[AML_NUM_OPCODES];
+All the opcode who corresponds to the "_ASC" or "_NAM"
+	in acpi_gbl_short_op_index[256] or
+	acpi_gbl_long_op_index[NUM_EXTENDED_OPCODE]. The index for these
+	two array are the opcode id from AML.
+Those opcodes belong to the AML_CLASS_ASCII class. The value are (‘A’-‘Z’),
+      '_'(NameChar_ 0x5F) for LeadNameChar;
+
+All the opcode who corresponds to the "_PFX" is the class AML_CLASS_PREFIX.
+      '\'(RootChar) 0x5C, '^'(ParentPrefixChar) 0x5E. '.'(DualNamePrefix
+      0x2E), '/'(MultiNamePrefix 0x2F) for NameString;
+
+--- For these two classes, modify the setting for opcode and arg_types:
+		walk_state->opcode = AML_INT_NAMEPATH_OP;
+		walk_state->arg_types = ARGP_NAMESTRING;
+
+--- For AML_CLASS_UNKNOWN, will skip this AML byte steams corresponding to this
+	opcode.
+
+--- For all the other classes :
+	walk_state->arg_types = walk_state->op_info->parse_args;
+	walk_state->parser_state.aml +=
+				    acpi_ps_get_opcode_size(walk_state->opcode);
+	This will make the new parser_state.aml point to the byte stream just
+	after the opcode.
+
+All these fields of walk_state will be used in the later processing.
+
+
+
+
+====== The DSDT/SSDT loading==========
+
+acpi_tb_load_namespace -> acpi_ns_load_table -->
+acpi_ns_parse_table(table_index, node) --> acpi_ns_one_complete_parse
+
+
+1. Create union acpi_parse_object
+
+parse_root = acpi_ps_create_scope_op(aml_start);
+
+Please note that the parameter of aml_start is the first char pointer just
+	behind the struct acpi_table_header of ACPI table.
+
+union acpi_parse_object *acpi_ps_create_scope_op(u8 *aml)
+{
+	union acpi_parse_object *scope_op;
+
+	scope_op = acpi_ps_alloc_op(AML_SCOPE_OP, aml);
+	if (!scope_op) {
+		return (NULL);
+	}
+
+	scope_op->named.name = ACPI_ROOT_NAME;
+	return (scope_op);
+}
+SO, it is obvious an union acpi_parse_object for AML_SCOPE_OP (opcode 0x10) will be
+created and initialized.
+
+	op->common.descriptor_type = ACPI_DESC_TYPE_PARSER;
+	op->common.aml_opcode = opcode;
+	op->common.aml = aml;
+	op->common.flags = flags;
+Here, the flags is set depended on the op_info->flags.
+
+This opcode (0x10) is corresponding to this acpi_opcode_info from
+acpi_gbl_aml_op_info[256]:
+
+/* 08 */ ACPI_OP("Scope", ARGP_SCOPE_OP, ARGI_SCOPE_OP,
+		 ACPI_TYPE_LOCAL_SCOPE, AML_CLASS_NAMED_OBJECT,
+		 AML_TYPE_NAMED_NO_OBJ,
+		 AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+		 AML_NSNODE | AML_NAMED),
+
+The flags will be set as ACPI_PARSEOP_NAMED_OBJECT for 0x10 opcode.
+
+2. create a struct acpi_walk_state for this ACPI opcode
+	walk_state = acpi_ds_create_walk_state(owner_id, NULL, NULL, NULL);
+
+
+3. acpi_ds_init_aml_walk
+
+	status = acpi_ds_init_aml_walk(walk_state, parse_root, NULL,
+				       aml_start, aml_length, NULL,
+       				       (u8)pass_number);
+
+It will initial the walk_state->parse_state.
+(struct acpi_parse_state parser_state;)
+
+3.1 union acpi_generic_state binded to parser_state->scope
+
+status = acpi_ps_init_scope(&walk_state->parser_state, op);
+
+	scope->common.descriptor_type = ACPI_DESC_TYPE_STATE_RPSCOPE;
+	scope->parse_scope.op = root_op;
+	scope->parse_scope.arg_count = ACPI_VAR_ARGS;
+	scope->parse_scope.arg_end = parser_state->aml_end;
+	scope->parse_scope.pkg_end = parser_state->aml_end;
+
+	parser_state->scope = scope;
+	parser_state->start_op	= root_op;
+
+So, the new union apci_generic_state will be binded to parser_state->scope.
+
+3.2 acpi_ds_init_callback
+
+At last will call acpi_ds_init_callbacks to set these fields in walk_state:
+walk_state->parse_flags
+walk_state->descending_callback
+walk_state->ascending_callback
+
+according the current parse level.
+
+4. acpi_ps_parse_aml --> acpi_ps_parse_loop
+
+Ok, everything are ready, start the aml parsing:
+
+status = acpi_ps_parse_aml(walk_state);
+
+set the acpi_thread_state of walk_state:
+--> walk_state->thread = thread;
+
+---> Build the relationship between struct acpi_thread_state and struct
+acpi_walk_state:
+	acpi_ds_push_walk_state(walk_state, thread);
+
+Ok. The focus is acpi_ps_parse_look:
+
+status = acpi_ps_parse_loop(walk_state);
+
+The beginning processing is :
+
+	while ((parser_state->aml < parser_state->aml_end) || (op)) {
+		aml_op_start = parser_state->aml;
+		if (!op) {
+			status =
+			    acpi_ps_create_op(walk_state, aml_op_start, &op);
+
+4.1 acpi_ps_create_op
+
+4.1.1 status = acpi_ps_get_aml_opcode(walk_state)
+
+This function will set the right data for walk_state->opcode,
+     walk_state->arg_types according to the acpi_opcode_info class.
+
+	For those walk_state->op_info->class of AML_CLASS_ASCII |
+	AML_CLASS_PREFIX, will set :
+		walk_state->opcode = AML_INT_NAMEPATH_OP;
+		walk_state->arg_types = ARGP_NAMESTRING;
+
+	other cases, will set as:
+	walk_state->parser_state.aml +=
+		    acpi_ps_get_opcode_size(walk_state->opcode);
+	walk_state->arg_types = walk_state->op_info->parse_args;
+	( this is for the most AMLmost AML opcode. For ScopeOp, the arg_types
+	  is ARGI_SCOPE_OP, the arguments followed are : #define ARGP_SCOPE_OP
+	  ARGP_LIST3 (ARGP_PKGLENGTH,  ARGP_NAME,          ARGP_TERMLIST))
+Please keep in mind that all these are relevant to the AML opcode of current
+	AML segments.
+
+This is different from the opcode of AML_SCOPE_OP that was used in
+	walk_state->parser_state->scope->parse_scope.op
+
+4.1.2 create a new union acpi_parse_object
+
+	walk_state->op_info = acpi_ps_get_opcode_info(walk_state->opcode);
+	op = acpi_ps_alloc_op(walk_state->opcode, aml_op_start);
+
+
+4.1.3 acpi_ps_build_named_op
+if (walk_state->op_info->flags & AML_NAMED)
+	will call acpi_ps_build_named_op.
+
+for ScopeOp, the flags will with AML_NAMED.
+
+In this function, the core processing is :
+		while (GET_CURRENT_ARG_TYPE(walk_state->arg_types) &&
+		       (GET_CURRENT_ARG_TYPE(walk_state->arg_types) != ARGP_NAME)) {
+			status =
+			    acpi_ps_get_next_arg(walk_state,
+    					 &(walk_state->parser_state),
+ 					 GET_CURRENT_ARG_TYPE(walk_state->
+					      arg_types), &arg);
+			if (ACPI_FAILURE(status)) {
+				return_ACPI_STATUS(status);
+			}
+
+			acpi_ps_append_arg(unnamed_op, arg);
+			INCREMENT_ARG_LIST(walk_state->arg_types);
+		}
+This loop will check all the arglist of walk_state->arg_types, until the
+ARGP_NAME is found. Note that each ARGP type occupies ARG_TYPE_WIDTH ( 5
+bits).
+
+4.1.3.1 acpi_ps_append_arg
+Now, we analyse acpi_ps_append_arg(unnamed_op, arg):
+
+--- op_info = acpi_ps_get_opcode_info(op->common.aml_opcode)
+	then make some checks to guarantee this opcode has the arglist.
+--- append the new arg to the arglist whose header is
+	unnamed_op->common.value.arg;
+--- set the parent of all arg in the input parameter arg:
+	while (arg) {
+		arg->common.parent = op;
+		arg = arg->common.next;
+		op->common.arg_list_length++;
+	}
+	you should note, in the input parameter arg, it is possible that there
+	are several arguments.
+
+Please note that, the input parameter of arg is created through :
+acpi_ps_get_next_arg(walk_state,
+	&(walk_state->parser_state),
+	GET_CURRENT_ARG_TYPE(walk_state->arg_types), &arg);
+After this function, the parser_state->aml will be updated to point to the
+	next argument.
+
+4.1.3.2 walk_state->descending_callback(walk_state, op)
+The calling is :
+walk_state->op = NULL;
+status = walk_state->descending_callback(walk_state, op);
+
+walk_state->descending_callback should be set by acpi_ds_init_callbacks.
+For Load pass 1, it should be
+walk_state->descending_callback = acpi_ds_load1_begin_op;
+
+4.1.3.3 acpi_ds_load1_begin_op
+
+path = acpi_ps_get_next_namestring(&walk_state->parser_state);
+
+this function will get the namestring. The parser_state->aml will be updated
+to the next argument.
+
+Here, we temporarily trace the ScopeOp only.
+
+switch (walk_state->opcode) {
+	case AML_SCOPE_OP:
+		status =
+		    acpi_ns_lookup(walk_state->scope_info, path, object_type,
+				   ACPI_IMODE_EXECUTE, ACPI_NS_SEARCH_PARENT,
+				   walk_state, &(node));
+now, interpreter_mode of acpi_ns_lookup is ACPI_IMODE_EXECUTE, flags is
+	ACPI_NS_SEARCH_PARENT, walk_state is non-NULL, **return_node is a
+	valid pointer.
+It means that, the search can be upstreamed if can not find the matched node
+in downstream of the input namespace node. For ACPI_IMODE_EXECUTE, the node
+must be found, otherwise, will return AE_NOT_FOUND.
+
+The core processing is done by acpi_ns_search_and_enter ->
+acpi_ns_search_one_scope
+
+The acpi_ns_search_one_scope will find the matched namespace node whose
+node->name is equal to the input target_name. If this matched node with
+different type from the input type, a ACPI_WARNING will be outputed for this
+case.
+
+--- If the namespace for searching is found, will process these for DSDT
+--- scope:
+if (!(flags & ACPI_NS_DONT_OPEN_SCOPE) && (walk_state)) {
+	if (acpi_ns_opens_scope(type)) {
+		status =
+			acpi_ds_scope_stack_push(this_node, type, walk_state);
+The type for ScopeOp is ACPI_TYPE_LOCAL_SCOPE.  This obj_type of ScopeOp is
+	the index of acpi_gbl_ns_properties[] in acpi_ns_opens_scope().
+So, acpi_ds_scope_stack_push will be called for the matched namespace node.
+A new union acpi_generic_state node will be linked to the list of
+walk_state->scope_info.
+
+4.1.3.4 acpi_ps_next_parse_state
+
+
+
+4.1.4 acpi_ps_append_arg(parent_scope, op)
+
+	parent_scope = acpi_ps_get_parent_scope(&(walk_state->parser_state));
+	acpi_ps_append_arg(parent_scope, op);
+
+	pleaes note that, acpi_ps_get_parent_scope will return :
+		return (parser_state->scope->parse_scope.op);
+	This is the pointer the union acpi_parse_object created by
+		acpi_ns_one_complete_parse for AML_SCOPE_OP at the beginning.
+
+--> acpi_ps_append_arg(parent_scope, op)
+
+	will setup the relationship between parent_scope and op, these two
+	union acpi_parse_object.
+	--> arg will be appended in the list of op->common.value.arg;
+	--> all the arg objects of list of arg->common.next will be set as:
+		arg->common.parent = op;
+		op->common.arg_list_length++; //the total child arg objects
+
+4.1.4 call walk_state->descending_callback
+
+This hook should be set in acpi_ds_init_aml_walk -> acpi_ds_init_callbacks;
+
+for ACPI_IMODE_LOAD_PASS1, the hook is:
+		walk_state->parse_flags = ACPI_PARSE_LOAD_PASS1 |
+				    ACPI_PARSE_DELETE_TREE;
+		walk_state->descending_callback = acpi_ds_load1_begin_op;
+		walk_state->ascending_callback = acpi_ds_load1_end_op;
+
+SO, acpi_ds_load1_begin_op will be called.
+
+acpi_ds_load1_begin_op(walk_state, &op);
+
+Please note that the &op will probably be changed to another union
+	acpi_parse_object.
+
+4.1.5 acpi_ds_load1_begin_op
+
+walk_state->opcode is initalized in acpi_ps_get_aml_opcode;
+It is the opcode of current AML segment.
+
+Name() is corresponding to AML_NAME_OP (0x08)
+
+4.1.5.1 get the namestring
+
+path = acpi_ps_get_next_namestring(&walk_state->parser_state);
+
+this function will return the namestring at the AML startpoint. and update the
+	parser_state->aml = end;
+here, end is the address of the next object of the arglist.
+
+then, get the object_type from walk_state:
+object_type = walk_state->op_info->object_type;
+
+processing based on the walk_state->opcode
+
+4.1.5.2 call acpi_ns_lookup
+
+acpi_ns_lookup(walk_state->scope_info, path, object_type,
+		   ACPI_IMODE_EXECUTE, ACPI_NS_SEARCH_PARENT,
+		   walk_state, &(node));
+
+
+
+=================Re-analysis=======
+acpi_tb_load_namespace ->
+acpi_ns_load_table(acpi_gbl_dsdt_index, acpi_gbl_root_node) ->
+acpi_ns_parse_table(table_index, node) ->
+acpi_ns_one_complete_parse(ACPI_IMODE_LOAD_PASS1, table_index, start_node) ->
+cpi_ns_one_complete_parse(ACPI_IMODE_LOAD_PASS2, table_index, start_node)
+
+We only start from :
+acpi_ns_one_complete_parse(u32 pass_number,
+			   u32 table_index,
+   			   struct acpi_namespace_node *start_node)
+
+-- Get the AML start and the AML length of whole DSDT/SSDT
+	aml_start = (u8 *)table + sizeof(struct acpi_table_header);
+	aml_length = table->length - sizeof(struct acpi_table_header);
+
+-- create an union acpi_parse_object for opcode of AML_SCOPE_OP which
+-- corresponding to the aml_start :
+	parse_root = acpi_ps_create_scope_op(aml_start);
+This opcode has this acpi_opcode_info from acpi_gbl_aml_op_info[]:
+	/* 08 */ ACPI_OP("Scope", ARGP_SCOPE_OP, ARGI_SCOPE_OP,
+			 ACPI_TYPE_LOCAL_SCOPE, AML_CLASS_NAMED_OBJECT,
+ 			 AML_TYPE_NAMED_NO_OBJ,
+ 			 AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+ 			 AML_NSNODE | AML_NAMED),
+-- initialize the walk_state->parser_state
+	status = acpi_ds_init_aml_walk(walk_state, parse_root, NULL,
+			       aml_start, aml_length, NULL,
+			       (u8)pass_number);
+	for DSDT loading, the input parameter of method_node is NULL, and
+	parser_state->start_op is NULL, so the major work of this
+	invokation is :
+		acpi_ps_init_scope(&walk_state->parser_state, op)
+	an union acpi_generic_state node will be allocated and set to:
+		parser_state->scope = scope;
+		parser_state->start_op = root_op;
+	without the calling of acpi_ds_scope_stack_push to link a node to
+		walk_state->scope_info.
+
+Up to now, only parse_state->scope and parser_state->start_op are valid in
+walk_state->parser_state.
+I think this scope is the top one.
+
+
+=== acpi_ps_parse_aml(walk_state) ===
+
+Please note the first thing, the core processing of this function is :
+
+while (walk_state) {
+
+## So, walk_state should be updated in the loop, and only when walk_state is
+NULL, will complete the loop.
+
+1. status = acpi_ps_parse_loop(walk_state)
+The core is this loop:
+
+	while ((parser_state->aml < parser_state->aml_end) || (op)) {
+## So, walk_state->parser_state->aml should be updated in the loop.
+
+The internal processing of loop is as :
+	aml_op_start = parser_state->aml;
+	if (!op) {
+		status =
+		    acpi_ps_create_op(walk_state, aml_op_start, &op);
+
+##for each parser_state->aml, will call acpi_ps_create_op(walk_state,
+		aml_op_start, &op).
+
+1.1 acpi_ps_create_op(walk_state, aml_op_start, &op)
+
+input parameter of op will be set to the created union acpi_parse_object.
+
+1.1.1 	status = acpi_ps_get_aml_opcode(walk_state)
+
+This function will get the opcode from the starting AML of
+walk_state->parser_state.aml. The opcode is 1 or 2 bytes:
+	walk_state->aml = walk_state->parser_state.aml;
+	walk_state->opcode = acpi_ps_peek_opcode(&(walk_state->parser_state));
+acpi_ps_peek_opcode can help us to get the right opcode from AML.
+Then, get the acpi_opcode_info from acpi_gbl_aml_op_info[] :
+	walk_state->op_info = acpi_ps_get_opcode_info(walk_state->opcode);
+
+	switch (walk_state->op_info->class) {
+## So, according the class of acpi_opcode_info, we can set those in
+walk_state:
+	walk_state->opcode
+	walk_state->arg_types
+Normally, will set as:
+	walk_state->parser_state.aml +=
+		    acpi_ps_get_opcode_size(walk_state->opcode);
+	walk_state->arg_types =	walk_state->op_info->parse_args;
+## arg_types is from the parse_args of acpi_opcode_info.
+	Please note that the wail_state->parser_state.aml will be advanced
+	over the opcode length, means that the current aml points to the next
+	object.
+
+1.1.2 Do something based on the opcode parsed by acpi_pas_get_aml_opcode
+These are the beginning:
+	walk_state->op_info = acpi_ps_get_opcode_info(walk_state->opcode);
+	op = acpi_ps_alloc_op(walk_state->opcode, aml_op_start);
+
+--- if (walk_state->op_info->flags & AML_NAMED)
+	status =
+	    acpi_ps_build_named_op(walk_state, aml_op_start, op,
+				   &named_op);
+	acpi_ps_free_op(op);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	*new_op = named_op;
+	return_ACPI_STATUS(AE_OK);
+## For the opcode with AML_NAMED attribute, will call acpi_ps_build_named_op.
+
+--- else
+	parent_scope = acpi_ps_get_parent_scope(&(walk_state->parser_state));
+
+	the acpi_ps_get_parent_scope return
+		(parser_state->scope->parse_scope.op);
+
+	which is from :
+
+acpi_ds_init_aml_walk -> acpi_ps_init_scope will set :
+	walk_state->parser_state.parse_scope.op = root_op;
+here, root_op is the union acpi_parse_object by parse_root =
+	acpi_ps_create_scope_op(aml_start) in acpi_ns_one_complete_parse;
+
+	then acpi_ps_append_arg(parent_scope, op);
+
+	at last, will call walk_state->descending_callback().
+	this hook is initialized by acpi_ds_init_callbacks(struct
+			acpi_walk_state *walk_state, u32 pass_number);
+
+	for Phrase 1, the hook is acpi_ds_load1_begin_op.
+
+
+1.1.2.1 acpi_ps_build_named_op(struct acpi_walk_state *walk_state,
+			       u8 *aml_op_start,
+	       		       union acpi_parse_object *unnamed_op,
+	       		       union acpi_parse_object **op)
+Please note that the *unnamed_op is created by: op =
+acpi_ps_alloc_op(walk_state->opcode, aml_op_start);
+
+The **op is the output of this function.
+
+This function will initialize the union acpi_parse_object *unnamed_op based on
+the current walk_state->opcode.
+All the arguments before ARGP_NAME will be appened to
+unnamed_op->common.value.arg;
+
+
+
+
+
+2. processing based on the status
+
+
+
+
+
+
+
+==========Method processing==========
+
+AML SYNOPSIS:
+
+DefMethod := MethodOp PkgLength NameString MethodFlags TermList
+MethodOp := 0x14
+MethodFlags := ByteData // bit 0-2: ArgCount (0-7)
+// bit 3: SerializeFlag
+// 0 NotSerialized
+// 1 Serialized
+// bit 4-7: SyncLevel (0x00-0x0f)
+
+
+/* 0B */ ACPI_OP("Method", ARGP_METHOD_OP, ARGI_METHOD_OP,
+			 ACPI_TYPE_METHOD, AML_CLASS_NAMED_OBJECT,
+ 			 AML_TYPE_NAMED_COMPLEX,
+ 			 AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+ 			 AML_NSNODE | AML_NAMED | AML_DEFER),
+
+#define ARGP_METHOD_OP	ARGP_LIST4 (ARGP_PKGLENGTH, ARGP_NAME, ARGP_BYTEDATA, ARGP_TERMLIST)
+
+
+=====Several lists=====
+
+1. walk_stae->parser_state->scope
+
+The node is union acpi_generic_stae
+
+1.1 The adding of root node
+
+The root node in this list is added by :
+
+acpi_ds_init_aml_walk -> acpi_ps_init_scope(&walk_state->parser_state, op)
+like that :
+
+	parser_state->scope = scope;
+	parser_state->start_op = root_op;
+
+The major fields are set as :
+
+	scope->common.descriptor_type = ACPI_DESC_TYPE_STATE_RPSCOPE;
+	scope->parse_scope.op = root_op;
+	scope->parse_scope.arg_count = ACPI_VAR_ARGS;
+	scope->parse_scope.arg_end = parser_state->aml_end;
+	scope->parse_scope.pkg_end = parser_state->aml_end;
+
+It seems this root node will not be removed.
+
+1.2 The child node adding
+
+acpi_ps_push_scope can do this work.
+
+But not every Op will be added to this list.
+Only when a argument of the Op introduces a new argument list (
+walk_state->arg_count is non-zero during the processing of
+acpi_ps_get_arguments).
+
+The new node will be inserted as the first node.
+
+**NOTE:
+All other arguments will be added into union acpi_parse_object -> struct
+acpi_parse_obj_common common -> union acpi_parse_value  value -> union
+acpi_parse_object *arg
+This arg points to the root node. The other is a single list linked by union
+acpi_parse_object         *next;
+
+1.3 How to remove the node from list
+
+acpi_ps_pop_scope can do this work.
+
+in acpi_ps_complete_op, if
+acpi_ps_has_completed_scope(&(walk_state->parser_state)) is TRUE, then
+		acpi_ps_pop_scope(&(walk_state->parser_state), op,
+			&walk_state->arg_types,
+			&walk_state->arg_count);
+The head node will be removed.
+And the walk_state->parser_state->scope->common.next will become the new head
+ndoe.
+
+**NOTE:
+The removed node will be used to update the walk_state->arg_types, arg_count,
+    and a new union acpi_parser_object
+
+
+2. The argument list of some Op
+
+The node is union acpi_parse_object
+
+The first node is in walk_state->parser_state->scope->parse_scope.op
+Please note walk_state->parser_state->scope is the head of the above list.
+
+We can get the union acpi_parse_object stored in parse_scope.op of union
+acpi_generic_state.
+This first node getting can be achieved by
+acpi_ps_get_parent_scope(&(walk_state->parser_state));
+
+2.1 how to add the head node
+
+So, two ways to add the head node of this list:
+
+1) acpi_ps_init_scope
+2) acpi_ps_push_scope
+
+2.2 How to add the argument operand object into the list
+
+acpi_ps_append_arg(op, arg)
+
+The first parameter is the header union acpi_parse_object, the second
+parameter is the new node waiting for adding.
+
+2.3 How to remove the acpi_parse_object
+
+acpi_ps_complete_this_op -> acpi_ps_delete_parse_tree
+
+For AML_CLASS_ARGUMENT operand object, will not do any deletions.
+
+**NOTE:
+acpi_ps_delete_parse_tree will remove whole subtree.
+
+
+
+3. walk_state->scope_info
+
+The node of this list is union acpi_generic_state
+
+The adding can refer to acpi_ds_scope_stack_push
+
+The new node will be added as the head node.
+
+The new node will be initialized as:
+
+	scope_info->common.descriptor_type = ACPI_DESC_TYPE_STATE_WSCOPE;
+	scope_info->scope.node = node;
+	scope_info->common.value = (u16) type;
+
+And:
+walk_state->scope_depth++;
+
+Whole list will be deleted by acpi_ds_scope_stack_clear(walk_state);
+
+
+4. thread->walk_state_list
+
+Here, thread is struct acpi_thread_state
+
+The node of this list is struct acpi_walk_state.
+
+the adding will be done with acpi_ds_push_walk_state(walk_state, thread);
+
+
+acpi_ds_pop_walk_state(thread) will unlink the head ndoe as the return.
+
+
+5. The operand_object list in namespace node
+
+struct acpi_namespace_node {
+	union acpi_operand_object *object;	/* Interpreter object */
+
+The header is where node->object of struct acpi_namesapce_node points to.
+Then the other union acpi_operand_object nodes are linked by the field,
+     common.next_object, of union acpi_operand_object;
+
+acpi_ns_attach_object(struct acpi_namespace_node *node,
+		      union acpi_operand_object *object,
+		      acpi_object_type type)
+The new node of a valid object will be inserted as the first node of the list;
+
+
+acpi_ns_attach_object
+
+========How to parse AML===========
+
+1. The root acpi_parse_object
+
+This node is created by acpi_ps_create_scope_op(aml_start).
+Whose descriptor_type is ACPI_DESC_TYPE_PARSER, aml_opcode is AML_SCOPE_OP.
+
+scope_op->named.name = ACPI_ROOT_NAME;
+("\___")
+
+
+2. A new struct acpi_walk_state will be created
+
+	walk_state = acpi_ds_create_walk_state(owner_id, NULL, NULL, NULL);
+
+Then initialization:
+	status = acpi_ds_init_aml_walk(walk_state, parse_root, NULL,
+				       aml_start, aml_length, NULL,
+     				       (u8)pass_number);
+
+3. acpi_ps_parse_aml(walk_state)
+
+The core is acpi_ps_parse_loop(walk_state);
+
+The basic process is :
+	scan the AML stream, find the Opcode;
+	call acpi_ps_create_op(walk_state, aml_op_start, &op) to create a new
+		union acpi_parse_object. This node will be added as the child
+		of root acpi_parse_object at the beggining.
+	**NOTE:
+		for NameOp, a new namespace node will be added to the tree.
+		op->named.node will be set to point to the new namespace node;
+		op->named.name = node->name.integer;
+	**NOTE:
+		acpi_ds_load1_begin_op only processes NameOp object;
+	For each argument of Op, will be create new acpi_parse_object, after
+		initialization, will be linked to op->common.value.arg as op's
+		child. The new argument object will be appended to the list;
+
+
+	=====The second phrase==============
+1. The similar way as the first phrase. But the hook functions are different
+
+	walk_state->descending_callback = acpi_ds_load2_begin_op;
+	walk_state->ascending_callback = acpi_ds_load2_end_op;
+
+These two functions are defined in /drivers/acpi/acpica/dswload2.c
+
+1.1 acpi_ds_load2_begin_op
+
+for acpi_ds_load2_begin_op,
+	if walk_state->op is NULL, all parse_objects can process in this
+		function;
+	else
+		only when walk_state->op_info->flags & AML_NAMED &&
+			( (walk_state->op_info->flags & AML_NSOPCODE) ||
+			  (walk_state->opcode == AML_INT_NAMEPATH_OP))
+
+After each NamedOp finished the first phrase, will run acpi_ds_load2_end_op
+before acpi_ps_complete_op(walk_state, &op, status) in acpi_ps_parse_loop.
+
+1.2
+For acpi_ds_load2_end_op, only when walk_state->op_info->flags & AML_NSOBJECT
+
+So, for NameOp, such as Name (_HID, "HISI0080"), the StringOp of "HISI0080"
+will not process by acpi_ds_load2_end_op. But the NameOp of "_HID" will be
+suitable for acpi_ds_load2_end_op.
+
+Actually, after the first phrase processing, op->common.node is valid now.
+
+For Name(), the corresponding walk_state->op_info->type is
+AML_TYPE_NAMED_COMPLEX. And the op->common.aml_opcode should be AML_NAME_OP.
+
+	status = acpi_ds_create_node(walk_state, node, op);
+will be invoked.
+
+
+1.3 an exmample of Name()
+
+1.3.1 acpi_ds_create_node
+This function will create some union acpi_operand_object nodes based on the
+arguments of acpi_parse_object from op->common.value.arg;
+
+acpi_ds_build_internal_object will:
+**NOTE: the input parameter of union acpi_parse_object *op is argument object
+	--> acpi_ut_create_internal_object
+		## create a union acpi_operand_object node whose
+		descriptor_type is ACPI_DESC_TYPE_OPERAND; type is the
+		object_type of acpi_opcode_info;
+
+acpi_ds_init_object_from_op(walk_state, op, op->common.aml_opcode,&obj_desc);
+	--> the acpi_operand_object of Name(_HID, "HISI0080) has
+		ACPI_TYPE_STRING type ( equal to the object_type)
+	so,
+		obj_desc->string.pointer = op->common.value.string;
+		obj_desc->string.length = (u32)strlen(op->common.value.string);
+		obj_desc->common.flags |= AOPOBJ_STATIC_POINTER;
+
+1.3.2 status = acpi_ns_attach_object(node, obj_desc, node->type);
+
+After this function, these fields of acpi_namespace_node will be set:
+	node->type = (u8) object_type;
+	node->object = obj_desc;
+
+Here, object_type is probably not equal to node->type;
+
+Now, the binding between struct acpi_namespace_node and the corresponding
+	union acpi_operand_object is finished.
+
+
+1.4 Method()
+##AML Synopsis
+DefMethod := MethodOp PkgLength NameString MethodFlags TermList
+
+Please keep in mind that, for MethodOp, afetr metting with TermList argument,
+it will set these in acpi_ps_get_arguments:
+	walk_state->parser_state.aml = walk_state->parser_state.pkg_end;
+	walk_state->arg_count = 0;
+So, walk_state->ascending_callback and acpi_ps_complete_op(walk_state, &op,
+status) will be invoked.
+
+in acpi_ds_load1_end_op, the acpi_operand_object will be initialized and
+binded with the corresponding namespace_node.
+acpi_ds_scope_stack_pop(walk_state) will be called too, this will make
+walk_state->scope_info points to this MethodOp.
+
+in acpi_ps_complete_op, since parser_state->aml ==
+parser_state->scope->parse_scope.arg_end, the parent OP in
+walk_state->parser_state->scope will be poped, then the parsing will be
+continue, but only whole Method is skipped.
+
+
+
+for Method, acpi_ds_load2_begin_op will with NULL input parameter of
+	walk_state->op is NULL.
+When walk_state->ascending_callback is called, the walk_state->op is Non-NULL.
+
+1.4.1
+
+when callling acpi_ns_lookup to create the namespace node, this condistion
+will match for MethodOp:
+        if (!(flags & ACPI_NS_DONT_OPEN_SCOPE) && (walk_state)) {
+                if (acpi_ns_opens_scope(type)) {
+                        status =
+                             acpi_ds_scope_stack_push(this_node, type,
+                                                        walk_state);
+
+1.4.2 acpi_ds_load2_end_op
+For Method, the walk_state->op_info->type is AML_TYPE_NAMED_COMPLEX,
+	then switch (op->common.aml_opcode) {
+		case AML_METHOD_OP:
+			acpi_ds_create_operands(walk_state, op->common.value.arg);
+		## This function will traverse whole arguments of MethodOp,
+			for each argument, will call :
+				acpi_ds_create_operand(walk_state, arg, index)
+			this acpi_ds_create_operand will allocate
+			acpi_operand_object, and extract the argument value
+			according to the object_type & type of argumentOp.
+			then call acpi_ds_obj_stack_push will store the new
+			acpi_operand_object to walk_state->operands[] for
+			later usage.
+
+			2) acpi_ex_create_method(op->named.data,
+				op->named.length, walk_state)
+			This function will allocate an new union
+			acpi_operand_object, initialize its method, then call
+			acpi_ns_attach_object to bind this operand_object with
+			namespace node as node->object.
+
+1.5 Device()
+
+DefDevice := DeviceOp PkgLength NameString ObjectList
+DeviceOp := ExtOpPrefix 0x82
+
+/* 5A */ ACPI_OP("Device", ARGP_DEVICE_OP, ARGI_DEVICE_OP,
+		ACPI_TYPE_DEVICE, AML_CLASS_NAMED_OBJECT,
+		AML_TYPE_NAMED_NO_OBJ,
+		AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+		AML_NSNODE | AML_NAMED),
+
+#define ARGP_DEVICE_OP                  ARGP_LIST3 (ARGP_PKGLENGTH,
+		ARGP_NAME,          ARGP_OBJLIST)
+
+For DeviceOp, when metting ARGP_OBJLIST, walk_state->arg_count will be -1,
+then will process the next Op without skip whole DeviceOp length. This is
+different from MethodOp.
+
+ScopeOp also have the similar way when meetting with ARGP_TERMLIST;
+
+
+1.6 ResourceTemplate() {}
+
+DefBuffer := BufferOp PkgLength BufferSize ByteList
+BufferOpml_start := 0x11
+BufferSize := TermArg => Integer
+
+
+As for the resource definition, you can refer to :
+6.4.3.5 to 6.4.3.8
+
+#define ARGP_BUFFER_OP                  ARGP_LIST3 (ARGP_PKGLENGTH,
+		ARGP_TERMARG,       ARGP_BYTELIST)
+
+For ARGP_TERMARG, walk_state->arg_count = 1 in acpi_ps_get_next_arg.
+
+In acpi_ps_get_arguments, when met ARGP_TERMARG, the while process will be
+breaked without arg output. Then Since the current
+op->common.parent->common.aml_opcode is AML_NAME_OP for AML_BUFFER_OP, so:
+	op->named.data = aml_op_start;
+	op->named.length = (u32)
+		(walk_state->parser_state.pkg_end - aml_op_start);
+
+	walk_state->parser_state.aml =
+		walk_state->parser_state.pkg_end;
+	walk_state->arg_count = 0;
+
+**NOTE::
+It means that this op for BUFFER is not insert into walk_state->scope if the
+parent Op of this BufferOp is AML_NAME_OP.
+
+Since the BufferOp is without AML_NAMED, acpi_ds_load1_end_op and
+acpi_ds_load2_end_op will return AE_OK directly.
+Then acpi_ps_complete_op(walk_state, &op, status) will pop the front Op,
+that is NameOp.
+
+This time, acpi_ds_load1_end_op will be executed into.
+	if (op->common.aml_opcode == AML_NAME_OP) {
+		object_type =
+			(acpi_ps_get_opcode_info((op->common.value.arg)->common.aml_opcode))
+				->object_type
+
+	and :
+	op->common.node->type = (u8) object_type;
+
+It means that the op->common.node->type for NameOp will be set as
+	ACPI_TYPE_BUFFER. This should be use in the second phrase.
+For ACPI_TYPE_BUFFER, it is not ACPI_NS_NEWSCOPE. will not call
+acpi_ds_scope_stack_pop(walk_state).
+
+
+
+
+
+
+1.7 return(
+
+/* 42 */ ACPI_OP("Return", ARGP_RETURN_OP, ARGI_RETURN_OP,
+			 ACPI_TYPE_ANY, AML_CLASS_CONTROL,
+ 			 AML_TYPE_CONTROL, AML_HAS_ARGS),
+
+Normally, this ReturnOp will be push into scope with walk_state->arg_count =
+1;
+
+
+1.8 OperationRegion(
+
+AML Synopsis:
+
+DefOpRegion := OpRegionOp NameString RegionSpace RegionOffset RegionLen
+OpRegionOp := ExtOpPrefix 0x80
+RegionSpace := ByteData // 0x00 SystemMemory
+	// 0x01 SystemIO
+	// 0x02 PCI_Config
+	// 0x03 EmbeddedControl
+	// 0x04 SMBus
+	// 0x05 SystemCMOS
+	// 0x06 PciBarTarget
+	// 0x07 IPMI
+	// 0x08 GeneralPurposeIO
+	// 0x09 GenericSerialBus
+	// 0x80-0xFF: OEM Defined
+RegionOffset := TermArg => Integer
+RegionLen := TermArg => Integer
+
+
+/* 58 */ ACPI_OP("OperationRegion", ARGP_REGION_OP, ARGI_REGION_OP,
+			 ACPI_TYPE_REGION, AML_CLASS_NAMED_OBJECT,
+ 			 AML_TYPE_NAMED_COMPLEX,
+			 AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+			 AML_NSNODE | AML_NAMED | AML_DEFER),
+
+#define ARGP_REGION_OP                  ARGP_LIST4 (ARGP_NAME,
+	ARGP_BYTEDATA,      ARGP_TERMARG,   ARGP_TERMARG)
+
+#define AML_REGION_OP               (u16) 0x5b80
+
+
+In acpi_ds_load2_end_op, for AML_REGION_OP, will process:
+	if (op->common.aml_opcode == AML_REGION_OP) {
+		region_space = (acpi_adr_space_type)
+			((op->common.value.arg)->common.value.integer);
+	}
+
+But where is the RegionOffset, RegionLen to be processed??
+
+
+1.9 FieldOp
+
+Field(SCTR, AnyAcc, NoLock, Preserve) {
+	LSTA, 32,
+}
+
+This data type is Field Unit (within an Operation Region);
+
+
+Field (RegionName, AccessType, LockRule, UpdateRule) {FieldUnitList}
+
+DefField := FieldOp PkgLength NameString FieldFlags FieldList
+FieldOp	:= ExtOpPrefix 0x81
+
+FieldFlags := ByteData // bit 0-3: AccessType
+// 0 AnyAcc
+// 1 ByteAcc
+// 2 WordAcc
+// 3 DWordAcc
+// 4 QWordAcc
+// 5 BufferAcc
+// 6 Reserved
+// 7-15 Reserved
+// bit 4: LockRule
+// 0 NoLock
+// 1 Lock
+// bit 5-6: UpdateRule
+// 0 Preserve
+// 1 WriteAsOnes
+// 2 WriteAsZeros
+// bit 7: Reserved (must be 0)
+
+FieldElement := NamedField | ReservedField | AccessField | ExtendedAccessField
+	| ConnectField
+
+NamedField := NameSeg PkgLength
+ReservedField := 0x00 PkgLength
+AccessField := 0x01 AccessType AccessAttrib
+onnectField := <0x02 NameString> | <0x02 BufferData>
+
+/* 59 */ ACPI_OP("Field", ARGP_FIELD_OP, ARGI_FIELD_OP, ACPI_TYPE_ANY,
+		AML_CLASS_NAMED_OBJECT, AML_TYPE_NAMED_FIELD,
+		AML_HAS_ARGS | AML_NSOBJECT | AML_NSOPCODE |
+		AML_FIELD),
+#define ARGP_FIELD_OP                   ARGP_LIST4 (ARGP_PKGLENGTH,
+		ARGP_NAMESTRING,    ARGP_BYTEDATA,  ARGP_FIELDLIST)
+
+ARGP_NAMESTRING is corresponding to RegionName,
+ARGP_BYTEDATA is corresponding to FieldFlags.
+
+
+
+===Return====
+
+/* 42 */ ACPI_OP("Return", ARGP_RETURN_OP, ARGI_RETURN_OP,
+			 ACPI_TYPE_ANY, AML_CLASS_CONTROL,
+ 			 AML_TYPE_CONTROL, AML_HAS_ARGS),
+
+
+
+
+
+
+=====How to process Method==========
+
+
+1. 
+after acpi_load_tables -> acpi_tb_load_namespace -> acpi_ns_load_table ->
+acpi_ns_parse_table, then acpi_ds_initialize_objects
+
+When return, acpi_ns_initialize_objects will be called.
+
+In acpi_ds_initialize_objects, the core is:
+
+acpi_ns_walk_namespace(ACPI_TYPE_ANY, start_node, ACPI_UINT32_MAX,
+		ACPI_NS_WALK_UNLOCK, acpi_ds_init_one_object,
+		NULL, &info, NULL);
+So, for each namespace node, will call :
+acpi_ds_init_one_object(acpi_handle obj_handle,
+			u32 level, void *context, void
+			**return_value)
+
+This function will process some specific OP, including :
+	ACPI_TYPE_REGION ---> acpi_ds_initialize_region
+
+	ACPI_TYPE_METHOD ---> acpi_ds_auto_serialize_method
+	if acpi_gbl_auto_serialize_methods is TRUE.
+	**NOTE:
+		acpi_ns_get_attached_object(node) will return note->object.
+		which is initialize in acpi_ds_load2_end_op:
+			acpi_ex_create_method(op->named.data,
+					op->named.length, walk_state);
+
+1.1 acpi_ds_auto_serialize_method
+
+This function will setup a struct acpi_walk_state, then :
+
+walk_state->descending_callback = acpi_ds_detect_named_opcodes;
+
+and call status = acpi_ps_parse_aml(walk_state);
+to process the AML of Method range.
+
+You know, in the Phrase1 & Phrase2, no parsing on MethodOp body.
+
+So, the difference is walk_state->descending_callback.
+It is acpi_ds_detect_named_opcodes for MethodOp now.
+
+This function will only available for the OP whose op_info->flag with
+(AML_NAMED | AML_CREATE | AML_FIELD);
+
+For all those Op among MethodOp, will return AE_CTRL_TERMINATE;
+
+
+
+
+2. acpi_ns_initialize_objects
+
+acpi_ns_init_one_object
+
+
+
+
+
+
+========AML method parsing ==========
+
+1. MethodOp for the interpreter mode before ACPI_IMODE_EXECUTE
+
+1444 085f 4352 5308
+
+Opcode is 0x14(MethodOp).
+
+#define ARGP_METHOD_OP              ARGP_LIST4 (ARGP_PKGLENGTH,
+		ARGP_NAME,          ARGP_BYTEDATA,  ARGP_TERMLIST)
+
+So, the union acpi_parse_object node for method will be created in
+acpi_ps_create_op until meetting the ARGP_NAME.
+
+The ARGP_PKGLENGTH will be processed in acpi_ps_build_named_op ->
+acpi_ps_get_next_arg befor ARGP_NAME. For ARGP_PKGLENGTH, it will not append
+any arguments to the method parse_object into common.value.arg;
+
+ARGP_NAME will create a namespace node with name, _CRS;
+
+Then acpi_ps_get_arguments -> acpi_ps_get_next_arg will process the ARGP_BYTEDATA, and store the 0x08
+as MethodFlags of DefMethod. This argument parse_object will be appended into
+common.value.arg of Method parse_object.
+
+For the last argument, ARGP_TERMLIST, acpi_ps_get_arguments ->
+acpi_ps_get_next_arg will return walk_state->arg_count = 1. It will lead to
+the while for acpi_ps_get_next_arg break and without new created argument
+parse_object.
+
+But for op->common.aml_opcode = AML_METHOD_OP, the acpi_ps_get_arguments will
+change walk_state->arg_count =0 after setting:
+	op->named.data = walk_state->parser_state.aml;
+	op->named.length = (u32)(walk_state->parser_state.pkg_end -
+			walk_state->parser_state.aml);
+	walk_state->parser_state.aml =
+			walk_state->parser_state.pkg_end;
+So,
+	Whole Method will be skipped and without the calling of
+	acpi_ps_push_scope. But walk_state->ascending_callback will be called.
+
+
+2. Method executing
+
+The interpreter mode is ACPI_IMODE_EXECUTE;
+
+2.1 The NameOp in MethodOp
+
+0852 4255 4611 4207 0a6e 880d 0002 0c00
+0000 0e00 ff00 0000 2000 8a2b 0000 0c03
+
+For NameOp, 08 is NameOp;
+52 42 55 46 is the NameString
+
+#define ARGP_NAME_OP         ARGP_LIST2 (ARGP_NAME, ARGP_DATAOBJ)
+
+For ARGP_NAME, acpi_ps_create_op -> acpi_ps_build_named_op will process the
+"MBUF" and create the namespace node.
+
+
+So, after 0852 4255 46 is processed, the parse_object corresponding to NameOp
+will be created but without adding to parser_state->scope;
+During this procedure, acpi_ds_exec_begin_op -> acpi_ds_load2_begin_op will be
+called.
+
+
+acpi_ps_get_arguments will process the ARGP_DATAOBJ :
+acpi_ps_get_next_arg will return walk_state->arg_count = 1 for ARGP_DATAOBJ.
+
+Then acpi_ps_push_scope will pushed this new NameOp parse_object into
+parser_state->scope;
+This will lead walk_state->ascending_callback not to be invoked at that
+moment and continue the next AML Opcode;
+
+2.2 Name (RBUF, ResourceTemplate ()
+
+11 4207 0a6e 880d 0002
+
+So, The BufferOp is 0x11;
+Then PkgLength is 072;
+
+DefBuffer := BufferOp PkgLength BufferSize ByteList
+
+Since ResourceTemplate will have end tag, so the PkgLength is not enough. AML
+provide BufferSize to delimit the range of bytelist data; It is 0a6e here.
+
+And
+
+#define ARGP_BUFFER_OP    ARGP_LIST3 (ARGP_PKGLENGTH,
+	ARGP_TERMARG,       ARGP_BYTELIST)
+
+
+For BufferOp, there is no AML_NAMED;
+So,in acpi_ps_create_op, acpi_ps_build_named_op will not be called.
+It means there is no corresponding namespace node for BufferOp;
+This parse_object will be appended to the front NameOp;
+Then acpi_ds_exec_begin_op will be called with walk_state->op is not NULL;
+There is no much meaningfull processing in acpi_ds_exec_begin_op;
+
+Go back to acpi_ps_parse_loop, acpi_ps_get_arguments will be called for
+walk_state->arg_types;
+
+ARGP_PKGLENGTH is easy, only update parser_state->pkg_end with
+acpi_ps_get_next_package_end;
+
+ARGP_TERMARG will return walk_state->arg_count = 1;
+
+And in the calling acpi_ps_get_arguments, for AML_BUFFER_OP, no further
+processing.
+
+so, for this BufferOp, acpi_ps_push_scope will be called to push the new
+parse_object into walk_state->parser_state->scope;
+
+Ok. The next is for the BufferSize.
+OpCode is 0x0a, it is the AML format:
+
+ByteConst := BytePrefix ByteData
+BytePrefix := 0x0A
+
+#define ARGP_BYTE_OP                    ARGP_LIST1 (ARGP_BYTEDATA)
+
+SO, the new will as child of BufferOp;
+
+acpi_ps_get_arguments will create a new arg parse_object for ARGP_BYTEDATA.
+
+And walk_state->ascending_callback  will be called for this BytePrefix opcode;
+
+op->common.value.arg is the parse_object for 6e;
+
+Then the BufferOp will be poped.
+
+2.2.1 the continous of BufferOp
+
+ARGP_BYTELIST will be processed now.
+
+Back to acpi_ps_parse_loop.
+Now the Op is not NULL, so acpi_ps_create_op will not called.
+
+walk_state->arg_types is ARGP_BYTELIST now.
+
+in acpi_ps_get_next_arg:
+
+parser_state->pkg_end had been update as 0x072 before for PkgLength.
+parser_state->aml is 0x21da (880d)
+
+if (parser_state->aml < parser_state->pkg_end) {
+	arg = acpi_ps_alloc_op(AML_INT_BYTELIST_OP, parser_state->aml);
+	arg->common.value.size = (u32)
+		ACPI_PTR_DIFF(parser_state->pkg_end,
+				parser_state->aml);
+	arg->named.data = parser_state->aml;
+
+	parser_state->aml = parser_state->pkg_end;
+
+So, the whole Buffer Bytelist will be skipped and saved in the new
+parse_object. This new object will be linked to the BufferOp object:
+	acpi_ps_append_arg(op, arg)
+
+
+Since walk_state->arg_count is not set as Non-ZERO.
+
+walk_state->ascending_callback will be called at this moment for BufferOp:
+
+The class is AML_CLASS_CREATE, switch to default.
+And case AML_TYPE_CREATE_OBJECT:
+
+switch (op->common.parent->common.aml_opcode) {
+case AML_NAME_OP:
+	walk_state->operands[0] = (void *)op->common.parent->common.node;
+	walk_state->num_operands = 1;
+	status = acpi_ds_create_node(walk_state,
+			op->common.parent->common.node,
+			op->common.parent);
+This acpi_ds_create_node will attach the ResourceOp as the node->object of
+NameOp:
+	acpi_ds_build_internal_object(walk_state, op->common.value.arg,
+			&obj_desc);
+
+	node->type = obj_desc->common.type;
+	status = acpi_ns_attach_object(node, obj_desc, node->type);
+
+The new obj_desc is ACPI_SET_DESCRIPTOR_TYPE(object, ACPI_DESC_TYPE_OPERAND);
+
+
+Last step is :
+	acpi_ds_eval_data_object_operands(walk_state, op,
+			acpi_ns_get_attached_object(op->common.parent->common.node));
+Please Note that the op->common.value.arg here is corresponding to
+	ByteConst(Opcode is AML_BYTE_OP) for ARGP_TERMARG of ResourceOp.
+	This argument's object_type
+	is ACPI_TYPE_INTEGER, type is AML_TYPE_LITERAL;(the AML stream is
+	0a6e);
+
+/* 04 */ ACPI_OP("ByteConst", ARGP_BYTE_OP, ARGI_BYTE_OP,
+		 ACPI_TYPE_INTEGER, AML_CLASS_ARGUMENT,
+		 AML_TYPE_LITERAL, AML_CONSTANT)
+
+
+The last argument of ResourceOp is ARGP_BYTELIST:
+	ARGP_BYTELIST argument of Resouce stream which is linked by
+	acpi_ps_get_arguments -> acpi_ps_get_next_arg --> acpi_ps_append_arg;
+The Opcode of this argument is AML_INT_BYTELIST_OP(0x33):
+	/* 65 */ ACPI_OP("-ByteList-", ARGP_BYTELIST_OP, ARGI_BYTELIST_OP,
+			 ACPI_TYPE_ANY, AML_CLASS_ARGUMENT,
+ 			 AML_TYPE_LITERAL, 0)
+
+
+---> status = acpi_ds_create_operand(walk_state, op->common.value.arg, 1);
+	will  create an operand whose obj_desc->common.type is
+	ACPI_TYPE_INTEGER, op_info->type is AML_TYPE_LITERAL. So:
+		case AML_TYPE_LITERAL:
+			obj_desc->integer.value = op->common.value.integer;
+	Here, op is the first argument node of ResourcOp's common.value.arg;
+	up to now, there are two operands in walk_state->operands[];
+	walk_state->operands[0] points to the NameOp's namesapce node;
+
+---> acpi_ex_resolve_operands(walk_state->opcode,&(walk_state->operands[walk_state->num_operands
+				- 1), walk_state)
+Here, walk_state->opcode is 0x11( BufferOp).
+
+in acpi_ex_resolve_operands, op_info->runtime_args is ARGI_BUFFER_OP for
+BufferOp.
+#define ARGI_BUFFER_OP                  ARGI_LIST1 (ARGI_INTEGER)
+
+At last, will call:
+status = acpi_ex_resolve_to_value(stack_ptr, walk_state);
+--> acpi_ex_resolve_object_to_value(stack_ptr, walk_state)
+
+This acpi_ex_resolve_operands will return the resolved operands in the input
+parameter of &(walk_state->operands[walk_state->num_operands - 1]) too.
+
+For AML_BUFFER_OP,
+	length = (u32) arg_desc->integer.value;
+	status = acpi_ds_build_internal_buffer_obj(walk_state, op, length,
+			&obj_desc);
+The return obj_desc points to
+	acpi_ns_get_attached_object(op->common.parent->common.node; It means
+	that the NameOp's object will be updated as the return object of
+	acpi_ds_build_internal_buffer_obj();
+That is what we want!!!
+
+For BufferOp, there is no namespace node, so, here will set in
+acpi_ds_build_internal_buffer_obj:
+op->common.node = ACPI_CAST_PTR(struct acpi_namespace_node, obj_desc);
+
+
+OK. The BufferOp is finished!
+
+==== NameOp======
+
+acpi_ds_exec_end_op ->
+case AML_TYPE_NAMED_COMPLEX:
+	status = acpi_ds_load2_end_op(walk_state);
+
+in acpi_ds_load2_end_op, walk_state->op_info->type is AML_TYPE_NAMED_COMPLEX,
+then case AML_NAME_OP:
+	status = acpi_ds_create_node(walk_state, node, op);
+	break;
+This will attach BufferOp with NameOp through node->object = obj_desc;
+The obj_desc is created by :
+	acpi_ds_build_internal_object(walk_state, op->common.value.arg,
+			&obj_desc);
+So, the obj_desc is to BufferOp;
+
+==========How to scan ACPI devices===========
+
+subsys_initcall(acpi_init)
+
+acpi_init -> acpi_scan_init -> acpi_bus_scan(ACPI_ROOT_OBJECT) ->
+
+if (ACPI_SUCCESS(acpi_bus_check_add(handle, 0, NULL, &device)))
+	acpi_walk_namespace(ACPI_TYPE_ANY, handle, ACPI_UINT32_MAX,
+			acpi_bus_check_add, NULL, NULL, &device);
+
+1. acpi_bus_check_add
+
+-- acpi_bus_get_device(handle, &device) will check whether the device
+corresponding to input parameter of acpi_handle handle had been scanned. which
+means that the struct acpi_device was created.
+
+-- cpi_bus_type_and_status(handle, &type, &sta)
+in this function, acpi_get_type will be called to return the node->type
+corresponding to the handle.
+If the handle is ACPI_ROOT_OBJECT, will return ACPI_TYPE_ANY directly;
+Then call acpi_bus_get_status_handle(handle, sta) to get the deice status by
+"_STA" method;
+Normally, the type will be set as ACPI_BUS_TYPE_DEVICE, sta will be as :
+	*sta = ACPI_STA_DEVICE_PRESENT | ACPI_STA_DEVICE_ENABLED |
+		ACPI_STA_DEVICE_UI      | ACPI_STA_DEVICE_FUNCTIONING;
+-- The core is acpi_add_single_object(&device, handle, type, sta)
+It will allocate a struct acpi_device and initialize it by
+acpi_init_device_object;
+This new acpi_device will be attached with acpi_device_add(device,
+		acpi_device_release);
+The new acpi_device will be linked to node->object, but these fields are set
+as:
+obj_desc->common.type = ACPI_TYPE_LOCAL_DATA;
+obj_desc->data.handler = acpi_scan_drop_device;
+data_desc->data.pointer = (void *)device;
+
+The other is achieved by acpi_device_add(device, acpi_device_release);
+1) struct acpi_device_bus_id will be allocated;
+2) initialize struct acpi_device_bus_id:
+	strcpy(acpi_device_bus_id->bus_id, acpi_device_hid(device));
+	acpi_device_bus_id->instance_no = 0;
+	list_add_tail(&acpi_device_bus_id->node, &acpi_bus_id_list);
+this node will be linked to acpi_bus_id_list;
+
+2. The child scanning
+acpi_walk_namespace(ACPI_TYPE_ANY, handle, ACPI_UINT32_MAX,
+	acpi_bus_check_add, NULL, NULL, &device);
+So, acpi_bus_check_add will be called for each valid child node;
+
+Then, all the discovered devices under the last acpi_device sussessfully will
+be attached:
+	if (device) {
+			acpi_bus_attach(device);
+			return 0;
+	}
+
+
+3. acpi_add_single_object
+
+device = kzalloc(sizeof(struct acpi_device), GFP_KERNEL);
+
+acpi_init_device_object(device, handle, type, sta);
+
+-- acpi_device_get_busid(struct acpi_device *device)
+	acpi_get_name(device->handle, ACPI_SINGLE_NAME, &buffer);
+	will return the node->name.ascii;
+as the device->pnp.bus_id;
+
+-- acpi_set_pnp_ids(handle, &device->pnp, type)
+This is the core. will process "_HID", "_CID", etc;
+
+
+====== The Method of _CRS====
+
+This is an example of resource handling.
+
+pnpacpi_parse_allocated_resource -> acpi_walk_resources(handle,
+	METHOD_NAME__CRS,pnpacpi_allocated_resource, dev) ->
+	acpi_rs_get_method_data(device_handle, name, &buffer) ->
+	acpi_ut_evaluate_object(ACPI_CAST_PTR(struct acpi_namespace_node,
+		handle), path, ACPI_BTYPE_BUFFER, &obj_desc) ->
+	acpi_ns_evaluate(info) ->
+
+--> acpi_ns_get_node(info->prefix_node,
+		info->relative_pathname,ACPI_NS_NO_UPSEARCH, &info->node)
+	will get the designated namespace node;
+--> for ACPI_TYPE_METHOD, will call status = acpi_ps_execute_method(info)
+
+
+1. acpi_ps_execute_method(struct acpi_evaluate_info *info)
+
+1.1 The preparation of method execution
+
+op = acpi_ps_create_scope_op(info->obj_desc->method.aml_start)
+-- create a union acpi_parse_object whose opcode is AML_SCOPE_OP;
+	This OP will point to the AML starting point of Method.
+
+-- Create a walk_state
+	info->pass_number = ACPI_IMODE_EXECUTE;
+	walk_state =
+	    acpi_ds_create_walk_state(info->obj_desc->method.owner_id,
+				    NULL, NULL, NULL);
+-- Initialize the walk_state
+	This is the core.
+	acpi_ds_init_aml_walk(walk_state, op, info->node,
+			info->obj_desc->method.aml_start,
+			info->obj_desc->method.aml_length, info,
+			info->pass_number)
+	acpi_ps_init_scope(&walk_state->parser_state, op) will linked the new
+	created acpi_parse_object into parser_state->scope;
+	acpi_ds_scope_stack_push(method_node, ACPI_TYPE_METHOD, walk_state)
+	will link a new created acpi_generic_state into walk_state->scope_info;
+	acpi_ds_method_data_init_args(walk_state->params,
+			ACPI_METHOD_NUM_ARGS,walk_state) will copy the
+		parameters into walk_state->arguments[];
+
+	acpi_ds_init_callbacks(walk_state, pass_number) will set the Hook for
+		ACPI_IMODE_EXECUTE;
+
+-- status = acpi_ps_parse_aml(walk_state)
+
+1.2 acpi_ps_parse_aml
+
+acpi_ps_parse_loop(walk_state)
+
+For methodOp, all the AML belonged to this MethodOp will be parsed at this
+moment. The namespace nodes will be created and the relevant arguments will be
+appended to the corresponding namespace nodes.
+
+NameOp is the argument OP of MethodOp;
+ResourceOp is the argument OP of NameOp;
+BufferSize is the argument OP of ResourceOp;
+ByteList of Resource is another argumentOP of ResourceOp;
+
+ReturnOp is the argument OP of MethodOp;
+the ASCII string of ReturnOp's parameter is the argument OP of ReturnOp;
+
+
+===== The string parameter of ReturnOp ==========
+For the ASCII string, acpi_ps_create_op -> acpi_ps_get_aml_opcode->acpi_ps_get_opcode_info will
+	return walk_state->op_info->class as AML_CLASS_ASCII, then update the
+	walk_state->opcode as:
+		walk_state->opcode = AML_INT_NAMEPATH_OP;
+		walk_state->arg_types = ARGP_NAMESTRING;
+Then later:
+	walk_state->op_info = acpi_ps_get_opcode_info(walk_state->opcode), new
+	op_info will be return as:
+
+/* 63 */ ACPI_OP("-NamePath-", ARGP_NAMEPATH_OP, ARGI_NAMEPATH_OP,
+			 ACPI_TYPE_LOCAL_REFERENCE, AML_CLASS_ARGUMENT,
+ 			 AML_TYPE_LITERAL, AML_NSOBJECT | AML_NSNODE),
+	The op->common.aml_opcode will be AML_INT_NAMEPATH_OP too.
+Then in acpi_ds_exec_begin_op, opcode_class = AML_CLASS_NAMED_OBJECT, so
+acpi_ds_load2_begin_op will be called:
+
+	At this moment, will:
+	if (walk_state->opcode == AML_INT_NAMEPATH_OP) {
+		buffer_ptr = op->common.value.string;
+		if (!buffer_ptr) {
+			return_ACPI_STATUS(AE_OK);
+		}
+Since only the opcode had been processed, no op->common.value.string now.
+
+
+--Now, it is time to process the parameter from ReturnOp.
+!!!NOTE!!!
+	walk_state->arg_types is ARGP_NAMESTRING now
+
+acpi_ps_get_arguments -> acpi_ps_get_next_namepath, arg->common.value.name
+= path for the AML_INT_NAMEPATH_OP;
+
+The path is :
+	path = acpi_ps_get_next_namestring(parser_state);
+
+/* 63 */ ACPI_OP("-NamePath-", ARGP_NAMEPATH_OP, ARGI_NAMEPATH_OP,
+		ACPI_TYPE_LOCAL_REFERENCE, AML_CLASS_ARGUMENT,
+		AML_TYPE_LITERAL, AML_NSOBJECT | AML_NSNODE)
+
+
+---Then acpi_ds_exec_end_op will be called for this AML_INT_NAMEPATH_OP:
+here, walk_state->op is AML_INT_NAMEPATH_OP;
+	walk_state->num_operands = 0;
+	walk_state->operand_index = 0;
+
+	the op_class is AML_CLASS_ARGUMENT, op->common.value.arg points to the
+	string of "RBUF".
+
+status = acpi_ds_evaluate_name_path(walk_state) :
+
+--> acpi_ds_create_operand(walk_state, op, 0) -> after acpi_ns_lookup return
+	the acpi_namespace_node of "RBUF", -> acpi_ds_obj_stack_push(obj_desc, walk_state)
+	will create a new walk_state->operands[] as:
+		walk_state->operands[walk_state->operand_index] = obj_desc;
+		walk_state->num_operands++;
+		walk_state->operand_index++;
+	!!!NOTE!!!:
+		Here, walk_state->operand_index is ZERO initially.
+		walk_state->num_operands is ZERO too.
+
+	So, the Object of "RBUF" is the operands[0] of walk_state for
+	AML_INT_NAMEPATH_OP;
+
+--> acpi_ex_resolve_to_value
+Please note that the operand here is union acpi_operand_object **operand =
+	&walk_state->operands[0], so where is the walk_state->operands[0] was
+	set?
+	!!!NOTE!!!:
+	acpi_ds_evaluate_name_path -> acpi_ds_create_operand(walk_state, op,
+			0) -> acpi_ds_obj_stack_push(obj_desc, walk_state)
+	will set the walk_state->operands[].
+
+For NameOp, ACPI_GET_DESCRIPTOR_TYPE(*stack_ptr) == ACPI_DESC_TYPE_NAMED.
+	acpi_ex_resolve_node_to_value will be called with input parameter of
+	NameOp.
+
+
+Please note that For NameOp, the node->type is not ACPI_TYPE_ANY anymore.
+When acpi_ds_load2_end_op for NameOp, acpi_ds_create_node(walk_state, node,
+op) will be called, and these settings will be done:
+	node->type = obj_desc->common.type;
+
+!!!!NOTE!!!!:
+	So, this NameOp type will be synchronized as BufferOp's object_type, it is
+	ACPI_TYPE_BUFFER!
+
+So, in acpi_ex_resolve_node_to_value, this case will be entered:
+	case ACPI_TYPE_BUFFER:
+		status = acpi_ds_get_buffer_arguments(source_desc);
+
+	here, source_desc is from node->object, it is BufferOp;
+
+	which is set in acpi_ds_exec_end_op -> acpi_ds_create_node for
+	BufferOp;
+	--> !!!NOTE!!!!
+		acpi_ds_build_internal_object(walk_state,
+				op->common.value.arg,&obj_desc) will build
+		the operands object for BufferOp:
+		after acpi_ut_create_internal_object,
+		      --> acpi_ds_init_object_from_op(walk_state, op,
+				      op->common.aml_opcode, &obj_desc)
+			      will set these:
+
+			obj_desc->buffer.node = ACPI_CAST_PTR(struct
+					      acpi_namespace_node,
+					      walk_state->operands[0]);
+			obj_desc->buffer.aml_start = op->named.data;
+			obj_desc->buffer.aml_length = op->named.length;
+
+		!!!Here, walk_state->operands[0] is NameOP;
+
+---> acpi_ds_get_buffer_arguments(union acpi_operand_object *obj_desc)
+The input parameter is BufferOp object;
+
+if (obj_desc->common.flags & AOPOBJ_DATA_VALID)
+
+is satisfied. Will return AE_OK directly;
+This AOPOBJ_DATA_VALID is set in acpi_ds_build_internal_buffer_obj :
+
+	obj_desc->buffer.flags |= AOPOBJ_DATA_VALID;
+
+
+node = obj_desc->buffer.node;
+
+Here, node is NameOp;
+The input parameters of acpi_ds_execute_arguments were set when BufferOp is
+handling.
+
+
+
+
+
+
+
+
+Then acpi_ps_complete_op(walk_state, &op, status) will pop the ReturnOP.
+
+
+====== ReturnOp ===========
+
+
+
+
+-- dependency handling
+acpi_device_dep_initialize(device)
+
+This function will call the "_DEP" method;
+
+
+
+
+
+
+
+

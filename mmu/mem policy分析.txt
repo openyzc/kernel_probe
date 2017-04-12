@@ -1,0 +1,76 @@
+
+
+nodes_subset(src1, src2) 表示判断 src1 是否 src2 的subset. T表示是。
+
+bitmap_pos_to_ord(const unsigned long *buf, unsigned int pos, unsigned int nbits)
+将返回 最大nbits的buf中第pos个置1比特的序号（从0开始编号）
+
+bitmap_ord_to_pos(const unsigned long *buf, unsigned int ord, unsigned int nbits)
+将从大小为nbits的buf的bitmap中返回第ord 个置1比特的位置index。
+
+node_remap(oldbit, old, new) 将从old中得到 oldbit这个bitmap位置id对应的序号，然后
+从new中取得该序号对应的 bit的位置id 作为返回值。
+
+
+
+mpol_relative_nodemask
+
+
+static void mpol_relative_nodemask(nodemask_t *ret, const nodemask_t *orig,
+				   const nodemask_t *rel)
+{
+	nodemask_t tmp;
+	nodes_fold(tmp, *orig, nodes_weight(*rel));
+	nodes_onto(*ret, tmp, *rel);
+}
+
+nodes_fold(tmp, *orig, nodes_weight(*rel)) 是将 orig 这个bitmap 中的所有置1
+的比特对应的位置 对 nodes_weight(*rel)求模后，以得到index在 tmp 中设置对应bit。
+实际功能是 将orig中可能较长的bitmap折叠到 nodes_weight长的新bitmap中。
+
+nodes_onto(*ret, tmp, *rel) 将从rel中取出 tmp中置1的bit对应的bit，保存到ret中。
+也就是类似于and。
+
+
+struct nodemask_scratch {
+	nodemask_t	mask1;
+	nodemask_t	mask2;
+};
+mask1 是系统中online且cpuset allowed的bitmap(比特AND 操作）。
+参见 mpol_set_nodemask 中的：
+	nodes_and(nsc->mask1,
+		  cpuset_current_mems_allowed, node_states[N_MEMORY]);
+此mask1是 MPOL_F_RELATIVE_NODES 处理时系统可用的 node 全集(假设为 nodes_full)，
+真正选择哪些nodes，将根据user输入的 bitmap % (bitsize(node全集)） 后选择nodes_full
+中的对应node id;
+
+而 mask2是经过选择后生成的最终 policy bitmap；
+
+
+
+struct mempolicy {
+	atomic_t refcnt;
+	unsigned short mode; 	/* See MPOL_* above */
+	unsigned short flags;	/* See set_mempolicy() MPOL_F_* above */
+	union {
+		short 		 preferred_node; /* preferred */
+		nodemask_t	 nodes;		/* interleave/bind */
+		/* undefined for default */
+	} v;
+	union {
+		nodemask_t cpuset_mems_allowed;	/* relative to these nodes */
+		nodemask_t user_nodemask;	/* nodemask passed by user */
+	} w;
+};
+
+在 mpol_store_user_nodemask 返回TRUE时， w.user_nodemask = *nodes 会保留user指定
+的bitmap(非empty）;
+返回FALSE时， 
+			pol->w.cpuset_mems_allowed =
+						cpuset_current_mems_allowed;
+MPOL_PREFERRED 时会设置：（在 mpol_new_preferred）
+pol->v.preferred_node = first_node(*nodes)
+
+
+
+

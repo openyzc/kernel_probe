@@ -1,0 +1,224 @@
+This doc will focus on the implementation of printk. But we don't deep into
+the UART driver of any specific COM device. Only care about the common layers
+of linux serial driver.
+
+1. The basic flow
+
+The entry is :
+asmlinkage __visible int printk(const char *fmt, ...)
+
+
+printk -> vprintk_default -> vprintk_emit(0, LOGLEVEL_DEFAULT, NULL, 0, fmt,
+args) -> console_unlock
+
+So, it is obvious that console_unlock is the key function.
+
+
+2. How to share the serial port among threads
+Although the serial is very simple in hardware' perspective, a good driver
+must consider those issues:
+
+1) Serial is slow device, we must adopt cache. How to cache the output data?
+2) How to balance the Real-time attribute of printk and the efficience of
+other major threads?
+3) How to ensure the output in order?
+4) How to sync the data in the critical area for the serial sharing for all
+necessary threads? how to share the unique serial port for multiple CPUs?
+
+
+3. notes on some key variables and structures of printk driver
+
+3.1 two buffers
+
+static struct cont {
+	char buf[LOG_LINE_MAX];
+	size_t len;
+	size_t cons;
+	struct task_struct *owner;
+	u64 ts_nsec;
+	u8 level;
+	u8 facility;
+	enum log_flags flags;
+	bool flushed:1;
+} cont;
+
+This cont is about 1KB.
+
+
+static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
+static char *log_buf = __log_buf;
+
+The default length is 1 << 14 ( 16KB)
+
+what is the roles of these two buffers?
+
+
+3.2 log_buf
+
+As you can image, the console is a slow device, but it will be used by many
+threads or cpu cores. It is normal case the output flows from many threads are
+much faster than the serial output speed.
+
+So, it is obvious that we need a buffer to cache the data to be outputed to
+serial device.
+
+That is the excat function what log_buf provides.
+
+
+But how to use this log_buf is a bit tricky. For these considerations:
+
+1) The log_buf is so small compared with all the debug info from whole system.
+It is easy to overrun the log_buf. How to handle it?
+(log_buf support the walk-around or loopback. It means some output will be
+ dropped)
+
+2) How to guarantee the order of output message from the same thread?
+To be more readable, it is needed to keep the message order in log_buf for
+some thread.
+
+3) How to obtain the best real-time without more negative effect on system
+
+
+I think the log_buf match the first requirement. cont support the 3rd
+requirement. The 2nd requirement is implemented cooperating with log_buf and
+cont.
+
+1. the log_buf definition
+
+in kernel/printk/printk.c :
+
+#define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
+static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
+static char *log_buf = __log_buf;
+static u32 log_buf_len = __LOG_BUF_LEN;
+
+2. some global variables relevant to message caching
+
+
+/* index and sequence number of the first record stored in the buffer */
+static u64 log_first_seq;
+static u32 log_first_idx;
+
+/* index and sequence number of the next record to store in the buffer */
+static u64 log_next_seq;
+static u32 log_next_idx;
+
+These two group of variables are for managing the log_buf.
+
+_seq is the record sequence number
+_idx is the position of __log_buf[] or index of __log_buf[].
+
+
+log_first_idx is the start position where the buf[] is used to store message
+data. ( Thos message should be struct printk_log )
+log_next_idx is the end position of the used buf[];
+
+log_first_seq is the first message ID that correspond to log_first_idx;
+log_next_seq is the last message ID that correspond to log_next_idx;
+
+At the beginning, log_first_idx=log_next_idx=0, log_first_seq=log_next_seq=0.
+As the message is saved into log_buf[], log_next_seq and log_next_idx will
+increase by one in log_store() for each struct printk_log.
+(Here, it is worth to mention, struct printk_log is not correponding to one
+ message record, espcially for long message data)
+
+The log_first_idx/log_first_seq were updated only when there is no enough
+log_buf[] space for the coming message. You can refer to log_make_free_space :
+
+	while (log_first_seq < log_next_seq &&
+	       !logbuf_has_space(msg_size, false)) {
+		/* drop old messages until we have enough contiguous space */
+		log_first_idx = log_next(log_first_idx);
+		log_first_seq++;
+	}
+
+Up to now, we know there are many struct printk_log in log_buf[]. What is
+valid depends on log_first_seq/log_first_idx and log_next_seq/log_next_idx.
+
+Since the log_buf[] is loop, we should know when the end of the log_buf[]
+reach, then log_next_idx should be initialized as ZERO again. We can not use
+the traditional head == end as the judgement since log_first_seq will be
+changed when log_buf[] space is on demand. So kernel add a new complete
+struct printk_log in the end of log_buf[] whose all fields are set as ZERO,
+including the msg->len is ZERO.
+You can refer to log_from_idx and log_next to understand this.
+( But to be honest, I worry about the msg->len is not ZERO all cases. For
+  example, is it possible that log_next_idx + sizeof(ts_nsec) + sizeof(len) >
+  log_buf_len?? To ensure the last spare space of log_buf[] can hold a
+  complete struct printk_log, the log_buf definition has special limit:
+
+#define LOG_ALIGN __alignof__(struct printk_log)
+#define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
+static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
+
+and all the space allocation also ensure the _idx aligned with LOG_ALIGN.
+So, log_next_idx, log_first_idx are LOG_ALIGN and can not bigger than
+(log_buf_len - sizeof(struct printk_log) ). So, it should be ok.
+  )
+
+
+3. some variables relative to the record sending control
+
+/* the next printk record to write to the console */
+static u64 console_seq;
+static u32 console_idx;
+static enum log_flags console_prev;
+
+console_seq is the sequence number of a record that will be sent next. When
+console_seq is equal to log_next_seq, means all records in the log_buf[] are
+sent.
+console_idx is the location where the next record in log_buf[] awaiting to be
+sent.
+coneols_prev is the flags of last record sent which will be used to decide
+what log prefix should be sent. (you can refer to console_unlock)
+
+
+LOG_NOCONS represents the record data had been flushed by console_cont_flush,
+no need to sent from log_buf[] again.
+
+3.3 cont
+
+1. Why struct cont is using?
+
+Supposed there are many info to be sent. But it is unwise to keep on sending
+all the time.
+
+when the console ouput is scheduled, these cases are possible:
+1) part of message record( without newline as the end, no new LOG_PREFIX, same
+thread) , will send this partial of message record;
+2) new message record segment come, will direclty append in cont; or
+3) new LOG_PREFIX, thread switch, cpu switch, panic dump. Any of
+those case occurred before a complete message record in cont, then flush the
+message segment in cont now; new message will save in log_buf[] by log_store;
+4) a complete record in cont when the ending newline is rearched.
+
+All these can refer to vprintk_emit().
+
+
+So, struct cont cont try to save a complete record. If the others factors
+which occur before end newline break the saving for a complete record, then
+one imcomplete message segment will save in cont as fake record, the later
+message data are saved in log_buf[]. Before the date in cont had been sent and
+flushed, no new message data can be stored in cont again! All those new
+message data will store in log_buf[].
+
+So, log_buf[] will only save message record. cont will save both message
+record and partial record which had been sent.
+
+The output data will be prioritily put into this buffer. When one record, too
+long data, thread switch, all these cases happen, all data buffered in cont
+will be flushed into __log_buf[] too.
+
+
+
+
+
+4. How to lock the console
+
+during the output period, after every record sending, the current printk
+thread can be scheduled. You can refer to console_unlock:
+
+	if (do_cond_resched)
+		cond_resched();
+
+

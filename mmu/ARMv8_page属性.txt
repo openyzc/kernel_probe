@@ -1,0 +1,144 @@
+memory type定义在 arch/arm64/include/asm/memory.h中：
+
+下面宏值是 mail_elx寄存器中的哪个 byte
+此三种是针对device的，也就是 mail_elx中的[7:4]为 0b0000
+#define MT_DEVICE_nGnRnE	0
+#define MT_DEVICE_nGnRE		1
+#define MT_DEVICE_GRE		2
+对于device,还有 nGRE没有在内核中使用。
+
+
+此两种是针对 normal memory的，也就是 mair_elx中的[7:4]为非0
+#define MT_NORMAL_NC		3
+#define MT_NORMAL		4
+
+
+参见 arch/arm64/mm/proc.S中如何使用这些宏。
+可见对于 device, Attr[][7:4]是0，而[3:0]是具体的device属性；
+而对于 MT_NORMAL_NC, Attr[][7:4]是0b0100,表示 Outer Non-Cacheable；
+[3:0]是0b0100,表示 Inner Non-Cacheable;
+而对于 MT_NORMAL_NC, Attr[][7:4]是0b1111,表示 Outer Write-back non-transient ＆ RW allocate；
+[3:0]是0b1111,表示 Inner Write-back non-transient ＆ RW allocate；
+	ldr	x5, =MAIR(0x00, MT_DEVICE_nGnRnE) | \
+		     MAIR(0x04, MT_DEVICE_nGnRE) | \
+		     MAIR(0x0c, MT_DEVICE_GRE) | \
+		     MAIR(0x44, MT_NORMAL_NC) | \
+		     MAIR(0xff, MT_NORMAL)
+	msr	mair_el1, x5
+
+
+
+
+
+页的属性比特定义在 arch/arm64/include/asm/pgtable-hwdef.h中：
+
+#define PTE_USER		(_AT(pteval_t, 1) << 6)		/* AP[1] */
+#define PTE_RDONLY		(_AT(pteval_t, 1) << 7)		/* AP[2] */
+#define PTE_SHARED		(_AT(pteval_t, 3) << 8)		/* SH[1:0], inner shareable */
+#define PTE_AF			(_AT(pteval_t, 1) << 10)	/* Access Flag */
+#define PTE_NG			(_AT(pteval_t, 1) << 11)	/* nG */
+#define PTE_PXN			(_AT(pteval_t, 1) << 53)	/* Privileged XN */
+#define PTE_UXN			(_AT(pteval_t, 1) << 54)	/* User XN */
+
+
+
+软件使用的页表属性位定义在 arch/arm64/mm/pgtable.h下：
+
+这些bits是硬件预留给software defined的，linux中定义为：
+#define PTE_DIRTY		(_AT(pteval_t, 1) << 55)
+#define PTE_SPECIAL		(_AT(pteval_t, 1) << 56)
+#define PTE_WRITE		(_AT(pteval_t, 1) << 57) AP[7］为1时表示 只读，参考 set_pte_at
+#define PTE_PROT_NONE		(_AT(pteval_t, 1) << 58) /* only when !PTE_VALID */ 在PTE_VALID比特为0的前提下置1表示PTE 有效.
+
+
+
+
+以下定义在  arch/arm64/mm/pgtable.h下：
+
+
+可见，SMP时，页面默认配置为 inner shareable的，需要硬件保证cache数据的一致性；
+只是不知道这里的inner 与 mair_el1中的 inner是否一致；
+#ifdef CONFIG_SMP
+#define PROT_DEFAULT		(PTE_TYPE_PAGE | PTE_AF | PTE_SHARED)
+#define PROT_SECT_DEFAULT	(PMD_TYPE_SECT | PMD_SECT_AF | PMD_SECT_S)
+#else
+#define PROT_DEFAULT		(PTE_TYPE_PAGE | PTE_AF)
+#define PROT_SECT_DEFAULT	(PMD_TYPE_SECT | PMD_SECT_AF)
+#endif
+
+
+因此默认 memory属性是 Write-back non-transient ＆ RW allocate shareable,且 inner
+与 outer是一样的属性配置；如果需要引入新的memory type，需要增加 memory type的宏
+定义，同时设置好 mair_el1 的对应 Attr[][7:0].
+#define _PAGE_DEFAULT		(PROT_DEFAULT | PTE_ATTRINDX(MT_NORMAL))
+
+
+经过((_PAGE_DEFAULT) & ~PTE_TYPE_MASK) 后,得到的 page attr将不包括 最后两个bit的
+entry 类型（也就是block, type 还是 page）. PAGE_NONE 将表示 无效的 PTE 且 不可execute;
+#define PAGE_NONE		__pgprot(((_PAGE_DEFAULT) & ~PTE_TYPE_MASK) | PTE_PROT_NONE | PTE_PXN | PTE_UXN)
+
+=====以下页表的 AP［6］是 0b1,表示 both for EL1&0=========
+表示对 EL1&0 可读写但是不可执行的普通页（用户数据页）
+#define PAGE_SHARED		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN | PTE_UXN | PTE_WRITE)
+表示对 EL1&0 可读写但是EL1不可执行，EL0可执行的普通页；（如果SCTLR_EL1.WXN 为1，EL0也不可执行）
+#define PAGE_SHARED_EXEC	__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN | PTE_WRITE)
+表示对 EL1&0 只读但是不可执行的普通页；
+#define PAGE_COPY		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN | PTE_UXN)
+表示对 EL1&0 只读但是EL1不可执行，EL0可执行的普通页；（因为只读，不受SCTLR_EL1.WXN影响）
+#define PAGE_COPY_EXEC		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN)
+
+#define PAGE_READONLY		__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN | PTE_UXN)
+#define PAGE_READONLY_EXEC	__pgprot(_PAGE_DEFAULT | PTE_USER | PTE_NG | PTE_PXN)
+
+
+#define PROT_NORMAL_NC		(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL_NC))
+#define PROT_NORMAL		(PROT_DEFAULT | PTE_PXN | PTE_UXN | PTE_ATTRINDX(MT_NORMAL))
+
+表示只是EL1可读写，但EL1＆0不可执行的页（内核数据页）
+#define PAGE_KERNEL		__pgprot(_PAGE_DEFAULT | PTE_PXN | PTE_UXN | PTE_DIRTY | PTE_WRITE)
+表示只是EL1可读写可执行，EL0不可执行的页（内核代码页）
+#define PAGE_KERNEL_EXEC	__pgprot(_PAGE_DEFAULT | PTE_UXN | PTE_DIRTY | PTE_WRITE)
+
+
+
+
+
+
+在  arch/arm64/mm/pgtable.h下：
+
+#define __P000  PAGE_NONE
+#define __P001  PAGE_READONLY
+#define __P010  PAGE_COPY
+#define __P011  PAGE_COPY
+#define __P100  PAGE_READONLY_EXEC
+#define __P101  PAGE_READONLY_EXEC
+#define __P110  PAGE_COPY_EXEC
+#define __P111  PAGE_COPY_EXEC
+
+#define __S000  PAGE_NONE
+#define __S001  PAGE_READONLY
+#define __S010  PAGE_SHARED
+#define __S011  PAGE_SHARED
+#define __S100  PAGE_READONLY_EXEC
+#define __S101  PAGE_READONLY_EXEC
+#define __S110  PAGE_SHARED_EXEC
+#define __S111  PAGE_SHARED_EXEC
+
+在 arch/x86/include/asm/pgtable_types.h下类似定义：
+/*         xwr */
+#define __P000	PAGE_NONE
+#define __P001	PAGE_READONLY
+#define __P010	PAGE_COPY
+#define __P011	PAGE_COPY
+#define __P100	PAGE_READONLY_EXEC
+#define __P101	PAGE_READONLY_EXEC
+#define __P110	PAGE_COPY_EXEC
+#define __P111	PAGE_COPY_EXEC
+
+
+在mm/mmap.c中：
+pgprot_t protection_map[16] = {
+	__P000, __P001, __P010, __P011, __P100, __P101, __P110, __P111,
+	__S000, __S001, __S010, __S011, __S100, __S101, __S110, __S111
+};
+

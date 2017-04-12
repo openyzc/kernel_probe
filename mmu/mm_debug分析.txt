@@ -1,0 +1,72 @@
+
+1. vm_table
+
+vm_table[]对应 /proc/sys/vm
+
+vm_table[]中的 proc_handler 在 proc_sys_call_handler 调用。
+
+2. current->mempolicy
+
+current->mempolicy 可以通过 do_set_mempolicy 设置。
+numa_policy_init 会调用 do_set_mempolicy(MPOL_INTERLEAVE, 0, &interleave_nodes)
+
+
+
+关于MySQL与 numactl
+http://www.penglixun.com/tech/database/mysql_multi_using_numactl.html
+
+numactl –cpunodebind=node –localalloc mysqld_path
+
+
+
+================================================================
+
+"memory policy" determines from which node the kernel will
+allocate memory in a NUMA system or in an emulated NUMA system.
+
+cpusets is an administrative mechanism for restricting the nodes from which
+memory may be allocated by a set of processes.
+
+When both cpusets and policies are applied to a task, the restrictions of
+the cpuset takes priority.
+
+
+cpus ---> nodes
+
+thread ---> cpu???
+
+
+
+
+x86_cpu_to_node_map 由 
+1) srat_detect_node -> numa_set_node(int cpu, int node) 设置;
+2) init_cpu_to_node -> numa_set_node(cpu, node)
+两个路径都会调用到 numa_cpu_node，此函数 会根据 cpu的apicid找到对应的 node，
+也就是 cpu    -------apicid -----> node 的关系在 __apicid_to_node[apicid] 中；
+（不同的apicid 可以对应同一个 node id)
+表示 cpu 属于哪个 node id，存在一一对应关系；
+numa_set_node 会设置 x86_cpu_to_node_map[cpu] = node;
+
+
+set_cpu_numa_node(int cpu, int node) 有点重复 numa_set_node的功能，只是将cpu与node
+的一一关系设置到 percpu变量 numa_node 中；应该是在 setup_per_cpu_areas 对每个possible
+cpu进行调用，如下 set_cpu_numa_node(cpu, early_cpu_to_node(cpu))，还是依赖于 
+x86_cpu_to_node_map[cpu].
+
+set_numa_node(int node) 略微不同于 set_cpu_numa_node(int cpu, int node)，其功能
+应该是针对 localcpu的。在 cpu_init 中调用。目前x86_64， powerpc， ia64采用此处理，
+但是 setup_per_cpu_areas 中的处理是对所有x86的，不仅仅限于x86_64，因此可以认为是
+一个补充。
+
+
+numa_add_cpu 会设置 node_to_cpumask_map[node]的cpu bitmap，表示 哪些cpu属于此node;
+smp_callin -> smp_store_cpu_info -> identify_secondary_cpu ->
+start_secondary -> identify_cpu -> numa_add_cpu ,只是用于x86。对每个 cpu进行startup
+时，会将当前cpu 添加到 其对应的 node为索引的 node_to_cpumask_map[early_cpu_to_node(cpu)]
+中。
+
+
+
+
+
+

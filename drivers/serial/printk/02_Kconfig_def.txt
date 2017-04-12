@@ -1,0 +1,127 @@
+
+The relevant references are in Documentation/kbuild
+kconfig-language.txt is the major doc.
+
+
+All the following are based on the kbase from estuary which version is 4.4,
+for arm64 architecture.
+
+1. depends vs select
+
+Take KALLSYMS as example to analyse:
+
+You can use 'ctrl+/' to check the currrent status and the dependency of
+KALLSYMS:
+
+ Symbol: KALLSYMS [=y]
+ │ 
+   │ Type  : boolean
+   │  
+     │ Prompt: Load all symbols for debugging/ksymoops
+     │  
+       │   Location:
+       │  
+         │     -> General setup
+	 │  
+	   │ (1)   -> Configure standard kernel features (expert users)
+	(EXPERT [=y])
+	│  
+	  │   Defined at init/Kconfig:1412
+	  │  
+	    │   Selected by: KPROBES [=y] && MODULES [=y] && HAVE_KPROBES [=y]
+	    ||  LATENCYTOP [=y] && HAVE_LATENCYTOP_SUPPORT [=y] && DEBUG_KERNEL
+	    [=y] && STACKTRACE_SUPPORT [=y] && PROC_FS [=y] ||  DEBUG_KMEMLEAK
+	    [=n] && DEBUG_KERNEL [=y] && HAVE_DEBUG_KMEMLEAK [=y] ||  LOCKDEP
+	    [=n] && DEBUG_KERNEL [=y] && TRACE_IRQFLAGS_SUPPORT [=y] &&
+	    STACKTRACE_SUPPORT [=y] && LOCKDEP_SUPPORT [=y] ||
+
+To clear what is the roles of depends and select, we only check the
+'DEBUG_KMEMLEAK', this item is defined in lib/Kconfig.debug
+
+config DEBUG_KMEMLEAK
+        bool "Kernel memory leak detector"
+        depends on DEBUG_KERNEL && HAVE_DEBUG_KMEMLEAK
+        select DEBUG_FS
+        select STACKTRACE if STACKTRACE_SUPPORT
+        select KALLSYMS
+
+So, it is obvious that KALLSYMS is selected by DEBUG_KMEMLEAK. But
+DEBUG_KMEMLEAK is depended on DEBUG_KERNEL && HAVE_DEBUG_KMEMLEAK, it means
+that if those any of those two is 'N' then DEBUG_KMEMLEAK can not be 'Y'. So,
+KALLSYMS is selected by DEBUG_KMEMLEAK [=n] && DEBUG_KERNEL [=y] && HAVE_DEBUG_KMEMLEAK [=y]
+
+Then current KALLSYMS[y] is not decided by DEBUG_KMEMLEAK && DEBUG_KERNEL &&
+HAVE_DEBUG_KMEMLEAK.
+
+A || B will result in the maximum value ( Y:2 M:1 N:0 )
+A && B will result in the minimum value
+
+one more thing to be noticed, dependencies are applied to all other options
+within this config entry:
+        bool "foo" if BAR
+        default y if BAR
+and
+	depends on BAR
+	bool "foo"
+	default y
+
+these two config entries are equivalent.
+
+2. menuconfig vs menu/endmenu
+
+menuconfig is similar to the simple config entry like 'config NET_CORE',
+but it also gives a hint to front ends( when you run make menuconfig, you can
+see '--->' appended the prompt string):
+
+(init/Kconfig)
+
+menuconfig EXPERT
+        bool "Configure standard kernel features (expert users)"
+        # Unhide debug options, to make the on-by-default options visible
+        select DEBUG_KERNEL
+        help
+
+You can find under the menuentry of '[*] Configure standard kernel features
+(expert users) --->', there are many subentries depended on EXPERT.
+So, you can create a implicit menu entries tree based on the dependencies.
+
+menu/endmenu will specify a explicit menu entry. The prompt string also have
+'--->'. But inside the "menu" ... "endmenu" block, there are at least one
+confige item. All subentries inherit the dependencies from the menu entry.
+
+3. choice/endchoice
+
+This defines a choice group and accepts any of the above attributes as
+options. A choice can only be of type bool or tristate, while a boolean
+choice only allows a single config entry to be selected, a tristate
+choice also allows any number of config entries to be set to 'm'.
+
+choice
+        prompt "Memory model"
+        depends on SELECT_MEMORY_MODEL
+        default DISCONTIGMEM_MANUAL if ARCH_DISCONTIGMEM_DEFAULT
+        default SPARSEMEM_MANUAL if ARCH_SPARSEMEM_DEFAULT
+        default FLATMEM_MANUAL
+
+config FLATMEM_MANUAL
+	bool "Flat Memory"
+	...
+
+endchoice
+
+This choice entry will be appended with '--->' too. But there is no [] at the
+header. Since you must make a choice among those configurations.
+
+If you want to disable the whole choice entry, you can use the option
+"optional", just as this entry in arch/avr32/boards/atstk1000/Kconfig :
+
+choice
+        prompt "LEDs connected to J2:"
+        depends on LEDS_GPIO && !BOARD_ATSTK100X_SW4_CUSTOM
+        optional
+
+
+If no [symbol] is associated with a choice, then you can not have multiple
+definitions of that choice. If a [symbol] is associated to the choice,
+then you may define the same choice (ie. with the same entries) in another place.
+

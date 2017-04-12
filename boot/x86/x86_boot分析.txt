@@ -1,0 +1,118 @@
+1. arch/x86/boot/version.c 中使用了几个宏。这些宏应该来自
+include/generated/utsrelease.h中。该头文件在编译过程中生成。实际是通过Makefile中的echo
+输出到指定的文件。
+
+define filechk_utsrelease.h
+......
+	(echo \#define UTS_RELEASE \"$(KERNELRELEASE)\";)
+endef
+
+include/generated/utsrelease.h: include/config/kernel.release FORCE
+        $(call filechk,utsrelease.h)
+
+2. bzImage的结构
+bzImage是由 arch/x86/boot下的Makefile 生成的。规则是
+
+cmd_image = $(obj)/tools/build $(obj)/setup.bin $(obj)/vmlinux.bin \
+                               $(obj)/zoffset.h $@
+
+也就是来自 setup.bin, vmlinux.bin。
+
+其中 setup.bin 是这样生成的
+$(obj)/setup.elf: $(src)/setup.ld $(SETUP_OBJS) FORCE
+        $(call if_changed,ld)
+
+$(obj)/setup.bin: $(obj)/setup.elf FORCE
+        $(call if_changed,objcopy)
+
+vmlinux.bin是这样的
+OBJCOPYFLAGS_vmlinux.bin := -O binary -R .note -R .comment -S
+$(obj)/vmlinux.bin: $(obj)/compressed/vmlinux FORCE
+        $(call if_changed,objcopy)
+
+$(obj)/compressed/vmlinux: FORCE
+        $(Q)$(MAKE) $(build)=$(obj)/compressed $@
+包含了compressed目录下的object files以及压缩后的vmlinux。具体可以参考
+compressed/Makefile。
+
+------------
+| 512 bytes header(The starting 512 bytes of setup.bin. Those code is in header.S)
+| (include .bstext, .bsdata, .header)
+|------------   the start offset of .setup of EFI_STUB(optional)
+|setup.bin(The remaining)
+|....(paddings)
+|PECOFF_RELOC_RESERVE(optional, only when CONFIG_EFI_STUB)
+|------------  the end of .reloc of EFI_STUB(optional).
+ ##This addr must be aligned to sector size(512)
+ ##Size is 512 * setup_sectors, will be saved in buf[0x1f1] of hdr
+ vlinux.bin
+ ....(paddings, '\0')
+ crc( for whole file, including the paddings. 4bytes)
+ ##sys_size( the sum of size of vmlinux.bin and 4 for crc，should aligned to 16)
+-------------
+
+
+
+
+efi_stub_defaults 会设置 efi_pe_entry， startup_64（for X86_64)的缺省值。
+
+
+
+
+一些关键的数据会保存在bzImage的前面。如下：
+
+
+buf[0x3c]: 4bytes. 保存一个偏移地址，指向 header.S中的 pe_header;
+buf[0x42]: 2bytes. 保存UEFI application的sections
+数，缺省4。参考update_pecoff_section_header_fields；
+
+buf[pe_header + 0x1c]: 4bytes. 去掉第一个sector 512字节后的代码size,SizeOfCode;
+buf[pe_header + 0x24]：4bytes. SizeOfInitializedData;
+buf[pe_header + 0x28]: 4 bytes. vmlinux.bin起始 + efi_pe_entry；
+
+buf[pe_header + 0x50]: 4 bytes. SizeOfImage;
+buf[pe_header + 0xa8]：只对x86_32有效。指向 section table;
+buf[pe_header + 0xb8]: 只对x86_64有效。
+
+--buf[0x1f1]: 1byte. setup.bin +
+relocs（0x20)这个size对齐512后的sector数目 -1；（setup_sects）
+--buf[0x1f2]: 2bytes. 保存root flags;
+--buf[0x1f4]: 4byte. 保存vmlinux.bin的size(对齐16);
+--buf[0x1fc]: 2bytes. 保存 root device的设备号；
+--buf[0x1fe] : 0xAA55，表示 有效的boot block flag；
+
+--buf[0x260]：4bytes, 保存整个 bzImage包含bss的size，对应 init_size；
+
+buf[0x264] : 4bytes, efi_stub_entry_update 设置，与 efi32_stub_entry
+或efi64_stub_entry相关. handover_offset;
+
+
+
+3. syscall
+
+sys_call_table[]的初始化参考 arch/x86/syscalls目录下的.tbl 和 .sh
+
+
+4. 新版本的boot协议
+
+当前内核的setup.bin，使用 arch/x86/boot下的
+setup.ld作为链接脚本，生成独立的setup.bin程序。该程序的起始汇编程序header.S是入口。经过将stack创建到_end
+与 0x10000之间，然后跳转到main.c中的main，开始c语言的处理。最终会通过
+汇编pmjump.S中的 protected_mode_jump跳转到 boot_params.hdr.code32_start
+指定的位置继续运行。
+
+5. 开始compressed下的vmlinux.bin 运行
+
+bootloader 应该会将 arch/x86/boot下生成的vmlinux.bin
+中部分程序合理的load到code32_start指示的内存地址。实际arch/x86/boot/vmlinux.bin只是将arch/x86/boot/compressed/vmlinux
+进行objcopy后生成的。 该被 objcopy的 vmlinu实际由 compressed目录下的vmlinux.lds.S 链接生成。
+该vmlinux的入口对于x86_64是head_64.S中的 startup_32。
+
+
+
+
+
+
+
+
+

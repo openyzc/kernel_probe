@@ -1,0 +1,71 @@
+ok. We start from pci resource allocation.
+
+In pcie-designware.c, after root bus had been created, will call these two
+functions to allocate the necessary resources:
+
+pci_bus_size_bridges(bus);
+pci_bus_assign_resources(bus);
+
+At this time, we just skip the pci_bus_size_bridges(bus), although this
+function is important and can decide what alignment of any bus resource
+windows.
+
+
+1. The basic resource structure in PCI
+
+acpi_pci_root_create/pci_scan_root_bus/pci_scan_root_bus_msi ->
+pci_create_root_bus --> pci_bus_add_resource
+
+will add struct pci_bus_resource node to struct list_head resources of struct
+pci_bus.
+
+For PowerPC, the resource intialization is:
+subsys_initcall(pcibios_init) -> pcibios_init -> pcibios_scan_phb -->
+pci_add_resource(&resources, &hose->busn)
+
+This resource will probably be used as parent windows through
+find_free_bus_resource -> pci_bus_for_each_resource(bus, r, i) :
+here, i is the resource index of the list, r is a pointer of struct resource;
+
+Please note that the bus->resources list is the resource windows of root bus;
+
+
+2. The resource assign/request
+
+pci_bus_assign_resources --> __pci_bus_assign_resources(bus, NULL, NULL)
+
+for the non-hotplug devices, the realloc_head, fail_head are NULL;
+
+The assignment is from upstream to downstream. It means all the accessors
+resources will be assigned at first.
+
+pbus_assign_resources_sorted(bus, realloc_head, fail_head)
+	__assign_resources_sorted(&head, realloc_head, fail_head)
+
+here, &head is the output of __dev_sort_resources(dev, &head) for all
+children under the input bus. All the resources of any child,
+including the windows, will be sorted by the alignment.
+
+
+--> assign_requested_resources_sorted(head, fail_head)
+	--> pci_assign_resource(dev_res->dev, idx))
+	--> _pci_assign_resource(dev, resno, size, align)
+	--> __pci_assign_resource(bus, dev, resno, size, min_align)
+	---> pci_bus_alloc_resource
+	---> pci_bus_alloc_from_region
+	---> allocate_resource
+		---> find_resource(root, new, size, &constraint)
+		---> __request_resource(root, new)
+
+The key is find_resource(). The new only provide the resource size, the start
+of this struct resource doesn't make any sense or have any impact on the final
+allocated resource.
+
+
+
+
+
+
+
+
+
