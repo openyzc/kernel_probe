@@ -1,0 +1,48 @@
+
+Ok. Everything starts from gic_init_bases():
+
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+		its_init(handle, &gic_data.rdists, gic_data.domain);
+
+And, here, gic_data.domain is gic_irq_domain_ops.
+
+its_parent is set as gic_irq_domain_ops;
+
+
+
+
+1. The ITS register mapping
+
+The ITS address map consists of two separate 64KB frames starting from an
+IMPLEMENTATION DEFINED address
+specified in ITS_base. This base address must be aligned to a 64KB boundary. The
+two frames are:
+• The control registers. which are located at ITS_base + 0x000000.
+• The interrupt translation space, which is located at ITS_base + 0x010000.
+
+In ACPI spec, 5.2.12.18 GIC Interrupt Translation Service (ITS) Structure
+will define the base address of these two 64KB page for each ITS.
+
+In GIC spec 6.2.7 :
+An ITS is controlled and configured using a memory-mapped interface where:
+• The version can be read from GITS_IIDR and from GITS_PIDR2.
+• GITS_TYPER specifies the features that are supported by an ITS.
+• GITS_CTLR controls the operation of an ITS.
+• GITS_TRANSLATER receives EventID information. It is IMPLEMENTATION DEFINED how
+the DeviceID is
+supplied. See ITS commands on page 6-107 for more details.
+• GITS_BASER<n> registers provide information about the type, size and access
+attributes for the architected
+ITS memory structures.
+• GITS_CBASER, GITS_CREADR, and GITS_CWRITER store address information for the
+ITS command
+queue interface.
+There is an enable bit for each ITS, GITS_CTLR.Enabled.
+
+
+
+gic_acpi_parse_madt_its --> its_probe_one
+
+
+
+

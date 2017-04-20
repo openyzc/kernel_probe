@@ -1,0 +1,25 @@
+This will be called after the setup_machine_fdt(__fdt_pointer) for FDT mapping.
+
+setup_arch --> arm64_memblock_init()
+
+memblock_remove --> memblock_remove_range
+	--> memblock_isolate_range
+	This function will return all the registered blocks covered by the range
+	to be removed;
+	---> 
+	for (i = end_rgn - 1; i >= start_rgn; i--)
+		memblock_remove_region(type, i);
+	Here, those overlapped regions are removed;
+
+memblock_add --> memblock_add_range
+	--> if this is the first memblock, just modify the regions[0].base,
+	regions[0].size, etc;
+	--> otherwise, traverse whole memblock list, for all those overlapped
+	with the added range, the adding will apply this region to separate the
+	the range. The small region of added range will be inserted, the bigger
+	region will also be inserted. Then finally will merge all the ajacent
+	regions;
+
+
+
+

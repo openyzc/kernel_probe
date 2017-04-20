@@ -1,0 +1,66 @@
+
+
+The initialised procedure is :
+
+setup_arch  --> early_ioremap_init() --> early_ioremap_setup()
+
+only perform the following intialization in early_ioremap_setup():
+	slot_virt[i] = __fix_to_virt(FIX_BTMAP_BEGIN - NR_FIX_BTMAPS*i);
+
+**NOTE***
+	offset = offset_in_page(phys_addr);
+	phys_addr &= PAGE_MASK;
+
+PAGE_MASK can be used to mask out the offset in one page;
+
+The fixadd index from FIX_BTMAP_BEGIN to FIX_BTMAP_END are for early_xxxmap.
+At this moment, support early_ioremap for IO, early_memremap for normal memory,
+early_memremap_ro for RO memory;
+
+========== The page table setup will be done in __early_ioremap======
+
+1. find a idle element from prev_map[] (When it is ZERO), then we know the slot
+ID;
+
+2. Adjust the start 'phys_addr' and end physical addr to page boundary, and the
+size will be extended accordingly.
+
+3. call these to set the PTEs
+
+	idx = FIX_BTMAP_BEGIN - NR_FIX_BTMAPS*slot;
+	while (nrpages > 0) {
+		if (after_paging_init)
+			__late_set_fixmap(idx, phys_addr, prot);
+		else
+			__early_set_fixmap(idx, phys_addr, prot);
+		phys_addr += PAGE_SIZE;
+		--idx;
+		--nrpages;
+	}
+
+For ARM64,
+
+#define __early_set_fixmap __set_fixmap
+
+will set the PTEs in the bm_pte[] which are corresponding with the fix index;
+( From FIX_BTMAP_BEGIN - NR_FIX_BTMAPS*slot - nrpages to FIX_BTMAP_BEGIN -
+NR_FIX_BTMAPS*slot)
+
+In the end, the mapped virtual address will be returned and stored in
+prev_map[]:
+
+prev_map[slot] = (void __iomem *)(offset + slot_virt[slot]);
+
+
+===================================================
+So, the basic ideas for early_???map() are:
+
+  -- Whole early map space are divided into FIX_BTMAPS_SLOTS;
+  -- Each slot can be mapped maximal NR_FIX_BTMAPS contiguous pages;
+  -- All the PTEs are using the bm_pte[] which is specific to FIXADDR;
+
+
+#define NR_FIX_BTMAPS		(SZ_256K / PAGE_SIZE)
+#define FIX_BTMAPS_SLOTS	7
+#define TOTAL_FIX_BTMAPS	(NR_FIX_BTMAPS * FIX_BTMAPS_SLOTS)
+

@@ -1,0 +1,47 @@
+
+in arch/arm64/Kconfig, the PGTABLE_LEVELS is defined :
+
+config PGTABLE_LEVELS
+        int
+        default 2 if ARM64_16K_PAGES && ARM64_VA_BITS_36
+        default 2 if ARM64_64K_PAGES && ARM64_VA_BITS_42
+        default 3 if ARM64_64K_PAGES && ARM64_VA_BITS_48
+        default 3 if ARM64_4K_PAGES && ARM64_VA_BITS_39
+        default 3 if ARM64_16K_PAGES && ARM64_VA_BITS_47
+        default 4 if !ARM64_64K_PAGES && ARM64_VA_BITS_48
+
+
+
+
+in arch/arm64/include/asm/pgtable-hwdef.h :
+
+
+#define ARM64_HW_PGTABLE_LEVEL_SHIFT(n)	((PAGE_SHIFT - 3) * (4 - (n)) + 3)
+#define PTRS_PER_PTE		(1 << (PAGE_SHIFT - 3))
+
+#define PGDIR_SHIFT	ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
+
+Based on these macros and the config PGTABLE_LEVELS, we know:
+  -- PGTABLE is the highest page table;
+  -- PGTABLE_LEVELS is the page table level counter which doesn't cover the MSB
+	of PGTABLE; For 4K page, the MSB 9 bits are not included in the
+	PGTABLE_LEVELS;
+  -- The 1st level PTE covers (PAGE_SHIFT - 3) + 3 bits = PAGE_SHIFT as one PTE
+corresponds one page; the 2nd level PTE ----> (PAGE_SHIFT - 3) + PAGE_SHIFT ...
+
+For 64K page, the address bits will be divided as below:
+
+
+	    		PAGE_SHIFT  PMD_SHIFT  PUD_SHIFT  PGDIR_SHIFT
+		PTE	PMD		PUD	
+Max AddrBits		3rd		2nd	1st	 0level PGD entries
+	48	16	13		13 		1 << (48 - 42) partial
+	42	16	13				1 << (42 - 29) full
+
+For 4K
+
+	48	12	9		9	9	1 << (48 - 39)	full
+
+For 16K
+	48	14	11		11	11	1 << (48 - 47)	partial
+

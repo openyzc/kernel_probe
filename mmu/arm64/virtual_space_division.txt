@@ -1,0 +1,134 @@
+in arch/arm64/include/asm/memory.h :
+
+#define VA_BITS			(CONFIG_ARM64_VA_BITS)
+
+
+1. How to define ARM64_VA_BITS
+
+in arch/arm64/Kconfig :
+
+ARM64_VA_BITS_36	depends on 	16K_PAGES
+ARM64_VA_BITS_39	depends on 	4K_PAGES
+ARM64_VA_BITS_42	depends on 	64K_PAGES
+ARM64_VA_BITS_47	depends on 	16K_PAGES
+ARM64_VA_BITS_48			ALL
+
+
+2. The conversion between fix address ID and virtual address
+
+in include/asm-generic/fixmap.h :
+
+#define __fix_to_virt(x)	(FIXADDR_TOP - ((x) << PAGE_SHIFT))
+#define __virt_to_fix(x)	((FIXADDR_TOP - ((x)&PAGE_MASK)) >> PAGE_SHIFT)
+
+3. The definition of FIXADDR_TOP
+
+It is architecture-dependent.
+
+For ARM64, it is :
+#define FIXADDR_TOP		(PCI_IO_START - SZ_2M)
+
+4. The virtual space definitions
+
+#define VA_START		(UL(0xffffffffffffffff) << VA_BITS)
+#define PAGE_OFFSET		(UL(0xffffffffffffffff) << (VA_BITS - 1))
+#define KIMAGE_VADDR		(MODULES_END)
+#define MODULES_END		(MODULES_VADDR + MODULES_VSIZE)
+#define MODULES_VADDR		(VA_START + KASAN_SHADOW_SIZE)
+#define MODULES_VSIZE		(SZ_128M)
+#define VMEMMAP_START		(PAGE_OFFSET - VMEMMAP_SIZE)
+#define PCI_IO_END		(VMEMMAP_START - SZ_2M)
+#define PCI_IO_START		(PCI_IO_END - PCI_IO_SIZE)
+#define FIXADDR_TOP		(PCI_IO_START - SZ_2M)
+#define TASK_SIZE_64		(UL(1) << VA_BITS)
+
+	-------------------------  -1UL (highest VA)
+	|			|
+	|			| 	(1 << (VA_BITS - 1))
+	|			|
+	-------------------------  PAGE_OFFSET
+	|	VMEMMAP		| 	VMEMMAP_SIZE
+	-------------------------  VMEMMAP_START
+	|	SZ_2M		|	space gap
+	-------------------------  PCI_IO_END
+	|	PCI_IO		|	PCI_IO_SIZE
+	-------------------------  PCI_IO_START
+	|	SZ_2M		|	space gap
+	-------------------------  FIXADDR_TOP
+	|			|
+	|	KIMAGE		|
+	-------------------------  KIMAGE_VADDR/MODULES_END
+	|	MODULES		|
+	|			|	MODULES_VSIZE
+	-------------------------  MODULES_VADDR
+	|			|
+	|	KASAN_SHADOW	|	KASAN_SHADOW_SIZE (1UL << (VA_BITS - 3))
+	|			|
+	-------------------------  VA_START
+	|			|
+	|			|
+	|	BIG GAP		|
+	|			|
+	-------------------------  TASK_SIZE_64 (UL(1) << VA_BITS)
+	|			|
+	|			|
+	|	User space	|	
+	|			|
+	------------------------- 0
+
+
+
+
+For ARM,
+in arch/arm/include/asm/memory.h :
+
+#define PAGE_OFFSET		UL(CONFIG_PAGE_OFFSET)
+
+#define TASK_SIZE		(UL(CONFIG_PAGE_OFFSET) - UL(SZ_16M))
+#define TASK_UNMAPPED_BASE	ALIGN(TASK_SIZE / 3, SZ_16M)
+
+And CONFIG_PAGE_OFFSET is :
+
+config PAGE_OFFSET
+        hex
+        default PHYS_OFFSET if !MMU
+        default 0x40000000 if VMSPLIT_1G
+        default 0x80000000 if VMSPLIT_2G
+        default 0xB0000000 if VMSPLIT_3G_OPT
+        default 0xC0000000
+
+So, For ARM, the user space is ajacent to kernel space.
+
+
+the layout maybe like this( I haven't checked the code, just copy from
+some web) :
+
+
+VMALLOC_END        feffffff        Free for platform use, recommended.
+                                VMALLOC_END must be aligned to a 2MB
+                                boundary.
+
+VMALLOC_START        VMALLOC_END-1        vmalloc() / ioremap() space.
+                                Memory returned by vmalloc/ioremap will
+                                be dynamically placed in this region.
+                                VMALLOC_START may be based upon the value
+                                of the high_memory variable.
+
+PAGE_OFFSET        high_memory-1        Kernel direct-mapped RAM region.
+                                This maps the platforms RAM, and typically
+                                maps all platform RAM in a 1:1 relationship.
+
+TASK_SIZE        PAGE_OFFSET-1        Kernel module space
+                                Kernel modules inserted via insmod are
+                                placed here using dynamic mappings.
+
+00001000        TASK_SIZE-1        User space mappings
+                                Per-thread mappings are placed here via
+                                the mmap() system call.
+
+00000000        00000fff        CPU vector page / null pointer trap
+                                CPUs which do not support vector remapping
+                                place their vector page here.  NULL pointer
+                                dereferences by both the kernel and user
+                                space are also caught via this mapping.
+

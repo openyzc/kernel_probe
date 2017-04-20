@@ -1,0 +1,133 @@
+
+ITS parent domain:
+
+its_init_domain() will create a irq_domain with its_domain_ops(struct
+irq_domain_ops), allocate&initialise a struct msi_domain_info node with
+its_msi_domain_ops(struct msi_domain_info node) which will be used by the child
+irq_domain node.
+
+MBIGNE domain(which is a platform msi domain):
+
+its_pmsi_init will create a irq_domain which will build the connection to
+msi_domain_ops(struct irq_domain_ops) with this calling :
+
+	--> platform_msi_create_irq_domain(of_node_to_fwnode(np),
+						    &its_pmsi_domain_info,
+						    parent)
+		--> msi_create_irq_domain(fwnode, info, parent)
+		domain->bus_token = DOMAIN_BUS_PLATFORM_MSI;
+			--> irq_domain_create_hierarchy(parent,
+				IRQ_DOMAIN_FLAG_MSI, 0,
+				fwnode, &msi_domain_ops, info);
+
+Here, a new struct msi_domain_info node(its_pmsi_domain_info) is stored in
+domain->host_data which is same as what had been done in its_init_domain() for
+ITS.
+
+
+=================================================
+
+How to trigger the calling to its_pmsi_prepare()?
+As you known, if its_pmsi_prepare is called, it will get the struct
+msi_domain_info of parent domain and continue the calling to ops->msi_prepare()
+of struct msi_domain_info from parent domain.
+
+static const struct of_device_id mbigen_of_match[] = {
+	{ .compatible = "hisilicon,mbigen-v2" },
+	{ /* END */ }
+};
+
+----> mbigen_device_probe(struct platform_device *pdev)
+for those devices under MBIGEN controller
+	-->  of_platform_device_create(np, NULL, parent)
+	--> platform_msi_create_device_domain(&child->dev, num_pins,
+							   mbigen_write_msg,
+							   &mbigen_domain_ops,
+							   mgn_chip);
+
+In the platform_msi_create_device_domain(), the configure of mbigen children
+will be read to know how many hwirq required, which is the parent irq domain and
+the msi-specifier...
+Such as the below mbigen_uart...
+
+        p0_mbigen_peri_b: interrupt-controller@60080000 {
+                compatible = "hisilicon,mbigen-v2";
+                reg = <0x0 0x60080000 0x0 0x10000>;
+
+                mbigen_uart: uart_intc {
+                        msi-parent = <&p0_its_peri_b 0x120c7>;
+                        interrupt-controller;
+                        #interrupt-cells = <2>;
+                        num-pins = <1>;
+                };
+        };
+
+Especially, the 'msi-parent' makes much sense to setup the irq domain
+hierarchy. As for 'msi-parent', you can refer to
+Documentation/devicetree/bindings/interrupt-controller/msi.txt;
+
+Please note these:
+1) this new irq_domain will be bound with the
+device_node whose compatible string is "arm,gic-v3-its" although
+this compatible string is also used by its_of_probe() during
+the ITS probing(you can refer to irq-gic-v3-its.c);
+2) the domain parent of this new pmis domain is ITS domain;
+
+ok, we repeat how to setup the irq domain relationship:
+
+mbigen_device_probe() will be called when trying to bind the mbigen controller
+whose compatible string is "Hisilicon MBIGEN-V2";
+Then all the children which have "interrupt-controller" and "num-pins" will be
+filtered out to create the corresponding platform msi irq domain;
+	--> child = of_platform_device_create(np, NULL, parent);
+	In this processing, you need to pay more attention about these: 
+		--> of_platform_device_create_pdata
+			--> of_msi_configure(&dev->dev, dev->dev.of_node)
+		there, dev->msi_domain will be set to the parent domain which
+		is defined by 'msi-parent' properties and domain token type is
+		DOMAIN_BUS_PLATFORM_MSI; It should be the irq domain created in
+		drivers/irqchip/irq-gic-v3-its-platform-msi.c by
+		platform_msi_create_irq_domain() --> msi_create_irq_domain() and
+		domain->bus_token = DOMAIN_BUS_PLATFORM_MSI;
+
+	--> platform_msi_create_device_domain(&child->dev, num_pins,
+						   mbigen_write_msg,
+						   &mbigen_domain_ops,
+						   mgn_chip);
+	here, a new irq_domain will be created, and the irq_domain_ops of
+	mbigen_domain_ops will be used with this new irq_domain;
+	mgn_chip will be used as mbigen private data to store some
+	mbigen-relevant info;
+	1) a struct platform_msi_priv_data node will be allocated and
+	initialised, then saved as host_data of this new irq_domain created
+	here:
+		irq_domain_create_hierarchy(dev->msi_domain, 0, nvec,
+				     of_node_to_fwnode(dev->of_node),
+				     ops, data);
+	once again, the dev->msi_domain points to the irq_domain created in
+	irq-gic-v3-its-platform-msi.c;
+		--> msi_domain_prepare_irqs(domain->parent, dev, nvec,
+			&data->arg);
+		1) the first parameter is same as dev->msi_domain of
+		irq_domain_create_hierarchy();
+		2) data->arg will be used to store some important data when
+		ops->msi_prepare() is called in msi_domain_prepare_irqs();
+		3) in msi_domain_prepare_irqs(), the domain->host_data is
+		its_pmsi_domain_info defined in irq-gic-v3-its-platform-msi.c;
+
+	So, the calling sequence is :
+
+	msi_domain_prepare_irqs -> ops->msi_prepare (which is its_pmsi_prepare)
+		--> its_pmsi_prepare
+	in its_pmsi_prepare():
+		-->  msi_info = msi_get_domain_info(domain->parent);
+		This is the struct msi_domain_info which was initialised by
+		its_init_domain().
+		-> So, msi_info->ops is its_msi_domain_ops, 
+			its_msi_prepare() will be called to initilised the ITT
+			for the mbigen child device;
+
+
+
+
+

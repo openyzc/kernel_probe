@@ -1,0 +1,4 @@
+
+bootmem_init(). This calling must be after the paging_init();
+
+

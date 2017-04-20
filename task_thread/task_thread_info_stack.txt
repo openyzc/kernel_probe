@@ -1,0 +1,187 @@
+This article is just to describe the relationships between task_struct,
+thread_info, task stack;
+
+****** When CONFIG_THREAD_INFO_IN_TASK is diabled *******
+In the kernel before CONFIG_THREAD_INFO_IN_TASK is introduced, thread_info is
+not in the task_struct as the first field.
+
+1. The thread_info
+
+The thread_info is defined with task stack and share the same memory segment.
+
+union thread_union {
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info;
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+
+How to get thread_info with a pointer to task_struct?
+
+in include/linux/sched.h :
+
+#ifdef CONFIG_THREAD_INFO_IN_TASK
+static inline struct thread_info *task_thread_info(struct task_struct *task)
+{
+	return &task->thread_info;
+}
+#elif !defined(__HAVE_THREAD_FUNCTIONS)
+# define task_thread_info(task)	((struct thread_info *)(task)->stack)
+#endif
+
+  -- __HAVE_THREAD_FUNCTIONS is only for IA64;
+  -- when CONFIG_THREAD_INFO_IN_TASK is enabled, the thread_info is defined in
+	task_struct, so we can get the thread_info directly;
+	otherwise, we should use the void *stack which had been intialised as
+	pointer to the thread_info&stack sharable space;
+
+So, How to identify the thread_info and stack??
+
+
+
+
+2. stack
+
+
+#define init_stack		(init_thread_union.stack)
+
+in include/linux/sched.h :
+
+union thread_union {
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	struct thread_info thread_info;
+#endif
+	unsigned long stack[THREAD_SIZE/sizeof(long)];
+};
+
+in init/init_task.c :
+
+union thread_union init_thread_union __init_task_data = {
+#ifndef CONFIG_THREAD_INFO_IN_TASK
+	INIT_THREAD_INFO(init_task)
+#endif
+};
+
+So, if CONFIG_THREAD_INFO_IN_TASK isn't enabled, the init_thread_union will be
+initialised with INIT_THREAD_INFO(init_task) by different architectures.
+Otherwise, init_thread_union is used just as thread stack.
+
+
+
+3. task_struct
+
+struct task_struct init_task = INIT_TASK(init_task);
+
+#define INIT_TASK(tsk)	\
+{									\
+	INIT_TASK_TI(tsk)						\
+	.state		= 0,						\
+	.stack		= init_stack,					\
+	.usage		= ATOMIC_INIT(2),				\
+	.flags		= PF_KTHREAD,					\
+	.prio		= MAX_PRIO-20,					\
+	.static_prio	= MAX_PRIO-20,					\
+	.normal_prio	= MAX_PRIO-20,					\
+	.policy		= SCHED_NORMAL,					\
+	.cpus_allowed	= CPU_MASK_ALL,					\
+	.nr_cpus_allowed= NR_CPUS,					\
+	.mm		= NULL,						\
+	.active_mm	= &init_mm,					\
+
+So, the void *stack will be decided by init_stack.
+Based on the analysis of section 2, for task 0, the void *stack points to the
+init_thread_union.stack; Please keep in mind that init_thread_union is defined
+as global separate structure.
+
+============The stack and thread_info==========
+
+task->stack will the minimum stack addr;
+
+For growsup stack:
+
+	-----------------  end of stack (high address)
+	|	 	|
+	|		|
+	|		|
+	|		|
+	|		|
+	-----------------  start of stack (low address)
+	|		|
+	|		|  thread_info (For non CONFIG_THREAD_INFO_IN_TASK)
+	|		|
+	-----------------  task->stack ( &init_stack )
+
+For grows down stack :
+
+	----------------- start of stack (high address)
+	|		|
+	|		|
+	|		|
+	|		|
+	----------------- end of stack (low address)
+	|		|
+	|		| thread_info
+	|		|
+	----------------- task->stack ( &init_stack)
+
+So, you can understand the definiton of end_of_stack() in task_stack.h;
+
+
+====================================
+
+task_struct and thread_info
+
+  thread_info   -----a struct task_struct *task in thread_info -->task_struct
+
+
+
+==============Understand the current()==========
+That macro is defined in current.h;
+It is architecture-dependent, but most are defined like that:
+
+#define current get_current()
+
+
+
+
+
+On arm, in arch/arm/include/asm/thread_info.h :
+register unsigned long current_stack_pointer asm ("sp");
+
+static inline struct thread_info *current_thread_info(void)
+{
+	return (struct thread_info *)
+		(current_stack_pointer & ~(THREAD_SIZE - 1));
+}
+
+So, we can get the thread_info from SP as the stack of ARM is growing down.
+
+
+On arm64, it is a little complicated.
+
+in arch/arm64/kernel/entry.S :
+
+tsk	.req	x28
+ 
+
+This tsk register will points to the current thread_info/task_struct by
+'ldr_this_cpu	tsk, __entry_task, x20' or 'get_thread_info tsk' in entry.S;
+
+in arch/arm64/kernel/entry.S :
+	.macro	get_thread_info, rd
+	mrs	\rd, sp_el0
+	.endm
+
+And sp_el0 will be stored the current task_struct or thread_info as ARM64
+applies the CONFIG_THREAD_INFO_IN_TASK :
+in head.S :
+__primary_switched:
+	......
+	adr_l	x5, init_task
+	msr	sp_el0, x5
+
+You can refer to the patch 'arm64: Store struct task_info in sp_el0';
+or patch-set 'arm64: move thread_info off of the task stack';
+
+
+

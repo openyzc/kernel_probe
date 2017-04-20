@@ -1,0 +1,29 @@
+1. What is HIGHMEM?
+
+You can refer to arch/x86/Kconfig to find the NOHIGHMEM;
+
+config NOHIGHMEM
+        bool "off"
+        ---help---
+          Linux can use up to 64 Gigabytes of physical memory on x86 systems.
+          However, the address space of 32-bit x86 processors is only 4
+          Gigabytes large. That means that, if you have a large amount of
+          physical memory, not all of it can be "permanently mapped" by the
+          kernel. The physical memory that's not permanently mapped is called
+          "high memory".
+
+So, HIGHMEM only makes sense for 32-bit address space systems;
+The highmem is those physical address spaces which are not permanently mapped by
+the kernel.
+
+For 4G address space, the 0 ~3G is for user space, the last 1G is for kernel;
+
+
+2. For ARM64, there is no use of HIGHMEM as its address space is 64 bits.
+
+So, page_address_init() is NULL;
+
+HASHED_PAGE_VIRTUAL will be defined for most systems which support HIGHMEM;
+besides those architectures where WANT_PAGE_VIRTUAL is defined.
+
+

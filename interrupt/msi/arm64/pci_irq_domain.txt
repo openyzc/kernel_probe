@@ -1,0 +1,12 @@
+
+
+devicetree/bindings/pci/pci-msi.txt :
+
+you should refer to "msi-map", "msi-map-mask";
+
+__of_msi_map_rid --> of_pci_map_rid 
+
+
+
+in irq-gic-v3.c :
+gic_acpi_init  --> acpi_set_irq_model(ACPI_IRQ_MODEL_GIC, domain_handle);

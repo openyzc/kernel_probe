@@ -1,0 +1,78 @@
+
+#define FIXADDR_TOP		(PCI_IO_START - SZ_2M)
+
+
+#define __pa_symbol(x)		__phys_addr_symbol(RELOC_HIDE((unsigned
+long)(x), 0))
+
+
+#define RELOC_HIDE(ptr, off)						\
+({									\
+	unsigned long __ptr;						\
+	__asm__ ("" : "=r"(__ptr) : "0"(ptr));				\
+	(typeof(ptr)) (__ptr + (off));					\
+})
+
+This is useful for GCC to avoid the optimization:
+For example if we do something like:
+
+strcpy(tmp, "abc" + LARGE_OFFSET)
+
+GCC could assume that "abc" is a 4 bytes long string, and could assume
+that LARGE_OFFSET points within it, and could optimize this into:
+
+memcpy(tmp, "abc" + LARGE_OFFSET, 4 - LARGE_OFFSET) 
+
+You can refer to this :
+http://www.unixresources.net/linux/clf/linuxK/archive/00/00/71/48/714831.html
+
+
+*** NOTES
+
+arch/arm64/include/asm/assembler.h will define some assembly macros, such as
+str_l, ldr_l;
+
+        .macro  str_l, src, sym, tmp
+#ifndef MODULE
+        adrp    \tmp, \sym
+        str     \src, [\tmp, :lo12:\sym]
+
+So, str_l will store src to sym. tmp is the temporary register.
+
+/* the offset between the kernel virtual and physical mappings */
+extern u64			kimage_voffset;
+
+So, this macro will convert the virtual 'addr' to physical addr:
+
+#define __kimg_to_phys(addr)	((addr) - kimage_voffset)
+
+
+================How to build the page tables for FIXADDR===================
+
+The 0 level page table is defined by this globle variable:
+For arm64, it is in arch/arm64/kernel/vmlinux.lds.S :
+swapper_pg_dir = .
+
+Then in arch/arm64/mm/mmu.c :
+
+static pte_t bm_pte[PTRS_PER_PTE] __page_aligned_bss;
+static pmd_t bm_pmd[PTRS_PER_PMD] __page_aligned_bss __maybe_unused;
+static pud_t bm_pud[PTRS_PER_PUD] __page_aligned_bss __maybe_unused;
+
+These three tables are used to setup the page tables.
+PUD is 1st, PMD is 2nd, PTE is 3rd;
+
+As fixadd range is not so big, normally, only one valid entry in bm_pud.
+
+This BUILD_BUG_ON will check this:
+
+	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
+		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
+
+early_fixmap_init() will setup the corresponding page tables for FIXADDR space;
+
+*** NOTES***
+early_fixmap_init() only setup the 1st(PUD), 2nd(PMD) tables.
+The PTEs hasn't been initialised with valid entries which correspond physical
+pages.
+

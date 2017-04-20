@@ -1,0 +1,5 @@
+
+start_kernel() --> setup_per_cpu_areas()
+
+
+

@@ -1,0 +1,182 @@
+We only discuss gic v3/v4 driver based on ACPI here.
+
+1.  The globl variable of acpi_data
+
+static struct
+{
+	void __iomem *dist_base;
+	struct redist_region *redist_regs;
+	u32 nr_redist_regions;
+	bool single_redist;
+	u32 maint_irq;
+	int maint_irq_mode;
+	phys_addr_t vcpu_base;
+} acpi_data __initdata;
+
+1.1) acpi_data.nr_redist_regions is set in acpi_validate_gic_table()
+acpi_validate_gic_table() will parse the MADT, to count how many GIC
+REDISTRIBUTOR or whether GICC with Redistributor base address exists.
+For the front case, acpi_data.single_redist = false and
+acpi_data.nr_redist_regions = count; otherwise,
+acpi_data.single_redist = true;
+
+One more thing noted, ape->dirver_data is assigned by the fourth parameter of
+macro IRQCHIP_ACPI_DECLARE() to represent the GIC version;
+
+1.2) The *redist_regs is allocated by gic_acpi_init(), but initialized by
+gic_acpi_collect_gicr_base() --> acpi_table_parse_madt(type, redist_parser, 0)
+--> gic_acpi_parse_madt_gicc  or gic_acpi_parse_madt_redist
+
+For D03/05, ACPI firmware applies the GIC CPU Interface (GICC) Structure(whose
+type is 0x0B), propably because GIC Redistributors aren't in the always-on power
+domain. Otherwise, should config the GIC Redistributor (GICR) Structure(whose
+type is 0xE).
+
+If you want to check how the MADT table is defined, please refer to this:
+
+OpenPlatformPkg/Chips/Hisilicon/Hi1616/D05AcpiTables/MadtHi1616.aslc
+
+EmbeddedPkg/Include/Library/AcpiLib.h:56:#define
+EFI_ACPI_5_1_GICC_STRUCTURE_INIT
+
+MdePkg/Include/IndustryStandard/Acpi51.h:319:#define EFI_ACPI_5_1_GIC
+
+2. static struct gic_chip_data gic_data __read_mostly;
+
+struct gic_chip_data {
+	struct fwnode_handle	*fwnode;
+	void __iomem		*dist_base;
+	struct redist_region	*redist_regions;
+	struct rdists		rdists;
+	struct irq_domain	*domain;
+	u64			redist_stride;
+	u32			nr_redist_regions;
+	unsigned int		irq_nr;
+	struct partition_desc	*ppi_descs[16];
+};
+
+This static gic_data is initialized in gic_init_bases().
+
+	gic_data.fwnode = handle;
+	gic_data.dist_base = dist_base;
+	gic_data.redist_regions = rdist_regs;
+	gic_data.nr_redist_regions = nr_redist_regions;
+	gic_data.redist_stride = redist_stride;
+
+among those fields, fwnode points to the struct fwnode_handle which is allocated
+by irq_domain_alloc_fwnode(acpi_data.dist_base), where, the fwnode.type is
+FWNODE_IRQCHIP and void *data points to acpi_data.dist_base;
+
+gic_data.irq_nr will set as the INTIDs of SGI + PPI + SPI; It should not be
+bigger than 1020;
+
+	gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
+						 &gic_data);
+
+I think the most important field is 'struct rdists           rdists;'
+
+3. struct rdists rdists in gic_data
+
+The struct rdists is defined in include/linux/irqchip/arm-gic-v3.h :
+
+struct rdists {
+	struct {
+		void __iomem	*rd_base; /* initialized by gic_populate_rdist*/
+		struct page	*pend_page; /*its_cpu_init-->its_cpu_init_lpis*/
+		phys_addr_t	phys_base; /*initialized by gic_populate_rdist*/
+	} __percpu		*rdist;
+	struct page		*prop_page; /* its_init-->its_alloc_lpi_tables*/
+	int			id_bits;
+	u64			flags;
+};
+
+	gic_data.rdists.rdist = alloc_percpu(typeof(*gic_data.rdists.rdist));
+
+struct page *prop_page is corresponding to the LPI configure table. You can
+refer to the GIC v3 spec:
+
+LPI priority and enable bits programmed in the LPI Configuration table. The
+address of the LPI Configuration table is defined by GICR_PROPBASER.
+
+struct page *pend_page is corresponding to the LPI pending table. Please refer
+to the GIC v3 spec:
+
+Memory-backed storage for LPI pending bits in an LPI Pending table. This table
+is specific to a particular Redistributor. The address of the LPI Pending table is defined by GICR_PENDBASER.
+
+
+4. Some variables and structures for ITS
+
+static struct irq_domain *its_parent;
+	in its_init(): its_parent = parent_domain;
+	So, its_parent points to the fwnode_handle which was stored in
+	'gic_data.fwnode';
+
+static LIST_HEAD(its_nodes);
+static DEFINE_SPINLOCK(its_lock);
+
+The struct its_node node will be linked into this list by its_probe_one().
+
+in drivers/irqchip/irq-gic-v3-its.c :
+
+static struct rdists *gic_rdists;
+#define gic_data_rdist()		(raw_cpu_ptr(gic_rdists->rdist))
+#define gic_data_rdist_rd_base()	(gic_data_rdist()->rd_base)
+
+in its_init(),
+	gic_rdists = rdists;
+	here, the 'rdists' is '&gic_data.rdists' when its_init() is called.
+	so, gic_rdists is for convenience to apply 'gic_data.rdists';
+	But the per-cpu pointer is initialized by gic_cpu_init() -->
+	gic_populate_rdist() later;
+	Please keep in mind that, gic_rdists is only for its driver. For GIC v3
+	driver, no this variable of 'gic_rdists';
+
+in drivers/irqchip/irq-gic-v3.c :
+#define gic_data_rdist()		(this_cpu_ptr(gic_data.rdists.rdist))
+
+
+
+---------The structures------
+in drivers/irqchip/irq-gic-v3-its.c :
+
+struct its_node {
+	raw_spinlock_t		lock;
+	struct list_head	entry;
+	void __iomem		*base;  /*The virtual ITS_base */
+	phys_addr_t		phys_base; /*The physical ITS_base */
+	struct its_cmd_block	*cmd_base; /*The virtual base of cmd queue */
+	struct its_cmd_block	*cmd_write;
+	struct its_baser	tables[GITS_BASER_NR_REGS];
+	struct its_collection	*collections; /* its_alloc_collections */
+	struct list_head	its_device_list;
+	u64			flags;
+	u32			ite_size; /* ITT_entry_size of GITS_TYPER*/
+	u32			device_ids; /* Devbits of GITS_TYPER */
+	int			numa_node;
+};
+
+
+The structure is specific for ITS_BASER[8].
+You can refer to its_alloc_tables().
+
+struct its_baser {
+	void		*base;
+	u64		val;
+	u32		order;
+	u32		psz;
+};
+
+This structure is only used during the Redistributor probing.
+
+5. IORT & ITS
+
+in drivers/irqchip/iort.c :
+
+static LIST_HEAD(iort_msi_chip_list);
+static DEFINE_SPINLOCK(iort_msi_chip_lock);
+
+
+In this list, struct iort_its_msi_chip will be linked.
+
+

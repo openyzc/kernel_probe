@@ -1,0 +1,25 @@
+
+1. struct msi_desc
+
+defined in include/linux/msi.h;
+this should be the most important structure of MSI.
+
+msix_capability_init --> msix_map_region
+will initialise part of this structure.
+
+this struct node will be linked like that:
+
+in msix_setup_entries():
+list_add_tail(&entry->list, dev_to_msi_list(&dev->dev));
+
+in struct device of device.h, there is a list:
+
+#ifdef CONFIG_GENERIC_MSI_IRQ
+	struct list_head	msi_list;
+#endif
+
+That is the right place where the struct msi_desc node is linked.
+
+A macro of for_each_pci_msi_entry(entry, dev) is introduced to traverse this
+list.
+

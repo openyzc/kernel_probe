@@ -1,0 +1,19 @@
+
+
+paging_init() will finish this work.
+
+Before this function, there are three page mapping:
+
+1. idmap for the early boot code/data calling;
+2. kernel image in swapper_pg_dir and the later pages;
+3. fixadd mapping in bm_pud[], bm_pmd[], bm_pte[];
+
+Please note, during the procedure of full page tables setup, we can not
+directly use these above page tables to allocate the pages for the new page
+tables. We only can use FIX_PTE to FIX_PGD to store all the temporary page
+tables and set those physical pages.
+
+After all new page tables are ready, then we can update the ttbl1 with
+swapper_pg_dir; Then everything is OK at that moment.
+
+

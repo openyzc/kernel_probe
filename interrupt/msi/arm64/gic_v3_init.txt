@@ -1,0 +1,115 @@
+
+We only concern the ACPI mode.
+
+IRQCHIP_ACPI_DECLARE(gic_v3, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V3,
+		     gic_acpi_init);
+IRQCHIP_ACPI_DECLARE(gic_v4, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V4,
+		     gic_acpi_init);
+
+
+gic_acpi_init(struct acpi_subtable_header *header, const unsigned long end)
+
+--> gic_init_bases --> its_init
+
+		--> gic_dist_init
+		--> gic_cpu_init
+
+1. its_init(handle, &gic_data.rdists, gic_data.domain)
+
+
+1.1 --> its_acpi_probe();
+
+static void __init its_acpi_probe(void)
+{
+	acpi_table_parse_madt(ACPI_MADT_TYPE_GENERIC_TRANSLATOR,
+			      gic_acpi_parse_madt_its, 0);
+}
+
+The functionality of its_acpi_probe is to process the 'GIC Interrupt Translation
+Service (ITS)' of MADT.
+
+A new struct fwnode_handle will be created for its specially.
+The its base address(physical) will be stored in fwnode_handle as void *data;
+
+
+	--> its_probe_one
+	* will ioremap the Redistributor register. The ITS address map consists
+	of two separate 64KB frame pages:
+	* The control registers. which are located at ITS_base + 0x00;
+	* The interrupt translation space, which is located at ITS_base +
+	0x10000;
+
+		--> its_alloc_tables(its)
+			--> its_setup_baser
+		Will read the configurations in GITS_TYPER, such as DEVBITS;
+		Then try to configure GITS_BASER in a probing mode to decide the
+		cache, shareability, page_size, size, etc.
+
+	Please keep in mind that only DEV Table, COLLECTION table, vPE table are
+	supported by GITS_BASER[];
+
+		--> its_alloc_collections(its)
+			allocate the struct its_collection for its->collections;
+		--> configure the GITS_CBASER
+		Please note the page is 4K for GITS_CBASER;
+		--> its_init_domain(handle, its)
+		here, handle is the fwnode_handle created specially for its when
+		gic_acpi_parse_madt_its() is called.
+		In its_init_domain(), a new struct irq_domain node will be
+		created with irq_domain_create_tree(handle, &its_domain_ops,
+		its) and a struct msi_domain_info will be initialized with
+		binding to its_msi_domain_ops and struct its_node :
+
+				info->ops = &its_msi_domain_ops;
+				info->data = its;
+				inner_domain->host_data = info;
+		And the last thing mentioned here is the parent irq_domain is:
+			inner_domain->parent = its_parent;
+		the its_parent is initialized by these code:
+
+	gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
+						 &gic_data);
+
+2. gic_dist_init() for Distributor
+
+To be more accurate, gic_dist_init() is for SPI.
+
+ARE_NS = 1, All SPIs are configured as level triggered, active low; All active
+status will be cleared before enabling the ARE_NS.
+And, all those SPI will be routed to boot CPU defaultly:
+
+	affinity = gic_mpidr_to_affinity(cpu_logical_map(smp_processor_id()));
+	for (i = 32; i < gic_data.irq_nr; i++)
+		gic_write_irouter(affinity, base + GICD_IROUTER + i * 8);
+
+3. gic_cpu_init() for CPU interfaces
+
+This process will perform all per-cpu relevant initialization.
+
+	--> gic_populate_rdist()
+	will setup the binding between (this_cpu_ptr(gic_data.rdists.rdist)) and
+	gic_data.redist_regions[i].redist_base; That is to say, the cpu pointer
+	of gic_data.rdists.rdist will be bound with gic_data.redist_regions[]
+	whose mpidr is equal to the one configured in GICR_TYPER of some
+	Redistributor detected before.
+	--> gic_enable_redist(true)
+	enabling the Redistributor;
+	--> configure SGI/PPI with GICR_IGROUPR0, GICR_ICACTIVER0,
+	GICR_ICENABLER0, GICR_ISENABLER0, GICR_IPRIORITYR[0~7];
+	--> its_cpu_init();
+		--> its_cpu_init_lpis()
+	This is for LPIs; important for its;
+	will configure GICR_PROPBASER, GICR_PENDBASER for LPI configuration
+	tables; Then enable LPI with GICR_CTLR;
+		--> its_cpu_init_collection()
+		traverse whole its_nodes list and initialized collections[] of
+		each its node. For each its node, will call these to finish the
+		conllection tables setting:
+			its_send_mapc(its, &its->collections[cpu], 1);
+			its_send_invall(its, &its->collections[cpu]);
+
+
+
+

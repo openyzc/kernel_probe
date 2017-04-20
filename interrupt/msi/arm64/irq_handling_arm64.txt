@@ -1,0 +1,44 @@
+
+
+1. Some major kernel config items
+
+config PCI_MSI_IRQ_DOMAIN
+        def_bool ARC || ARM || ARM64 || X86
+        depends on PCI_MSI
+        select GENERIC_MSI_IRQ_DOMAIN
+
+config GENERIC_MSI_IRQ_DOMAIN
+        bool
+        select IRQ_DOMAIN_HIERARCHY
+        select GENERIC_MSI_IRQ
+
+So, for ARM64, IRQ_DOMAIN_HIERARCHY is enabled.
+
+arch/arm64/Kconfig:115:	select SPARSE_IRQ
+
+So, SPARSE_IRQ is also enabled.
+
+As for the DTS, you can refer to this file:
+Documentation/devicetree/bindings/interrupt-controller/arm,gic-v3.txt
+
+in arch/arm64/Kconfig :
+select ARM_GIC_V2M if PCI
+
+So, the irq-gic-v2m.c will be built for ARM64.
+
+2. The generic IRQ handling
+
+set the global variable of handle_arch_irq:
+
+set_handle_irq(gic_handle_irq);
+
+gic_handle_irq(struct pt_regs *regs) -->
+	--> handle_domain_irq(gic_data.domain, irqnr, regs)
+	--> handle_IPI(irqnr, regs);
+		this is specific for SGI/IPI;
+
+	handle_domain_irq --> __handle_domain_irq(domain, hwirq, true, regs)
+		--> irq = irq_find_mapping(domain, hwirq)
+		--> generic_handle_irq(irq)
+
+

@@ -1,0 +1,244 @@
+The official specification is PCI Local Bus Specificaton, you can refer to 6.8
+for the MSI/MSI-X.
+
+As for the kernel driver, you can refer to MSI-HOWTO.txt;
+Where there are some generic description.
+
+As for the PCIE capability structure, you can refer to:
+
+7.8. PCI Express Capability Structure
+7.9. PCI Express Extended Capabilities
+
+The 7.8 structure is in configure space. 7.9 is at the base of extended
+configuration region(offset 256) or Root Complex Register Block (RCRB).
+
+You can refer to set_pcie_port_type() to know how to parse the PCIE Capability
+structure with the 7.8.2 PCI Express Capabilities Register (Offset 02h);
+
+
+pci_scan_device(struct pci_bus *bus, int devfn) -->
+pci_setup_device(struct pci_dev *dev) --> set_pcie_port_type(dev)
+
+will initialise the pdev->pcie_flags_reg as PCIE capability.
+
+
+1. The msi probing
+
+device_initcall(pcie_portdrv_init) -->
+		pcie_port_bus_register()
+		pci_register_driver(&pcie_portdriver)
+
+So, when pci_dev passes the match() of pci_bus_type, whose match() is
+pci_bus_match --> pci_match_device().
+Then pci_device_probe() -->
+pcie_portdrv_probe(struct pci_dev *dev,
+			const struct pci_device_id *id)
+---> pcie_port_device_register(dev)
+	--> get_port_device_capability(dev); /* will return the sevices capa. */
+	--> pcie_init_service_irqs(dev, irqs, capabilities);
+
+
+
+2. how to get the msi domain
+
+msix_capability_init / msi_capability_init --> pci_msi_setup_msi_irqs
+
+We should focus on pci_msi_setup_msi_irqs().
+
+For non-x86, I think should follow this path:
+
+  pci_msi_setup_msi_irqs --> 	if (domain && irq_domain_is_hierarchy(domain))
+		return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
+
+  The irq_domain corresponding to the pci_dev must be set befor this.
+  You can refer to the 2.1 section below.
+
+For x86, should :
+  arch_setup_msi_irqs(dev, nvec, type) -> x86_msi.setup_msi_irqs(dev, nvec,
+type) --> native_setup_msi_irqs --> irq_remapping_get_irq_domain(&info)
+
+  I think for non-IOMMU scenario, irq_remapping_get_irq_domain will return NULL.
+So,
+	if (domain == NULL)
+		domain = msi_default_domain;
+and
+	return msi_domain_alloc_irqs(domain, &dev->dev, nvec);
+
+The corresponding struct msi_domain_info of msi_default_domain is
+pci_msi_domain_info.
+
+Ok, It is time to switch to msi_domain_alloc_irqs() which is common for all
+architectures. We will continue this in section 2.3;
+
+
+Two calling chains which will set the msi_domain of struct device:
+
+2.1 pci_device_add --> pci_set_msi_domain(struct pci_dev *dev) -->
+pci_dev_msi_domain --> pci_msi_get_device_domain
+
+For OF, "msi-map" and "msi-map-mask" will be used to setup the relationship
+between RID(for PCI, BFD will be converted to RID) and MSI controller(then you
+can find the corresponding irq_domain);
+
+you can refer to the arch/arm64/boot/dts/hisilicon/hip07.dtsi, for PCIE RC,
+after pci_msi_get_device_domain --> of_msi_map_get_device_domain() will find the
+struct device_node whose handler was defined by 'msi-map = <0x8000 &p0_its_dsa_a
+0x8000 0x800>;' for PCI bus range [0x80, 0x87]. Please note the RID of PCIE is
+BDF of the RC which will be traversed by pci_for_each_dma_alias(pdev,
+get_msi_id_cb, &rid);
+
+For this &p0_its_dsa_a, it corresponds to :
+
+                p0_its_dsa_a: interrupt-controller@c6000000 {
+                        compatible = "arm,gic-v3-its";
+                        msi-controller;
+                        #msi-cells = <1>;
+                        reg = <0x0 0xc6000000 0x0 0x40000>;
+                };
+
+And this node will register the irq_domain by its_pci_of_msi_init -->
+its_pci_msi_init_one --> pci_msi_create_irq_domain(handle,
+		&its_pci_msi_domain_info, parent) -->
+	msi_create_irq_domain(fwnode, info, parent)
+
+So, for this msi-controller, the corresponding msi_domain_info is
+its_pci_msi_domain_info + its_pci_msi_ops;
+And the struct irq_domain_ops is msi_domain_ops;
+Please refer to irq-gic-v3-its-pci-msi.c;
+
+
+
+--------------------------------------
+
+For ACPI, will apply IORT table;
+	iort_get_device_domain(&pdev->dev, rid);
+
+2.2  pci_set_bus_msi_domain(struct pci_bus *bus) -->
+pci_host_bridge_msi_domain()
+
+For OF, of_msi_get_domain(&bus->dev, bus->dev.of_node, DOMAIN_BUS_PCI_MSI) will
+parse the "msi-parent", "#msi-cells" to know the handler of msi controller, then
+irq_find_matching_host(args.np, token) can find the matching irq_domain in
+irq_domain_list;
+If there are no "msi-parent", irq_find_matching_host() will try to search the
+matching node in irq_domain_list with the device fwnode and DOMAIN_BUS_PCI_MSI;
+
+If all avove failed, then try this specific for x86:
+	struct fwnode_handle *fwnode = pci_root_bus_fwnode(bus);
+	pci_root_bus_fwnode ----> _pci_root_bus_fwnode
+
+But I can't find where to set sd->fwnode on x86 at this moment yet.
+Need more time.....
+
+
+2.3 msi_domain_alloc_irqs
+
+struct msi_alloc_info {
+	struct msi_desc			*desc;
+	irq_hw_number_t			hwirq;
+	union {
+		unsigned long		ul;
+		void			*ptr;
+	} scratchpad[NUM_MSI_ALLOC_SCRATCHPAD_REGS];
+} msi_alloc_info_t;
+
+2.3.1 OF (non-x86)
+
+For GICv3, the major domain data structures are msi_domain_ops,
+its_pci_msi_domain_info, its_pci_msi_ops;
+
+
+1) msi_domain_prepare_irqs
+
+	ret = ops->msi_check(domain, info, dev);
+	if (ret == 0)
+		ret = ops->msi_prepare(domain, dev, nvec, arg);
+
+The ops->msi_check should be pci_msi_domain_check_cap;
+For ARM64, ops->msi_prepare is its_pci_msi_prepare of its_pci_msi_ops;
+
+Then from its_pci_msi_prepare, the its_msi_prepare of its_msi_domain_ops will be
+called in the end.
+All these are intialised by its_init_domain() of irq-gic-v3-its.c;
+Then DEV table and ITT are setup there.
+
+2) The calling of ops->set_desc
+
+	for_each_msi_entry(desc, dev) {
+		ops->set_desc(&arg, desc);
+
+For ARM64, there is no set_desc hook in its_pci_msi_ops, so,
+ops->set_desc will be set as pci_msi_domain_set_desc by
+pci_msi_domain_update_dom_ops;
+
+After ops->set_desc(&arg, desc), arg->hwirq will be set;
+
+	arg->hwirq =
+		pci_msi_domain_calc_hwirq(msi_desc_to_pci_dev(desc),
+					       desc);
+
+3) __irq_domain_alloc_irqs
+
+This function is very important.
+
+	virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+				       dev_to_node(dev), &arg, false,
+				       desc->affinity);
+Here, the input paramter of realloc is FALSE.
+	--> irq_domain_alloc_descs
+	this function will allocate the continguous virq and their corresponding
+	irq_desc nodes will be added to irq_desc_tree when CONFIG_SPARSE_IRQ is
+	enabled.
+   Please note that
+   ** when first parameter of virq < 0, the virq allocation can
+   start from any virq number(but it is strange the allocation can't start from
+   ZERO); otherwise, the allocation must start from virq.
+   ** The virq is the key ID to search irq_desc_tree for CONFIG_SPARSE_IRQ;
+
+	--> irq_domain_alloc_irq_data(domain, virq, nr_irqs)
+	This function will allocate irq_data for each domain parent;
+	All these parent domain irq_data will be linked as single link by this:
+		child->parent_data = irq_data;
+
+	--> irq_domain_alloc_irqs_recursive
+	Here, domain->ops->alloc(domain, irq_base, nr_irqs, arg); will be
+	called.
+	For ARM64, here domain->ops is msi_domain_ops, so msi_domain_alloc will
+	be called.
+		---> msi_domain_alloc;
+		hwirq = ops->get_hwirq(info, arg);
+		as no get_hwirq hook in its_pci_msi_ops, so, ops->get_hwirq will
+		be set as msi_domain_ops_default.get_hwirq in
+		msi_domain_update_dom_ops, and --> msi_domain_ops_get_hwirq
+			return arg->hwirq;
+		----> irq_find_mapping(domain, hwirq)
+			check whether the hwirq had been mapped;
+		----> irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg)
+			be recursive to the parent domain, which means the
+			parent will be performed domain->ops->alloc() firstly;
+		----> 	for (i = 0; i < nr_irqs; i++) {
+		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
+			-----> msi_domain_ops_init
+			irq_domain_set_hwirq_and_chip will initialse the
+		irq_data to setup the mapping between hwirq and linux irq;
+		And the irq_data->chip = chip ? chip : &no_irq_chip;
+		which means irq_data->chip will be initialised with msi
+		controller's chip;
+
+??? Why irq_startup(desc, true) will be called in __irq_do_set_handler??
+
+
+
+
+
+
+
+
+
+
+
+2.3.2 x86 msi
+
+msi_default_domain
+
+

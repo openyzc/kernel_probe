@@ -1,0 +1,458 @@
+The driver file is drivers/irqchip/irq-gic-v3.c
+
+
+The current driver supports dts and ACPI. Here we only trace the ACPI at first.
+
+
+IRQCHIP_ACPI_DECLARE(gic_v3, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V3,
+		     gic_acpi_init);
+IRQCHIP_ACPI_DECLARE(gic_v4, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V4,
+		     gic_acpi_init);
+IRQCHIP_ACPI_DECLARE(gic_v3_or_v4, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_NONE,
+		     gic_acpi_init);
+
+This macro is defined as(in include/linux/irqchip.h):
+
+#define IRQCHIP_ACPI_DECLARE(name, subtable, validate, data, fn)	\
+	ACPI_DECLARE_PROBE_ENTRY(irqchip, name, ACPI_SIG_MADT, 		\
+				 subtable, validate, data, fn)
+
+and in include/linux/acpi.h :
+
+struct acpi_probe_entry {
+	__u8 id[ACPI_TABLE_ID_LEN];
+	__u8 type;
+	acpi_probe_entry_validate_subtbl subtable_valid;
+	union {
+		acpi_tbl_table_handler probe_table;
+		acpi_tbl_entry_handler probe_subtbl;
+	};
+	kernel_ulong_t driver_data;
+};
+
+#define ACPI_DECLARE_PROBE_ENTRY(table, name, table_id, subtable, valid, data,
+fn)	\
+	static const struct acpi_probe_entry __acpi_probe_##name	\
+		__used __section(__##table##_acpi_probe_table)		\
+		 = {							\
+			.id = table_id,					\
+			.type = subtable,				\
+			.subtable_valid = valid,			\
+			.probe_table = (acpi_tbl_table_handler)fn,	\
+			.driver_data = data, 				\
+		   }
+Here, the '__used' has description in GCC manual:
+
+unused This attribute, attached to a variable, means that the variable is meant
+to be possibly unused. GCC does not produce a warning for this variable.
+used This attribute, attached to a variable with static storage, means that the
+variable must be emitted even if it appears that the variable is not referenced.
+
+
+So, for gic_v3, the macro will be expanded as :
+
+static const struct acpi_probe_entry __acpi_probe_gic_v3	\
+		__used __section(__irqchip_acpi_probe_table)	\
+		= {						\
+			.id = ACPI_SIG_MADT,			\
+			.type = ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,	\
+			.subtable_valid = acpi_validate_gic_table,	\
+			.probe_table = gic_acpi_init,		\
+			.driver_data = ACPI_MADT_GIC_VERSION_V3,	\
+		}
+
+
+Q1. How .probe_table is called?
+
+In include/asm-generic/vmlinux.lds.h :
+
+#ifdef CONFIG_ACPI
+#define ACPI_PROBE_TABLE(name)						\
+	. = ALIGN(8);							\
+	VMLINUX_SYMBOL(__##name##_acpi_probe_table) = .;		\
+	KEEP(*(__##name##_acpi_probe_table))				\
+	VMLINUX_SYMBOL(__##name##_acpi_probe_table_end) = .;
+#else
+......
+
+#define INIT_DATA
+......
+	IRQCHIP_OF_MATCH_TABLE()		\
+	ACPI_PROBE_TABLE(irqchip)		\
+	ACPI_PROBE_TABLE(clksrc)		\
+	ACPI_PROBE_TABLE(iort)			\
+	EARLYCON_TABLE()
+
+So, the symbol __irqchip_acpi_probe_table will point to the start of section of
+__irqchip_acpi_probe_table and __irqchip_acpi_probe_table_end points to the end
+of that section.
+
+
+As for the ld macro of KEEP(), in 'The GNU linker' manual
+(https://www.eecs.umich.edu/courses/eecs373/readings/Linker.pdf) has these
+descriptions:
+
+When link-time garbage collection is in use (‘--gc-sections’), it is often
+useful to mark sections that should not be eliminated. This is accomplished by
+surrounding an input section's wildcard entry with KEEP(), as in KEEP(*(.init))
+or KEEP(SORT_BY_NAME(*)(.ctors)).
+
+-------------------------
+In include/linux/acpi.h, there are:
+
+#define acpi_probe_device_table(t)					\
+	({ 								\
+		extern struct acpi_probe_entry ACPI_PROBE_TABLE(t),	\
+			                       ACPI_PROBE_TABLE_END(t);	\
+		__acpi_probe_device_table(&ACPI_PROBE_TABLE(t),		\
+					  (&ACPI_PROBE_TABLE_END(t) -	\
+					   &ACPI_PROBE_TABLE(t)));	\
+	})
+
+So, the processing on all the entries of __irqchip_acpi_probe_table will be
+triggered by acpi_probe_device_table().
+
+In drivers/irqchip/irqchip.c, there is:
+
+void __init irqchip_init(void)
+{
+	of_irq_init(__irqchip_of_table);
+	acpi_probe_device_table(irqchip);
+}
+
+start_kernel() --> init_IRQ() --> irqchip_init();
+
+Then __acpi_probe_device_table() will be called to process each entry of
+__irqchip_acpi_probe_table section.
+
+int __init __acpi_probe_device_table(struct acpi_probe_entry *ap_head, int nr)
+{
+...
+	for (ape = ap_head; nr; ape++, nr--) {
+		if (ACPI_COMPARE_NAME(ACPI_SIG_MADT, ape->id)) {
+			acpi_probe_count = 0;
+			acpi_table_parse_madt(ape->type, acpi_match_madt, 0);
+			count += acpi_probe_count;
+		} else {
+			int res;
+			res = acpi_table_parse(ape->id, ape->probe_table);
+			if (!res)
+				count++;
+		}
+	}
+...
+}
+
+So, (ACPI_COMPARE_NAME(ACPI_SIG_MADT, ape->id)) will be entered and the
+following calling sequeces will happen:
+
+acpi_table_parse_madt(ape->type, acpi_match_madt, 0); --->
+acpi_table_parse_entries --> acpi_table_parse_entries_array(char *id,
+ --> acpi_parse_entries_array --> proc[i].handler
+
+proc[i].handler(entry, table_end) is acpi_match_madt here.
+
+static int __init acpi_match_madt(struct acpi_subtable_header *header,
+				  const unsigned long end)
+{
+	if (!ape->subtable_valid || ape->subtable_valid(header, ape))
+		if (!ape->probe_subtbl(header, end))
+			acpi_probe_count++;
+
+	return 0;
+}
+
+So, for the matched acpi table, will call ape->probe_subtbl(header, end) to
+process each configuration in the table till the end of the table(where the
+'end' is the offset from the table start).
+
+Here, ape->subtable_valid for gic-v3/gic-v4 is acpi_validate_gic_table(),
+ape->probe_subtbl is gic_acpi_init().
+
+each successful acpi_match_madt() will increase acpi_probe_count by 1.
+
+
+Q2. What will be presented in MADT?
+
+You can refer to the MADT (5.2.12 in ACPI spec 6.1);
+
+The corresponding structures defined in kernel are:
+
+1) The MADT HEADER
+struct acpi_table_madt {
+	struct acpi_table_header header;	/* Common ACPI table header */
+	u32 address;		/* Physical address of local APIC */
+	u32 flags;
+};
+
+2) Interrupt Controller structure[n]
+
+Just after the MADT HEADER, there is a interrupt controller structure array.
+
+each array entry has:
+struct acpi_subtable_header {
+	u8 type;
+	u8 length;
+};
+
+And the type is defined in ACPI Table 5-46 Interrupt Controller Structure Types;
+Each structure type has different structure definition.
+So, this checking is to pick up the interrupt controller structure your
+interrrupt controller applies.
+
+if (entry->type != proc[i].id)
+
+
+acpi_table_parse_madt(enum acpi_madt_type id,
+	      acpi_tbl_entry_handler handler, unsigned int max_entries)
+
+will parse the MADT table to find the matched interrupt controller structure
+with the input 'id'. max_entries 0 means finding all the matched interrupt
+controller structures.
+For each matched entry, the acpi_tbl_entry_handler handler will be called.
+
+For GIC of ARM64, these interrupt controller types are supported:
+
+0xB GIC CPU Interface (GICC) yes no Section 5.2.12.14
+0xC GIC Distributor (GICD) no no Section 5.2.12.15
+0xD GIC MSI Frame no no Section 5.2.12.16
+0xE GIC Redistributor (GICR) no no Section 5.2.12.17
+0xF GIC Interrupt Translation Service (ITS) no no Section 5.2.12.18
+
+
+As for how to define these data in ACPI, we can refer to:
+
+EmbeddedPkg/Include/Library/AcpiLib.h
+and OpenPlatformPkg/Chips/Hisilicon/Hi1616/D05AcpiTables/MadtHi1616.aslc
+
+The type is defined something like that:
+
+MdePkg/Include/IndustryStandard/Acpi51.h:319:#define EFI_ACPI_5_1_GIC
+0x0B
+
+Q3. How to parse the MADT?
+
+acpi_probe_device_table --> __acpi_probe_device_table(struct acpi_probe_entry
+*ap_head, int nr) --> acpi_table_parse_madt(ape->type, acpi_match_madt, 0);
+
+will process each struct acpi_probe_entry defined by IRQCHIP_ACPI_DECLARE;
+
+int __init
+acpi_table_parse_madt(enum acpi_madt_type id,
+		      acpi_tbl_entry_handler handler, unsigned int max_entries)
+{
+	return acpi_table_parse_entries(ACPI_SIG_MADT,
+					    sizeof(struct acpi_table_madt), id,
+					    handler, max_entries);
+}
+
+Here, the id is from the 'type' of struct acpi_probe_entry. For gic-v3, it is
+ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR.
+
+---->>
+int __init
+acpi_table_parse_entries(char *id,
+			unsigned long table_size,
+			int entry_id,
+			acpi_tbl_entry_handler handler,
+			unsigned int max_entries)
+{
+	struct acpi_subtable_proc proc = {
+		.id		= entry_id,
+		.handler	= handler,
+	};
+
+	return acpi_table_parse_entries_array(id, table_size, &proc, 1,
+						max_entries);
+}
+
+please note that the '1' is corresponding to the size of 'struct
+acpi_subtable_proc proc';
+
+And the proc.id will be compared with the 'type' of struct acpi_subtable_header
+which is from the MADT. It is in acpi_parse_entries_array() :
+	while (((unsigned long)entry) + sizeof(struct acpi_subtable_header) <
+	       table_end) {
+		if (max_entries && count >= max_entries)
+			break;
+
+		for (i = 0; i < proc_num; i++) {
+			if (entry->type != proc[i].id)
+				continue;
+			if (!proc[i].handler ||
+			     (!errs && proc[i].handler(entry, table_end))) {
+				errs++;
+				continue;
+			}
+
+			proc[i].count++;
+			break;
+		}
+So, the max_entries is ZERO means traverse all the interrupt controller
+structure in MADT.
+
+ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR is corresponding to
+0xC GIC Distributor (GICD); This is the entry point of GICv3, GICv4.
+
+At this moment, we can start the gic_acpi_init().
+
+Q4. The analysis on gic_acpi_inint()
+
+1. basic GIC address fetching
+
+Just as the above said, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR is 12, which is
+corresponding to the 0xC GIC Distributor(GICD) listed in Table 5-46 Interrupt
+Controller Structure Types.
+
+Then you can refer to 5.2.12.15 GIC Distributor (GICD) Structure where the
+detail about Interrupt Controller Structure in Table 5-63;
+
+The corresponding structure definition in kernel is struct
+acpi_madt_generic_distributor. And in UEFI side, it is defined in
+EFI_ACPI_6_0_GIC_DISTRIBUTOR_ST of MdePkg/Include/IndustryStandard/Acpi60.h;
+
+----->Back to the driver
+
+static struct
+{
+	void __iomem *dist_base; /* This is GICD base, size 64K */
+	struct redist_region *redist_regs; /* points to the redist regs array.
+will be initialized by gic_acpi_parse_madt_redist() with the interrupt
+controller structures for GICR.  */
+	u32 nr_redist_regions; /* How many GICRs, can be unique or multiple */
+	bool single_redist; /* Whether multiple GICR */
+	u32 maint_irq;
+	int maint_irq_mode;
+	phys_addr_t vcpu_base;
+} acpi_data __initdata;
+
+This is the key structure for GICv3;
+
+	acpi_data.dist_base = ioremap(dist->base_address,
+				      ACPI_GICV3_DIST_MEM_SIZE);
+	then check the GICD_PIDR2 & 0xf0 is 0x30 or 0x40(GICv4);
+
+u32 nr_redist_regions is intialized by acpi_validate_gic_table();
+when 0xE GIC Redistributor (GICR) exists or 0xB GIC CPU Interface (GICC)
+exists(for this, only one struct redist_region);
+
+Please Note, GICC and GICR can not co-exist in MADT. When GICC is configured,
+GICR is defined in the GICC interrupt controller structure.
+
+And with these calling to initialize the acpi_data.redist_regs :
+
+	size = sizeof(*acpi_data.redist_regs) * acpi_data.nr_redist_regions;
+	acpi_data.redist_regs = kzalloc(size, GFP_KERNEL);
+
+	err = gic_acpi_collect_gicr_base();
+
+acpi_data.redist_regs[count] will be setup through :
+gic_acpi_parse_madt_redist --> gic_acpi_register_redist(redist->base_address,
+redist_base)
+
+2. another global structure
+
+struct gic_chip_data {
+	struct fwnode_handle	*fwnode; /* assigned with irq_domain_alloc_fwnode */
+	void __iomem		*dist_base; /* GICD base */
+	struct redist_region	*redist_regions; /* GICR regs array */
+	struct rdists		rdists; /*  */
+	struct irq_domain	*domain; /* points to the irq_domain, intialized
+in gic_init_bases() */
+	u64			redist_stride; /* in gic_init_bases, set as 0 */
+	u32			nr_redist_regions; /* count of GICR */
+	unsigned int		irq_nr; /* The ITLinesNumber of GICD_TYPE.
+32(N+1) -1*/
+	struct partition_desc	*ppi_descs[16];
+};
+
+static struct gic_chip_data gic_data __read_mostly;
+
+in gic_init_bases(), some fields are initialized:
+###INTIDs bit size 14-24 when LPI is enabled
+gic_data.rdists.id_bits = GICD_TYPER_ID_BITS(typer);
+###the maximum SPI INTID is 32(N+1)-1.
+gic_data.irq_nr = gic_irqs;
+
+###register the irq domain with gic_data
+gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
+					&gic_data);
+###allocate percpu variable and save the pointer
+gic_data.rdists.rdist = alloc_percpu(typeof(*gic_data.rdists.rdist));
+
+Then if its exists, initialize it:
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+		its_init(handle, &gic_data.rdists, gic_data.domain);
+
+the struct rdists is defined in include/linux/irqchip/arm-gic-v3.h :
+struct rdists {
+	struct {
+		void __iomem	*rd_base;
+		struct page	*pend_page;
+		phys_addr_t	phys_base;
+	} __percpu		*rdist;
+	struct page		*prop_page;
+	int			id_bits; /* INTID bit size. 14 - 24 bits */
+	u64			flags;
+};
+
+
+3. The basic procedure of GIC-v3/v4 initialization
+
+acpi_validate_gic_table()
+struct acpi_probe_entry is defined by IRQCHIP_ACPI_DECLARE(),
+driver_data is ACPI_MADT_GIC_VERSION_V3 or ACPI_MADT_GIC_VERSION_V4.
+
+Which will match with the GIC version defined in Table 5-63 GICD structure.
+
+4. the registration of GICv3 domain
+
+The struct irq_domain_ops is gic_irq_domain_ops;
+fwnode_handle is created by:
+domain_handle = irq_domain_alloc_fwnode(acpi_data.dist_base);
+
+You also can refer to Documentation/IRQ-domain.txt;
+
+The IRQ domain will setup the mapping between linux IRQ number and hwirq number
+of the interrupt controller.
+
+There are four irq domain mapping mechanisms up to now.
+
+3.1 Linear
+
+fixed size table indexed by the hwirq number. The table should be defined by
+the unsigned int linear_revmap[] of struct irq_domain;
+This mapping is suitable for the case when the maximum number of hwirq is fixed
+and a relatively small number. The table must be as large as the largest
+possible hwirq number.
+
+3.2 radix tree
+
+the hwirq is used as the lookup key for the radix tree.
+The tree map is a good choice if the hwirq number can be very large
+since it doesn't need to allocate a table as large as the largest
+hwirq number.
+
+3.3 No map
+irq_domain_add_nomap()
+
+The No Map mapping is to be used when the hwirq number is
+programmable in the hardware.  In this case it is best to program the
+Linux IRQ number into the hardware itself so that no mapping is
+required.
+
+3.4 Legacy
+
+The legacy map should only be used if fixed IRQ mappings must be
+supported.  For example, ISA controllers would use the legacy map for
+mapping Linux IRQs 0-15 so that existing ISA drivers get the correct IRQ
+numbers.
+
+irq_domain_add_simple()
+irq_domain_add_legacy()
+irq_domain_add_legacy_isa()
+
+
