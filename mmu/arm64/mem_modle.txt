@@ -1,3 +1,38 @@
+Some reference info:
+
+http://www.cnblogs.com/xelatex/p/3491301.html
+
+Some prologues
+
+1) The initialization of struct pglist_data *node_data[MAX_NUMNODES]
+__read_mostly
+
+numa_register_nodes -> setup_node_data(nid, start_pfn, end_pfn)
+
+will allocate and initialise a struct pg_data_t node, then:
+node_data[nid] = nd;
+
+So, node_data[] will store the relationship between node ID and struct pg_data_t
+which is 1:1;
+
+And a continguous page range which this node covers will be fetched from
+memblock as the parsing of NUMA configuration will update the memblock regions'
+information which includes the node ID of each region.
+
+You can refer to numa_register_nodes() to check the relevant processing.
+
+In setup_node_data(), the NUMA node page boundary(Upper and down) is stored in
+NODE_DATA(nid)->node_start_pfn, NODE_DATA(nid)->node_spanned_pages too.
+
+2) The struct mem_section *mem_section[]/mem_section[][1] initialization
+
+All the processing is in memory_present().
+After this calling, the Node memory will be divided into some memory sections
+and those sections will be set as SECTION_MARKED_PRESENT.
+
+Please Note that, these sections are propably not contiguous in phsyical memory.
+
+
 
 
 1. SPARSEMEM
@@ -9,4 +44,134 @@ arch/arm64/asm/sparsemem.h :
 #endif
 
 
+2. SPARSEMEM_EXTREME
 
+I think the definition below in mm/sparse.c can show what is the target of this
+configure item.
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+struct mem_section *mem_section[NR_SECTION_ROOTS]
+	____cacheline_internodealigned_in_smp;
+#else
+struct mem_section mem_section[NR_SECTION_ROOTS][SECTIONS_PER_ROOT]
+	____cacheline_internodealigned_in_smp;
+#endif
+
+
+You can see, if CONFIG_SPARSEMEM_EXTREME is disabled, then mem_section[][] is
+static and populates in bss section.
+
+How much memory are exhauted in this case?
+
+We can check the definition of NR_SECTION_ROOTS and SECTIONS_PER_ROOT in
+include/linux/mmzone.h :
+
+#define NR_MEM_SECTIONS		(1UL << SECTIONS_SHIFT)
+
+#ifdef CONFIG_SPARSEMEM_EXTREME
+#define SECTIONS_PER_ROOT       (PAGE_SIZE / sizeof (struct mem_section))
+#else
+#define SECTIONS_PER_ROOT	1
+#endif
+
+#define SECTION_NR_TO_ROOT(sec)	((sec) / SECTIONS_PER_ROOT)
+#define NR_SECTION_ROOTS	DIV_ROUND_UP(NR_MEM_SECTIONS, SECTIONS_PER_ROOT)
+
+And in include/linux/page-flags-layout.h :
+
+#ifdef CONFIG_SPARSEMEM
+#include <asm/sparsemem.h>
+
+/* SECTION_SHIFT	#bits space required to store a section # */
+#define SECTIONS_SHIFT	(MAX_PHYSMEM_BITS - SECTION_SIZE_BITS)
+
+#endif
+
+in arch/arm64/include/asm/sparsemem.h :
+
+#ifdef CONFIG_SPARSEMEM
+#define MAX_PHYSMEM_BITS	48
+#define SECTION_SIZE_BITS	30
+#endif
+
+So, For ARM64, we have this address bit division when SPARSEMEM :
+
+		SECTION_SIZE_BITS(30)
+   PAGE_SHIFT					SECTIONS_WIDTH/SECTIONS_SHIFT
+ |-------------|----------------------------------|----------------------|
+ 0	   12/14/16				 30			48
+
+
+So, if CONFIG_SPARSEMEM_EXTREME is diabled, the NR_MEM_SECTIONS is 64K, and as
+SECTIONS_PER_ROOT is 1 in this case. So, mem_section[][] will has 64K array
+elements, the memory size is nearly NR_SECTION_ROOTS pages.
+
+
+=====================================
+1. PFN <-----> SECTION
+
+We can apply these macros to convert PFN to section number:
+All are in include/linux/mmzone.h;
+
+#define PAGES_PER_SECTION       (1UL << PFN_SECTION_SHIFT)
+#define PAGE_SECTION_MASK	(~(PAGES_PER_SECTION-1))
+
+#define pfn_to_section_nr(pfn) ((pfn) >> PFN_SECTION_SHIFT)
+#define section_nr_to_pfn(sec) ((sec) << PFN_SECTION_SHIFT)
+
+#define SECTION_ALIGN_UP(pfn)	(((pfn) + PAGES_PER_SECTION - 1) &
+PAGE_SECTION_MASK)
+#define SECTION_ALIGN_DOWN(pfn)	((pfn) & PAGE_SECTION_MASK)
+
+2. SECTION <-----> index of mem_section[]
+
+You can get the section index with this macro. Each section root contains
+SECTIONS_PER_ROOT struct mem_section nodes.
+
+SECTION_NR_TO_ROOT(section_nr)
+
+
+sparse_index_init(unsigned long section_nr, int nid)
+
+This function will allocate the struct mem_section array for the nid and
+section_nr;
+
+During the early boot stage before slab is available, will call
+memblock_virt_alloc_node to allocate free memory size from memblock when
+CONFIG_HAVE_MEMBLOCK and CONFIG_NO_BOOTMEM;
+
+
+With __nr_to_section(section number), we can find the matched struct mem_section
+element in the array.
+
+
+
+==============The basic topology of NUMA system at this moment=============
+
+								----------
+								| page X |
+								----------
+
+								----------
+						-----------	| page ? |
+						|pageblock |	----------
+						|	   |
+						------------	----------
+								| page Y |
+								----------
+						   adjacent
+				----------	-------------
+				|section0|	| pageblock |
+				|	 |	|	    |
+				----------	-------------
+
+				 discontinguous
+	----------		-----------
+	|	 |		|section ?|
+	|   NODE |		|	  |
+	|	 |		-----------
+	|	 |
+	----------		-----------
+				|section N|
+				|	  |
+				-----------

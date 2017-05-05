@@ -1,0 +1,112 @@
+This only cover the first step of NUMA initialization.
+
+1. The global bitmap array
+
+in mm/page_alloc.c :
+
+nodemask_t node_states[NR_NODE_STATES] __read_mostly = {
+	[N_POSSIBLE] = NODE_MASK_ALL,
+
+all other node_states[] only set [0] = 1UL;
+
+in include/linux/nodemask.h :
+#define NODE_MASK_LAST_WORD BITMAP_LAST_WORD_MASK(MAX_NUMNODES)
+This macro will set the LSB of MAX_NUMNODES % BITS_PER_LONG;
+
+and also define these names for the bitmap of nodemask_t :
+
+#define node_online_map 	node_states[N_ONLINE]
+#define node_possible_map 	node_states[N_POSSIBLE]
+
+
+in include/linux/numa.h :
+
+#ifdef CONFIG_NODES_SHIFT
+#define NODES_SHIFT     CONFIG_NODES_SHIFT
+
+#define MAX_NUMNODES    (1 << NODES_SHIFT)
+
+
+For numa, there are some important varaibles in mm/page_alloc.c :
+
+int nr_node_ids __read_mostly = MAX_NUMNODES;
+int nr_online_nodes __read_mostly = 1;
+
+#define MAX_NODE_LOAD (nr_online_nodes)
+
+setup_nr_node_ids() will update nr_node_ids as the maximum node ID;
+node_set_online(int nid) will update the nr_online_nodes which represents the
+counter of online nodes :
+
+	nr_online_nodes = num_node_state(N_ONLINE);
+
+
+2. numa_init()
+
+2.1 numa_alloc_distance()
+
+will allocate and initialise the numa_distance[] and set the numa_distance_cnt.
+For arm64, just use the default nr_node_ids to create the maximum
+numa_distrance[];
+
+Please note that, these memory for numa_distrance[] is allocated from the free
+region of memblock and will be reserved later;
+
+2.3 arm64_acpi_numa_init
+This is only for ARM64 ACPI;
+
+--> will call the architecture-independent acpi_numa_init();
+
+	-->acpi_numa_init()
+	1) parse the SRAT;
+	2) apply the data of SRAT to setup pxm_to_node_map[] where the index is
+	unique domain ID from table, value is the NODE ID allocated in sequence;
+	The node ID allocation is based on the bitmap of nodes_found_map;
+	For pxm_to_node_map[], the domain ID probably had been applied by the
+	processor or GCC entry of SRAT if the same domain ID is used there;
+	3) numa_add_memblk(node, start, end)
+	This function will update the nid of memblock regions covered by
+	current numa node configure;
+	and set the bit which corresponds with the node id for this SRAT entry;
+		node_set(nid, numa_nodes_parsed);
+		So, numa_nodes_parsed represents all the initialised numa nodes;
+	Please note that, the numa memory range probably cover some holes in
+	memblock. What memory regions are valid should depend on the memblock
+	rather than the NUMA memory configure;
+
+	4) setup the distance matix
+
+	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
+	The configure is from SLIT table.
+	acpi_parse_slit ---> acpi_numa_slit_init
+	The matrix is slit->locality_count * slit->locality_count;
+	slit->locality_count should be the count of valid domain ID in SRAT;
+	and also is equal to the count of valid NODE ID;
+
+	numa_distance[] is one dimension array, first is the row, then the
+	coloum; So the distance of row(i), coloum(j) is stored in:
+		numa_distance[from * numa_distance_cnt + to];
+	And the distance configured in SLIT should not be bigger than 255 and
+	the row=coloum must be configured as LOCAL_DISTANCE;
+
+Up to now, the memblock.memoery regions will be set with the right NUMA node ID
+based on the NUMA configurations.
+
+2.4 numa_register_nodes
+
+The major work is to allocate and initialise the node_data[];
+
+	node_data[nid] = nd;
+	memset(NODE_DATA(nid), 0, sizeof(pg_data_t));
+	NODE_DATA(nid)->node_id = nid;
+	NODE_DATA(nid)->node_start_pfn = start_pfn;
+	NODE_DATA(nid)->node_spanned_pages = end_pfn - start_pfn;
+
+and update the online node bitmap for the initialised NODEs;
+
+2.5 setup_node_to_cpumask_map
+
+set the nr_node_ids;
+allocate the node_to_cpumask_map[] for all online Nodes;
+
+

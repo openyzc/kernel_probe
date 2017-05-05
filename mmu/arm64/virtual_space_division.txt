@@ -132,3 +132,88 @@ TASK_SIZE        PAGE_OFFSET-1        Kernel module space
                                 dereferences by both the kernel and user
                                 space are also caught via this mapping.
 
+================ How to map the RAM memory===========
+
+
+1. There are two regions of RAM according to the usage;
+
+one is for kernel Image;
+Another is for kernel available memory;
+
+
+---For Kernel Image space(also populate some memory region, but the virtual
+---space is different from t he kernel linear region.
+
+VA -----> PA :
+
+#define __pa_symbol(x)	__phys_addr_symbol(RELOC_HIDE((unsignedlong)(x), 0))
+
+This macro will return the PA of a symbol in kernel Image;
+The VA should be in [KERNEL_START, KERNEL_END);
+
+#define __kimg_to_phys(addr)	((addr) - kimage_voffset)
+
+#define __pa_symbol_nodebug(x)	__kimg_to_phys((phys_addr_t)(x))
+
+#define __phys_to_kimg(x)	((unsigned long)((x) + kimage_voffset))
+
+----------------
+
+
+
+in head.S :
+
+	ldr_l	x4, kimage_vaddr		// Save the offset between
+	sub	x4, x4, x0			// the kernel virtual and
+	str_l	x4, kimage_voffset, x5		// physical mappings
+
+Here, x0 is __PHYS_OFFSET; (VA)
+
+after ldr_l x4, kimage_vaddr, the physical address corresponds to kimage_vaddr
+was saved in x4; Then the PA - VA (base) will be stored in kimage_voffset;
+
+
+The VA of kimage_vaddr is _text - TEXT_OFFSET;
+
+THE __PHYS_OFFSET is defined :
+#define __PHYS_OFFSET	(KERNEL_START - TEXT_OFFSET)
+
+And before calling __primary_switched, x0 is set as that:
+
+	adrp	x0, __PHYS_OFFSET
+So, 'sub x4, x4, x0' will have the result of _text (VA) - PA(KERNEL_START)
+
+So, the value in kimage_voffset is the offset between the KERNEL_START and
+start physical address of kernel;
+
+-------The kernel linear region( The corresponding virtual space from
+PAGE_OFFSET) -------
+
+======== PA -----> VA =======
+/* The start physical memory address */
+#define PHYS_OFFSET	({ VM_BUG_ON(memstart_addr & 1); memstart_addr;})
+
+#define __phys_to_virt(x) ((unsigned long)((x) - PHYS_OFFSET) | PAGE_OFFSET)
+
+So, __phys_to_virt(x) can convert the physical to virtual for non-kernel memory;
+
+PHYS_OFFSET is corresponding to PAGE_OFFSET in this mapping for non-kernel
+memory;
+
+======= VA -----> PA ========
+#define __is_lm_address(addr)	(!!((addr) & BIT(VA_BITS - 1)))
+
+#define __lm_to_phys(addr)	(((addr) & ~PAGE_OFFSET) + PHYS_OFFSET)
+
+
+======= An unified VA ----> PA macro ===========
+As there are distinct separator between kernel image virtual and linear
+virtual, an unified macro for VA to PA is :
+
+#define __virt_to_phys_nodebug(x) ({					\
+	phys_addr_t __x = (phys_addr_t)(x);				\
+	__is_lm_address(__x) ? __lm_to_phys(__x) :			\
+			       __kimg_to_phys(__x);			\
+})
+
+

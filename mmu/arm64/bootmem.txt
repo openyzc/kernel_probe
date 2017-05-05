@@ -1,4 +1,7 @@
 
-bootmem_init(). This calling must be after the paging_init();
+bootmem is an old memory allocator during the early boot stage of kernel.
+It is more suitable for 32-bit architectures.
+
+Now, new memblock mechanism will replace it step by step.
 
 

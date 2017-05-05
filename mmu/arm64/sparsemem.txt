@@ -1,0 +1,295 @@
+
+bootmem_init(). This calling must be after the paging_init();
+
+We only discuss based on CONFIG_SPARSEMEM is enabled below.
+
+1. arm64_memory_present()
+
+
+memory_present(int nid, unsigned long start, unsigned long end)
+
+Here, the input parameters of 'start, end' are PFN.
+
+The major functionality are
+1) sparse_index_init(section, nid)
+
+Only makes sense for CONFIG_SPARSEMEM_EXTREME;
+Will allocate consecutive SECTIONS_PER_ROOT * struct mem_section array space,
+then set the global pointer variable of :
+struct mem_section *mem_section[NR_SECTION_ROOTS];
+
+as :
+mem_section[root] = section;
+
+For non-SPARSEMEM_EXTREME, this array will be defined as static:
+struct mem_section mem_section[NR_SECTION_ROOTS][SECTIONS_PER_ROOT];
+
+So, sparse_index_init() is NULL for this case;
+
+2) set_section_nid(section, nid)
+set the section_to_node_table[section_nr] to setup the mapping between section
+root id and node id;
+
+3) initialise the field 'unsigned long section_mem_map' of struct mem_section
+With SECTION_MARKED_PRESENT and nid;
+These data will be used in sparse_init() --> alloc_usemap_and_memmap() later;
+
+The LSB of ms->section_mem_map will be set, from bit 2, the Node ID is there.
+
+After this function, the NUMA node regions represented in memblock which were
+updated by arm64_numa_init() will be divided into memory sections.
+Each memory section will contain PAGES_PER_SECTION pages and early node id will
+be stored into the corresponding global
+mem_section[section_num][0]/*mem_section[section_root_num];
+
+
+2. sparse_init
+
+config SPARSEMEM_ALLOC_MEM_MAP_TOGETHER
+        def_bool y
+        depends on SPARSEMEM && X86_64
+
+This configure item is only for X86_64;
+We don't care this here.
+
+HUGETLB_PAGE_SIZE_VARIABLE is only in PPC, IA64.
+
+CONFIG_HUGETLB_PAGE is defined in fs/Kconfig and depended on
+SYS_SUPPORTS_HUGETLBFS for ARM64.
+
+In arch/arm64/Kconfig :
+onfig SYS_SUPPORTS_HUGETLBFS
+        def_bool y
+
+So, the HUGETBL_PAGE is enabled on ARM64, then we have this macro definition:
+
+#define pageblock_order		HUGETLB_PAGE_ORDER
+
+in include/linux/pageblock-flags.h
+
+And HUGETLB_PAGE_ORDER is in arch/arm64/include/asm/pgtable.h :
+#define HPAGE_SHIFT		PMD_SHIFT
+#define HPAGE_SIZE		(_AC(1, UL) << HPAGE_SHIFT)
+#define HPAGE_MASK		(~(HPAGE_SIZE - 1))
+#define HUGETLB_PAGE_ORDER	(HPAGE_SHIFT - PAGE_SHIFT)
+
+So, For ARM64, set_pageblock_order is NULL function.
+
+
+1. allocate NR_MEM_SECTIONS (unsigned long *) pointers
+
+	size = sizeof(unsigned long *) * NR_MEM_SECTIONS;
+	usemap_map = memblock_virt_alloc(size, 0);
+	if (!usemap_map)
+		panic("can not allocate usemap_map\n");
+	alloc_usemap_and_memmap(sparse_early_usemaps_alloc_node,
+							(void *)usemap_map);
+
+each section will have an unsigned long * which will be set to point to the
+SECTION_BLOCKFLAGS_BITS flag bits of section;
+
+2. Allocate struct page
+
+This only makes sense when CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER is enabled.
+2. Allocate struct page
+
+This only makes sense when CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER is enabled.
+
+At first, allocated NR_MEM_SECTION struct page* for whole system;
+Then call this to initialise the NR_MEM_SECTION pointer:
+
+alloc_usemap_and_memmap(sparse_early_mem_maps_alloc_node, (void *)map_map);
+
+Then it is time to intialise these pointers.
+
+sparse_early_mem_maps_alloc_node --> sparse_mem_maps_populate_node()
+
+Now, there are two branches for sparse_mem_maps_populate_node():
+
+2.1 non CONFIG_SPARSEMEM_VMEMMAP
+
+This function only for 	CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER and non
+CONFIG_SPARSEMEM_VMEMMAP defined in mm/sparse.c;
+
+
+Here, it will try to allocate all struct page nodes whose ammount is
+sizeof(struct page) * PAGES_PER_SECTION * section count in same Node;
+
+If there are no so much continguous memory, then will try to allocate
+per-section, where the struct page node is sizeof(struct page) *
+PAGES_PER_SECTION;
+
+Then, the input map_map array will be set with the new allocated struct page :
+map_map[pnum] = xxxx;
+
+2.2 CONFIG_SPARSEMEM_VMEMMAP
+
+Please note that, the map_map allocated below is for all memory sections, each
+section will correspond to one map_map[] :
+
+	size2 = sizeof(struct page *) * NR_MEM_SECTIONS;
+	map_map = memblock_virt_alloc(size2, 0);
+
+The setting of map_map[] will be done in:
+
+alloc_usemap_and_memmap(sparse_early_mem_maps_alloc_node,
+					(void *)usemap_map);
+
+Major work is done in  sparse_early_mem_maps_alloc_node -->
+sparse_mem_maps_populate_node
+
+The major works of sparse_mem_maps_populate_node are :
+1) allocae a buffer for whole memory for the struct page of contiguous memory
+sections;
+
+	unsigned long size = sizeof(struct page) * PAGES_PER_SECTION;
+	void *vmemmap_buf_start;
+
+	size = ALIGN(size, PMD_SIZE);
+	vmemmap_buf_start = __earlyonly_bootmem_alloc(nodeid, size * map_count,
+			 PMD_SIZE, __pa(MAX_DMA_ADDRESS));
+
+	if (vmemmap_buf_start) {
+		vmemmap_buf = vmemmap_buf_start;
+		vmemmap_buf_end = vmemmap_buf_start + size * map_count;
+	}
+
+2) for each section, call sparse_mem_map_populate(pnum, nodeid) to setup the
+page table entries between the struct page * regions of VMEMMAP_START and the
+physical page where the struct page array is stored.
+
+Then kernel can use the struct page with the return VMEMMAP address....
+
+The return VMEMMAP address of a memory section will be stored like that:
+map_map[pnum] = sparse_mem_map_populate(pnum, nodeid);
+
+Please note the physical address for the struct page array is allocated from
+vmemmap_buf.
+
+
+======= Why we need the SPARSEMEM_VMEMMAP? ==========
+
+1. The virtual space specific for struct page is excluded. It is an consecutive
+space started from VMEMMAP_START;
+
+Then it is easy to call pfn_to_page() to find the corresponding struct page;
+
+When non SPARSEMEM_VMEMMAP, the virtual is converted by phys_to_virt(). Which
+means the virtual space is from kernel linear space started from PAGE_OFFSET;
+
+
+===================Summary===========
+
+1. For SPARSEMEM_VMEMMAP, the VA of struct page is consecutive. During
+sparse_init(), will setup the page table for VA of struct page for consecutive
+memomry sections.
+
+ 
+in include/asm-generic/memory_model.h :
+
+#define __pfn_to_page(pfn)	(vmemmap + (pfn))
+#define __page_to_pfn(page)	(unsigned long)((page) - vmemmap)
+
+in arch/arm64/include/asm/pgtable.h :
+#define vmemmap			((struct page *)VMEMMAP_START - (memstart_addr
+>> PAGE_SHIFT))
+
+Those struct page elements are corresponding to the physical pages of the memory
+sections. In section_mem_map field of struct mem_section, the mapping relation
+between base struct page * and the start PFN of section will be stored there.
+You can refer to sparse_init_one_section() :
+	ms->section_mem_map |= sparse_encode_mem_map(mem_map, pnum) |
+							SECTION_HAS_MEM_MAP;
+
+static unsigned long sparse_encode_mem_map(struct page *mem_map, unsigned long
+pnum)
+{
+	return (unsigned long)(mem_map - (section_nr_to_pfn(pnum)));
+}
+
+Here, mem_map is the first struct page pointer of the section which pnum
+designates. As the vmemmap is corresponding to the memstart_addr >> PAGE_SHIFT,
+I think the ms->section_mem_map will be value of vmemmap.
+
+But for normal CONFIG_SPARSEMEM, ms->section_mem_map is the offset between the
+starting struct page and the start section PFN. I think the processing for
+SPARSEMEM_VMEMMAP is just to keep this semantics.
+
+The difference is only that, whether the VA of struct page elements for section
+is adjacent.
+
+==============The mapping relation ======================
+Actually, all thing sparse_init() done is just to further initialise the struct
+mem_section array element based on the existent valid memory sections.
+
+in sparse_init_one_section():
+
+	ms->section_mem_map &= ~SECTION_MAP_MASK;
+	ms->section_mem_map |= sparse_encode_mem_map(mem_map, pnum) |
+							SECTION_HAS_MEM_MAP;
+ 	ms->pageblock_flags = pageblock_bitmap;
+
+Here, pnum is the section Number.
+So, what is mem_map, pageblock_bitmap?
+
+
+This disgram is only for VMEMMAP.
+
+
+			INCR = PAGE_PER_SECTION - 1
+N and S		VMEMMAP AREA (N = PAGES_PER_SECTION * sid;	PHYSICAL AREA
+are in the		M = PAGES_PER_SECTION * (sid - 1))   (The struct pages
+same NODE		(fully mapping to all sections)	      will be stored
+			VMEMMAP_START + VMEMMAP_SIZE	     here continguously)
+			-------------------------
+			| struct page MAX	|
+			-------------------------
+			| struct page MAX - 1	|
+			-------------------------		-------------
+section N		| struct page ???	|      |------>	| INCR	    |
+-------------------	-------------------------      |	-------------
+| section_mem_map |--|	| struct page N + INCR	| -----||----->	| INCR - 1  |
+|		  |  |	-------------------------	|	-------------
+| pageblock_flags |  |	| struct page N+INCR -1	| ------|	| ...	    |
+|		  |  |	-------------------------		-------------
+-------------------  |	| struct page ???	|		| 1	    |
+		     |	-------------------------		-------------
+		     |->| struct page N		| ----------->	| 0	    |
+			-------------------------		-------------
+			| struct page M + INCR	|     |------>	| INCR	    |
+			-------------------------     |		-------------
+			| struct page ....	|     |		| INCR - 1  |
+			-------------------------     |		-------------
+			| struct page M		|     |		| ...	    |
+section S		-------------------------     |		-------------
+-------------------	| struct page S + INCR	| ----|		| 1	    |
+| section_mem_map |--|	-------------------------		-------------
+|		  |  |	| struct page ...	|	|---->	| 0	    |
+| pageblock_flags |  |	-------------------------	|	-------------
+-------------------  |->| struct page S		| ------|
+			-------------------------
+			| struct page T + INCR	|
+			-------------------------
+			| struct page ...	|
+			-------------------------
+			| struct page T		|
+			-------------------------
+			| struct page X + INCR	|
+			-------------------------
+			| struct page ...	|
+			-------------------------
+			| struct page 0		|
+			-------------------------
+				VMEMMAP_START
+
+So, in summary, for all memory sections in one NODE, no matter the memory
+sections are continguous or not, vmemmap will allocate continguous physical
+memory for all the corresponding struct page array for this NODE. And the
+virtual space is specific based on VMEMMAP_START definition.
+
+As for pageblock_flags, there are (1UL << (PFN_SECTION_SHIFT - pageblock_order))
+pageblocks for each section, each pageblock need NR_PAGEBLOCK_BITS bits to
+pageblock attributes. So, SPARSEMEM will allocate this memory space for this
+pageblock flags array and set pageblock_flags which points to that array.
+
+

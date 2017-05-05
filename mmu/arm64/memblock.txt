@@ -1,5 +1,22 @@
 This will be called after the setup_machine_fdt(__fdt_pointer) for FDT mapping.
 
+As based on FDT configuration, kernel can know the physical memory range.
+
+If you enabled EFI_STUB, those memory configure can be transferred by UEFI to
+kernel as UEFI can reconstruct/update the FDT. You can refer to
+allocate_new_fdt_and_exit_boot() in drivers/firmware/efi/libstub/fdt.c;
+
+setup_machine_fdt() is called before arm64_memblock_init() to get the memory
+configurations from firmware.
+The calling chain is:
+
+setup_machine_fdt(__fdt_pointer) --> early_init_dt_scan -->
+early_init_dt_scan_nodes --> of_scan_flat_dt(early_init_dt_scan_memory, NULL)
+--> early_init_dt_add_memory_arch --> memblock_add(base, size);
+
+Up to now, the memblock.memory regions list will be setup.
+The numa regions should be covered by this memblock.memory.
+
 setup_arch --> arm64_memblock_init()
 
 memblock_remove --> memblock_remove_range

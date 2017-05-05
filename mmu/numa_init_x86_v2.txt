@@ -1,0 +1,11 @@
+This log is written on 25 April 2017.
+
+There are some difference about NUMA initialization between x86 and ARM64.
+
+initmem_init() --> x86_numa_init() --> numa_init(x86_acpi_numa_init)
+
+There are no much difference when calling x86_acpi_numa_init().
+
+The major is in numa_init().
+
+It seems setup_bootmem_allocator doesn't make much sense on x86.
