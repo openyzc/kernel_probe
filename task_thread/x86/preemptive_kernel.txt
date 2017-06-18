@@ -1,0 +1,223 @@
+
+We only talk about this issue based on i386.
+
+The code is in arch/x86/entry/entry_32.S;
+
+1. How to preempt
+
+1) exception and interrupt will share the similar code to return;
+That is why 'ret_from_exception' defined in the same code block with
+'ret_from_intr';
+2) preempt_stop will diable the preemption by 'cli';
+3) If the previous context is from userspace, it is safe to trigger the
+preemption; If the previous is from kernel, including exception handling,
+interrupt handling, kernel thread, system call, it is more complicated.
+
+As interrupt is the top priority affair, it can preempt any processing types,
+even for other interrupt vectors whose priorities are lower than the current
+interrupt. So,
+
+#) high interrupt takes up the CPU from low interrupt context;
+#) interrupt takes up the softirq ongoing;
+#) interrupt takes up the exception ongoing;
+#) interrupt takes up the kernel thread;
+
+RULE ONE:
+For any cases, if the 'testl	$X86_EFLAGS_IF, PT_EFLAGS(%esp)', which means
+the preempted processing is interrupt disable context, no matter what is the
+preempted context, must return to the preempted processing. As no any
+threads/tasks can preempt interrupt.
+
+RULE TWO:
+when PER_CPU_VAR(__preempt_count) > 0, which represents there are some atomic
+works ongoing, can't preempt any of them;
+
+
+	ALIGN
+ret_from_exception:
+	preempt_stop(CLBR_ANY)
+ret_from_intr:
+#ifdef CONFIG_VM86
+	movl	PT_EFLAGS(%esp), %eax		# mix EFLAGS and CS
+	movb	PT_CS(%esp), %al
+	andl	$(X86_EFLAGS_VM | SEGMENT_RPL_MASK), %eax
+#else
+	/*
+	 * We can be coming here from child spawned by kernel_thread().
+	 */
+	movl	PT_CS(%esp), %eax
+	andl	$SEGMENT_RPL_MASK, %eax
+#endif
+	cmpl	$USER_RPL, %eax
+	jb	resume_kernel		# not returning to v8086 or userspace
+
+ENTRY(resume_userspace)
+	DISABLE_INTERRUPTS(CLBR_ANY)
+	TRACE_IRQS_OFF
+	movl	%esp, %eax
+	call	prepare_exit_to_usermode
+	jmp	restore_all
+END(ret_from_exception)
+
+#ifdef CONFIG_PREEMPT
+ENTRY(resume_kernel)
+	DISABLE_INTERRUPTS(CLBR_ANY)
+.Lneed_resched:
+	cmpl	$0, PER_CPU_VAR(__preempt_count)
+	jnz	restore_all
+	testl	$X86_EFLAGS_IF, PT_EFLAGS(%esp)	# interrupts off (exception path) ?
+	jz	restore_all
+	call	preempt_schedule_irq
+	jmp	.Lneed_resched
+END(resume_kernel)
+#endif
+
+============About preempt counter ================
+
+
+
+
+
+asmlinkage __visible void __sched schedule(void)
+{
+	struct task_struct *tsk = current;
+
+	sched_submit_work(tsk);
+	do {
+		preempt_disable();
+		__schedule(false);
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+}
+
+
+static inline void schedule_debug(struct task_struct *prev)
+{
+#ifdef CONFIG_SCHED_STACK_END_CHECK
+	if (task_stack_end_corrupted(prev))
+		panic("corrupted stack end detected inside scheduler\n");
+#endif
+
+	if (unlikely(in_atomic_preempt_off())) {
+		__schedule_bug(prev);
+		preempt_count_set(PREEMPT_DISABLED);
+	}
+...
+
+
+#if defined(CONFIG_PREEMPT_COUNT)
+# define PREEMPT_DISABLE_OFFSET	PREEMPT_OFFSET
+#else
+# define PREEMPT_DISABLE_OFFSET	0
+#endif
+
+
+/*
+ * Only used in the schedule context. When entering schedule(),
+ * preempt_disable() will be called before the '__schedule(false);'. As we
+ * expect the context before scheduling should be non-atomic/sleepable, so the
+ * preempt counter should be ZERO before calling schedule(). Then when
+ * schedule_bug() is entered, the preempt counter should be
+ * PREEMPT_DISABLE_OFFSET for CONFIG_PREEMPT_COUNT. Other preempt counter value
+ * are invalid which means the schedule() occur on the background where is
+ * non-preemptive.
+ */
+#define in_atomic_preempt_off() (preempt_count() != PREEMPT_DISABLE_OFFSET)
+/*
+ * I think this macro is also only for scheduling. It will be used to set the
+ * preempt counter as preemption disable just entering the schedule().
+ */
+#define PREEMPT_DISABLED	(PREEMPT_DISABLE_OFFSET + PREEMPT_ENABLED)
+
+For X86,
+/*
+ * I think if only PREEMPT_NEED_RESCHED in preempt counter, it represents
+ * preemption is available. But this macor seems not make much sense.
+ */
+#define PREEMPT_ENABLED	(0 + PREEMPT_NEED_RESCHED)
+
+
+/*
+ * This macro is also for safe checking for forking and scheduling.
+ * For schedule(), at the beginning, 'preempt_disable();', then
+ * 'raw_spin_lock(&rq->lock);' in __schedule() will increase by one too.
+ * So, before the new thread/task call the 'return finish_task_switch(prev);',
+ * the preempt counter should be equal to FORK_PREEMPT_COUNT. Otherwise, there
+ * are somewhere manipulating counter incorrectly.
+ */
+#define FORK_PREEMPT_COUNT	(2*PREEMPT_DISABLE_OFFSET + PREEMPT_ENABLED)
+
+static struct rq *finish_task_switch(struct task_struct *prev)
+	__releases(rq->lock)
+{
+	...
+	if (WARN_ONCE(preempt_count() != 2*PREEMPT_DISABLE_OFFSET,
+		      "corrupted preempt_count: %s/%d/0x%x\n",
+		      current->comm, current->pid, preempt_count()))
+		preempt_count_set(FORK_PREEMPT_COUNT);
+
+
+
+
+2. Is exception handling in the context of interrupt disabling?
+
+This macro define the handler sepecific to X86_TRAP_DE
+
+DO_ERROR(X86_TRAP_DE,     SIGFPE,  "divide error",		divide_error)
+
+
+static void do_error_trap(struct pt_regs *regs, long error_code, char *str,
+			  unsigned long trapnr, int signr)
+{
+	siginfo_t info;
+
+	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+
+	if (notify_die(DIE_TRAP, str, regs, error_code, trapnr, signr) !=
+			NOTIFY_STOP) {
+		cond_local_irq_enable(regs);
+		do_trap(trapnr, signr, str, regs, error_code,
+			fill_trap_info(regs, signr, trapnr, &info));
+	}
+}
+
+#define DO_ERROR(trapnr, signr, str, name)				\
+dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	\
+{									\
+	do_error_trap(regs, error_code, str, trapnr, signr);		\
+}
+
+
+set_intr_gate(X86_TRAP_DE, divide_error);
+
+#define set_intr_gate_notrace(n, addr)					\
+	do {								\
+		BUG_ON((unsigned)n > 0xFF);				\
+		_set_gate(n, GATE_INTERRUPT, (void *)addr, 0, 0,	\
+			  __KERNEL_CS);					\
+	} while (0)
+
+#define set_intr_gate(n, addr)						\
+	do {								\
+		set_intr_gate_notrace(n, addr);				\
+		_trace_set_gate(n, GATE_INTERRUPT, (void *)trace_##addr,\
+				0, 0, __KERNEL_CS);			\
+	} while (0)
+
+* So, X86_TRAP_DE applies interrupt gate;
+* But it doesn't mean the exception handling is doing in the interrupt
+* disabling context;
+* The interrupt switch will be recovered before the exception handling:
+
+	if (notify_die(DIE_TRAP, str, regs, error_code, trapnr, signr) !=
+			NOTIFY_STOP) {
+		cond_local_irq_enable(regs);
+
+static inline void cond_local_irq_enable(struct pt_regs *regs)
+{
+	if (regs->flags & X86_EFLAGS_IF)
+		local_irq_enable();
+}
+
+
+

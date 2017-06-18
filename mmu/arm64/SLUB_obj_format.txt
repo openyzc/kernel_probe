@@ -1,0 +1,159 @@
+This struct is an exerpt of struct kmem_cache. Only those fields relevant to
+the slub object format are kept.
+
+struct kmem_cache {
+	int size;		/* The size of an object including meta data */
+	int object_size;	/* The size of an object without meta data */
+	int offset;		/* Free pointer offset. */
+
+	struct kmem_cache_order_objects oo;
+
+	/* Allocation and freeing of slabs */
+	struct kmem_cache_order_objects max;
+	struct kmem_cache_order_objects min;
+	gfp_t allocflags;	/* gfp flags to use on each alloc */
+	int refcount;		/* Refcount for slab cache destroy */
+	void (*ctor)(void *);
+	int inuse;		/* Offset to metadata */
+	int align;		/* Alignment */
+	int reserved;		/* Reserved bytes at the end of slabs */
+
+	struct list_head list;	/* List of slab caches */
+	int red_left_pad;	/* Left redzone padding size */
+}
+
+
+#elif defined(CONFIG_SLUB_DEBUG)
+#define SLAB_DEBUG_FLAGS (SLAB_RED_ZONE | SLAB_POISON | SLAB_STORE_USER | \
+			  SLAB_TRACE | SLAB_CONSISTENCY_CHECKS)
+
+
+static inline int kmem_cache_debug(struct kmem_cache *s)
+{
+#ifdef CONFIG_SLUB_DEBUG
+	return unlikely(s->flags & SLAB_DEBUG_FLAGS);
+#else
+	return 0;
+#endif
+}
+
+void *fixup_red_left(struct kmem_cache *s, void *p)
+{
+	if (kmem_cache_debug(s) && s->flags & SLAB_RED_ZONE)
+		p += s->red_left_pad;
+
+	return p;
+}
+
+
+static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+{
+	*(void **)(object + s->offset) = fp;
+}
+
+
+
+static int calculate_sizes(struct kmem_cache *s, int forced_order)
+{
+	...
+
+	s->inuse = size;
+
+	if (((flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) ||
+		s->ctor)) {
+		/*
+		 * Relocate free pointer after the object if it is not
+		 * permitted to overwrite the first word of the object on
+		 * kmem_cache_free.
+		 *
+		 * This is the case if we do RCU, have a constructor or
+		 * destructor or are poisoning the objects.
+		 */
+		s->offset = size;
+		size += sizeof(void *);
+	}
+	...
+}
+
+1. When SLAB_RED_ZONE && CONFIG_SLUB_DEBUG
+
+
+s->red_left_pad will be set in calculate_size():
+		size += sizeof(void *);
+
+		s->red_left_pad = sizeof(void *);
+		s->red_left_pad = ALIGN(s->red_left_pad, s->align);
+
+How to use this 'red_left_pad'?
+In allocate_slab():
+		for_each_object_idx(p, idx, s, start, page->objects) {
+			setup_object(s, page, p);
+			if (likely(idx < page->objects))
+				set_freepointer(s, p, p + s->size);
+			else
+				set_freepointer(s, p, NULL);
+		}
+		page->freelist = fixup_red_left(s, start);
+
+refer to this calling chain:
+setup_object --> setup_object_debug --> init_object
+
+
+	(flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) || s->ctor
+					s->offset
+page start	aligned		|	s->inuse 	    TRACK_FREE s->size	
+   -------------------------------------------------------------------------
+  |		|		|	 |	      |	      |	     |	   |
+  |red_left_pad | object_size	|RED_ZONE|free_pointer| track0|track1|0... |
+  |		|		|	 |	      |	      |	     |	   |
+  --------------------------------------------------------------------------
+SLUB_RED_INACTIVE	   	1~sizeof(*)		 TRACK_ALLOC	align
+								    don't care
+
+2. When SLAB_POISON && SLAB_RED_ZONE
+
+	(flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) || s->ctor
+					s->offset
+page start	aligned		|	s->inuse 	    TRACK_FREE s->size	
+   -------------------------------------------------------------------------
+  |		|		|	 |	      |	      |	     |	   |
+  |red_left_pad | object_size	|	 |free_pointer| track0|track1|0... |
+  |		|		|	 |	      |	      |	     |	   |
+  --------------------------------------------------------------------------
+SLUB_RED_INACTIVE POISON_FREE   1~sizeof(*)	     TRACK_ALLOC	align
+			   POISON_END
+				POISON_INUSE			  POISON_INUSE
+		when SLUB_RED_INACTIVE
+
+3. When only SLAB_POISON
+
+
+	(flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) || s->ctor
+					s->offset
+	page start		|	s->inuse 	    TRACK_FREE s->size	
+   -------------------------------------------------------------------------
+  |		|		|	 |	      |	      |	     |	   |
+  |	0       | object_size	|	 |free_pointer| track0|track1|0... |
+  |		|		|	 |	      |	      |	     |	   |
+  --------------------------------------------------------------------------
+SLUB_RED_INACTIVE POISON_FREE   0~sizeof(*)-1	     TRACK_ALLOC	align
+			   POISON_END
+				POISON_INUSE			  POISON_INUSE
+
+
+4. When !(flags & SLAB_POISON) && !(flags & SLAB_DESTROY_BY_RCU) &&
+                        !s->ctor)
+
+Then s->offset = 0.
+Which means that the first sizeof(void *) of object_size will store the
+free-pointer to the next object.
+As there are no chances to overwrite this first word.
+
+
+==========NOTES=================
+	if (unlikely(s->flags & SLAB_POISON))
+		memset(start, POISON_INUSE, PAGE_SIZE << order);
+
+which means when SLAB_POISON is enabled, then whole slub page/pages will be
+initialised as POISON_INUSE.
+

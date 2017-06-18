@@ -1,0 +1,182 @@
+
+
+1. some basic data structures
+
+kmem_cache_node : a struct kmem_cache, whose object is struct kmem_cache_node;
+kmem_cache : a struct kmem_cache too, whose object is struct kmem_cache +
+nr_node_ids * sizeof(struct kmem_cache_node *);
+
+	create_boot_cache(kmem_cache, "kmem_cache",
+			offsetof(struct kmem_cache, node) +
+				nr_node_ids * sizeof(struct kmem_cache_node *),
+		       SLAB_HWCACHE_ALIGN);
+
+*) After this, the kmem_cache_node->node[node] will be initialised as a new
+object from a new page of that 'node'; Otherwise, pr_err will output;
+*) The remain page space will be added to n->partial, and n->nr_partial++;
+Please note this page is nofozen;
+*) the kmem_cache->cpu_slab is allocated by alloc_kmem_cache_cpus();
+
+
+Based on the following code,
+	create_boot_cache(kmem_cache_node, "kmem_cache_node",
+		sizeof(struct kmem_cache_node), SLAB_HWCACHE_ALIGN);
+
+	register_hotmemory_notifier(&slab_memory_callback_nb);
+
+	/* Able to allocate the per node structures */
+	slab_state = PARTIAL;
+
+	create_boot_cache(kmem_cache, "kmem_cache",
+			offsetof(struct kmem_cache, node) +
+				nr_node_ids * sizeof(struct kmem_cache_node *),
+		       SLAB_HWCACHE_ALIGN);
+
+
+As the slab_state is PARTIAL before the second invokation of
+create_boot_cache(kmem_cache, ....), we got this calling chain:
+
+create_boot_cache --> __kmem_cache_create --> kmem_cache_open -->
+init_kmem_cache_nodes -->
+	n = kmem_cache_alloc_node(kmem_cache_node,
+						GFP_KERNEL, node);
+rather than calling of 'early_kmem_cache_node_alloc(node)';
+
+	--> slab_alloc_node(s, gfpflags, node, _RET_IP_)
+During the early booting, the raw_cpu_ptr(s->cpu_slab) hasn't been initialised,
+which means the processing will fall into this path :
+	object = c->freelist;
+	page = c->page;
+	if (unlikely(!object || !node_match(page, node))) {
+		object = __slab_alloc(s, gfpflags, node, addr, c);
+		stat(s, ALLOC_SLOWPATH);
+	}
+
+	--> p = ___slab_alloc(s, gfpflags, node, addr, c)
+		--> goto new_slab
+		--> freelist = new_slab_objects(s, gfpflags, node, &c)
+
+*) Firstly, try to get freelist by get_partial()
+	freelist = get_partial(s, flags, node, c);
+	if (freelist)
+		return freelist;
+
+As the 's' here is kmem_cache_node, there is one partial slab page/pages was
+added. So,
+	get_partial_node --> acquire_slab(s, n, page, object == NULL, &objects)
+
+1. get_partial_node(struct kmem_cache *s, struct kmem_cache_node *n,
+				struct kmem_cache_cpu *c, gfp_t flags)
+
+	spin_lock(&n->list_lock);
+	list_for_each_entry_safe(page, page2, &n->partial, lru) {
+		void *t;
+
+		if (!pfmemalloc_match(page, flags))
+			continue;
+
+		t = acquire_slab(s, n, page, object == NULL, &objects);
+
+*) pfmemalloc_match(page, flags) will filter out the non-pfmemalloc page or
+pfmemalloc page which can match with 'flags';
+*) list_for_each_entry_safe(page, page2, &n->partial, lru) {
+This traverse will scan all the page/pages in n->partial list. All the
+page/pages should be non-frozen;
+*) acquire_slab(s, n, page, object == NULL, &objects)
+this acquire_slab will update the page as frozen, and return the first page of
+n->partial as the c->page:
+		available += objects;
+		if (!object) {
+			c->page = page;
+			stat(s, ALLOC_FROM_PARTIAL);
+			object = t;
+		}
+
+For all other slub page/pages originally in n->partial, will be moved to
+s->cpu_slab->partial:
+			put_cpu_partial(s, page, 0);
+			stat(s, CPU_PARTIAL_NODE);
+
+*) How many page/pages will be migrated to s->cpu_slab->partial?
+		if (!kmem_cache_has_cpu_partial(s)
+			|| available > s->cpu_partial / 2)
+			break;
+When doesn't support SLUB_CPU_PARTIAL, this scanning on n->partial will only
+work for the first slub page/pages. Or when the accumulation of migration
+objects is over (s->cpu_partial / 2), then we can end this partial node
+fetching.
+
+*) put_cpu_partial(s, page, 0)
+This function migrates the selected slub page/pages from n->partial to the
+s->cpu_slab->partial as the new head of that list.
+
+If drain is not ZERO and the sum of all the objects' project is bigger than
+s->cpu_partial, then unfreeze_partials(s, this_cpu_ptr(s->cpu_slab)) will be
+called to unfreeze the slub page/pages back to n->partial when (new.inuse ||
+n->nr_partial < s->min_partial).
+
+
+So, for the early booting, get_partial(s, flags, node, c) will return the slub
+page/pages in n->partial of kmem_cache_node.
+Please note that, the new inuse of that slub page/pages picked up is set as:
+	new.inuse = page->objects;
+
+
+
+###What is the role of 'unsigned frozen:1;' in struct page?
+
+It seems:
+	the slub page/pages in n->partial is non-frozen;
+	the slub page/pages in s->cpu_slab->partial is frozen;
+
+2. bootstrap
+
+	kmem_cache = bootstrap(&boot_kmem_cache);
+
+	/*
+	 * Allocate kmem_cache_node properly from the kmem_cache slab.
+	 * kmem_cache_node is separately allocated so no need to
+	 * update any list pointers.
+	 */
+	kmem_cache_node = bootstrap(&boot_kmem_cache_node);
+
+The first one will re-initialize the new kmem_cache created based on
+local boot_kmem_cache. After this, all the data structures in boot_kmem_cache
+will be copied to the new kmem_cache which is allocated by bootstrap --> struct
+kmem_cache *s = kmem_cache_zalloc(kmem_cache, GFP_NOWAIT); As the old
+p->slab_cache points to the boot_kmem_cache, so, the following processings are
+needed:
+	for_each_kmem_cache_node(s, node, n) {
+		struct page *p;
+
+		list_for_each_entry(p, &n->partial, lru)
+			p->slab_cache = s;
+
+#ifdef CONFIG_SLUB_DEBUG
+		list_for_each_entry(p, &n->full, lru)
+			p->slab_cache = s;
+#endif
+	}
+
+The slub page which had been allocated by create_boot_cache() exists yet and
+just copy the pointer to the new struct kmem_cache.
+
+
+3. create_kmalloc_cache
+
+This will allocate a struct kmem_cache object from the global kmem_cache slub.
+We should note that the kmem_cache here is the global rather than the local
+variable of boot_kmem_cache_node in kmem_cache_init as 'kmem_cache =
+bootstrap(&boot_kmem_cache)';
+
+struct kmem_cache *s = kmem_cache_zalloc(kmem_cache, GFP_NOWAIT);
+
+
+These will create different size kmem_cache elements in 'struct kmem_cache
+*kmalloc_caches[KMALLOC_SHIFT_HIGH + 1]' :
+	create_boot_cache(s, name, size, flags);
+	list_add(&s->list, &slab_caches);
+
+After these, the 'slab_state = UP;';
+
+

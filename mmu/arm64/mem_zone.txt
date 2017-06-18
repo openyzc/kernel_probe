@@ -1,0 +1,92 @@
+The base idea about memory allocation is to divide the whole available memory
+into several ZONES according to the hardware requests or management requests.
+
+The following is only for multiple nodes.
+
+1. initialise the arch_zone_highest_possible_pfn[MAX_NR_ZONES] based on the
+architectural fixable ZONE memory pfn separators.
+
+2. set the zone_movable_pfn[MAX_NUMNODES] based on the kernel configurations
+
+'movable_node'
+'kernelcore=mirror'
+'kernelcore=nn[KMG]'
+'movablecore=nn[KMG]'
+
+3. apply zone_movable_pfn[nid] to decide the boundary of each ZONE type of NODE
+whose ID is nid.
+
+In this processing, the pgdat->node_zones[zonetype] will be initialised.
+including these fields by calculate_node_totalpages() :
+
+zone->zone_start_pfn = zone_start_pfn;
+zone->spanned_pages = size;
+zone->present_pages = real_size;
+
+	pgdat->node_spanned_pages = totalpages;
+	pgdat->node_present_pages = realtotalpages;
+
+Then free_area_init_core(pgdat) will call memmap_init(size, nid, j,
+zone_start_pfn) to initialise some fields of the corresponding struct page for
+the PAGEs of the zone[] of NODE nid.
+
+4. update some NODE-relevant bitmaps
+
+check_for_memory(pgdat, nid)
+
+When the nid has HIGH_MEMORY:
+
+node_set_state(nid, N_HIGH_MEMORY)
+
+otherwise, will:
+
+node_set_state(nid, N_NORMAL_MEMORY)
+
+Which means the Node nid will be set as one of N_HIGH_MEMORY or N_NORMAL_MEMORY
+bitmap.
+
+===================What is the ZONE_MOVABLE?=============
+
+*) during the bootmem_init --> zone_sizes_init, the
+arch_zone_lowest_possible_pfn[ZONE_MOVABLE] and
+arch_zone_highest_possible_pfn[ZONE_MOVABLE] are ZERO!
+
+And the zone->zone_start_pfn for ZONE_MOVABLE is also decided by this chain:
+
+calculate_node_totalpages -> zone_spanned_pages_in_node ->
+adjust_zone_range_for_zone_movable :
+
+		if (zone_type == ZONE_MOVABLE) {
+			*zone_start_pfn = zone_movable_pfn[nid];
+			*zone_end_pfn = min(node_end_pfn,
+				arch_zone_highest_possible_pfn[movable_zone]);
+
+So, for each zone[ZONE_MOVABLE] of NODE nid, the zone range is decided by the
+zone_movable_pfn[nid] and arch_zone_highest_possible_pfn[movable_zone] as
+arch_zone_highest_possible_pfn[ZONE_MOVABLE] is ZERO!
+
+And movable_zone is the index of some ZONE, will be set in
+find_usable_zone_for_movable() as the last zone satisfies this :
+
+		if (arch_zone_highest_possible_pfn[zone_index] >
+				arch_zone_lowest_possible_pfn[zone_index])
+
+Which means that the last present ZONE with global range will be also used as
+ZONE_MOVABLE partially or fully depends on the zone_movable_pfn[nid].
+For example, if zone_movable_pfn[nid] is smaller than the starting of last
+present ZONE, then this whole ZONE will be used as ZONE_MOVABLE.
+
+And Please note that, zone_movable_pfn[] is decided by
+find_zone_movable_pfns_for_nodes(). The zone_movalbe_pfn[] is probably bigger
+than arch_zone_lowest_possible_pfn[movable_zone]. In this case, it represents
+the movable_zone is partially used as ZONE_MOVABLE.
+
+
+
+
+
+
+
+
+
+

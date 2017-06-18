@@ -1,0 +1,31 @@
+
+__build_all_zonelists -->
+	for_each_possible_cpu(cpu) {
+		setup_pageset(&per_cpu(boot_pageset, cpu), 0);
+Here, setup_pageset will call pageset_set_batch(p, batch) to initialise the
+percpu varaible of 'static DEFINE_PER_CPU(struct per_cpu_pageset,
+boot_pageset)';
+
+static void pageset_update(struct per_cpu_pages *pcp, unsigned long high,
+		unsigned long batch)
+{
+       /* start with a fail safe value for batch */
+	pcp->batch = 1;
+	smp_wmb();
+
+       /* Update high, then batch, in order */
+	pcp->high = high;
+	smp_wmb();
+
+	pcp->batch = batch;
+}
+
+/* a companion to pageset_set_high() */
+static void pageset_set_batch(struct per_cpu_pageset *p, unsigned long batch)
+{
+	pageset_update(&p->pcp, 6 * batch, max(1UL, 1 * batch));
+}
+
+So, the pcp->high is ZERO, pcp->batch is One after boot initialization.
+
+

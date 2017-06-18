@@ -1,0 +1,111 @@
+
+The calling chain likes that:
+
+start_kernel --> mem_init --> free_all_bootmem -->
+
+we only care about the implementation in mm/nobootmem.c :
+
+unsigned long __init free_all_bootmem(void)
+{
+	unsigned long pages;
+
+	reset_all_zones_managed_pages();
+
+	pages = free_low_memory_core_early();
+	totalram_pages += pages;
+
+	return pages;
+}
+
+=======What is managed pages? ==============
+
+	reset_all_zones_managed_pages();
+
+We find these fields are defined in struct zone :
+
+	unsigned long		managed_pages;
+	unsigned long		spanned_pages;
+	unsigned long		present_pages;
+
+According the comments :
+
+	 * managed_pages is present pages managed by the buddy system, which
+	 * is calculated as (reserved_pages includes pages allocated by the
+	 * bootmem allocator):
+	 *	managed_pages = present_pages - reserved_pages;
+
+So, that is way these operations are performed:
+	in __free_pages_boot_core() :
+	page_zone(page)->managed_pages += nr_pages;
+
+And present_pages are the page count which are availabe in that zone, including
+those pages reserved during early boot.
+
+in zone_sizes_init --> free_area_init_node --> free_area_init_core :
+
+	zone->managed_pages = is_highmem_idx(j) ? realsize : freesize;
+
+But this assignment seems not working. As zone_sizes_init is run before
+mem_init, so, the 'managed_pages' will be re-set.
+
+========================================================
+
+	--> free_low_memory_core_early() -->
+for_each_free_mem_range(i, NUMA_NO_NODE, MEMBLOCK_NONE, &start, &end, NULL)
+		count += __free_memory_core(start, end);
+
+	--> __free_pages_memory(start_pfn, end_pfn)
+
+	while (start < end) {
+		order = min(MAX_ORDER - 1UL, __ffs(start));
+
+		while (start + (1UL << order) > end)
+			order--;
+
+		__free_pages_bootmem(pfn_to_page(start), start, order);
+
+		start += (1UL << order);
+	}
+
+So,
+*) The free should start from the LSB of the 'start' PFN (the bit position
+starts from ZERO);
+*) __free_pages_boot_core(page, order) is the core;
+	--> until all the least significant order bits are finished the
+	processing or
+	--> The current 'start' PFN is multiply of (0x01 << (MAX_ORDER - 1)),
+	then continue the free operation with 'MAX_ORDER - 1' order until the
+	'start >= end';
+
+
+===== What pages are the buddy?======
+*) The LSB order bit are same;
+*) In the same zone;
+*) Had set the PageBuddy flag or guard page;
+
+
+===== When the pcp->lists[] will be used?========
+
+void __free_pages(struct page *page, unsigned int order)
+{
+	if (put_page_testzero(page)) {
+		if (order == 0)
+			free_hot_cold_page(page, false);
+		else
+			__free_pages_ok(page, order);
+	}
+}
+
+
+And in free_hot_cold_page(page, false), will link the page freed into the right
+pcp->list[]. For Hot page, will be linked to the list head for the sooner reuse,
+for cold page, will be linked to the list tail.
+
+=====How the free pages are organized?======
+
+NODE ---> ZONE ---> zone->free_area[order].free_list[migrate_type]
+
+*) It is possible there are multiple zones in one NODE;
+*) For each memory allocataion, the zone policy is in the 'struct zonelist
+node_zonelists[MAX_ZONELISTS]' of struct pglist_data;
+

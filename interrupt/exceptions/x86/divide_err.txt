@@ -1,0 +1,7 @@
+Please refer to this web:
+
+https://0xax.gitbooks.io/linux-insides/content/interrupts/interrupts-3.html
+
+It is more valuable to understand the interrupt processing on x86_64.
+
+

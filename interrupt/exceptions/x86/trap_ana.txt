@@ -1,0 +1,168 @@
+
+1.  What is trap?
+trap is one type of exceptions. It is synchronous which means that the
+interrupt/trap is triggered when a instruction is executing.
+
+The following sections will focus on these two exceptions as the representives:
+
+X86_TRAP_DE
+X86_TRAP_PF
+
+2. Where the interrupt gates are initialised?
+
+in trap_init():
+set_intr_gate(X86_TRAP_DE, divide_error);
+
+in early_trap_pf_init() or early_trap_init() for i386:
+set_intr_gate(X86_TRAP_PF, page_fault);
+
+3. divide_error
+
+entry_32.S (arch/x86/entry):ENTRY(divide_error)
+
+entry_64.S (arch/x86/entry):
+
+idtentry divide_error	do_divide_error has_error_code=0
+
+This macro defines the function of divide_error() through these lines:
+.macro idtentry sym do_sym has_error_code:req paranoid=0 shift_ist=-1
+ENTRY(\sym)
+
+Some as semantic is worth more decription here:
+1) has_err_code:req
+this parameter is mandatory by ':req';
+2) paranoid=0
+parameter of 'paranoid' has the default value '0';
+
+And in this macro, the do_divide_error() will be called:
+call	\do_sym
+
+####So, where is the definition of do_divide_error() for x86_64?
+
+in arch/x86/kernel/traps.c :
+
+#define DO_ERROR(trapnr, signr, str, name)				\
+dotraplinkage void do_##name(struct pt_regs *regs, long error_code)	\
+{									\
+	do_error_trap(regs, error_code, str, trapnr, signr);		\
+}
+
+DO_ERROR(X86_TRAP_DE,     SIGFPE,  "divide error",		divide_error)
+
+So, do_divide_error() will call do_error_trap(struct pt_regs *regs, long
+error_code, char *str, unsigned long trapnr, int signr)
+
+For X86_TRAP_DE, the '*str' is "divide error', the trapnr is X86_TRAP_DE, the
+signr is 'SIGFPE';
+
+As do_divide_error() is called by divide_error(). So, we should analyse the
+divide_error() to know how to call do_divide_error();
+
+3.1 what will do in divide_error() for i386?
+
+The definition specific to i386 is simple compared with the one in x86_64:
+ENTRY(divide_error)
+	ASM_CLAC
+	pushl	$0				# no error code
+	pushl	$do_divide_error
+	jmp	common_exception
+END(divide_error)
+
+You can find the do_divide_error is transferred to common_exception as stack
+parameter.
+
+As for 'ASM_CLAC', it will apply the complicated macro of ALTERNATIVE. How to
+understand this macro, you can refer to this web link:
+http://www.groad.net/bbs/thread-3276-1-1.html
+
+Basically, when CONFIG_X86_SMAP is enabled and CPU support the X86_FEATURE_SMAP,
+the 'clac' instruction will be poked here.
+
+ENTRY(divide_error)
+	ASM_CLAC
+	pushl	$0				# no error code
+	pushl	$do_divide_error
+	jmp	common_exception
+END(divide_error)
+
+It is obvious for i386, will jump to common_exception() to finish the divide
+error processing.
+
+common_exception:
+	/* the function address is in %gs's slot on the stack */
+	pushl	%fs
+	pushl	%es
+	pushl	%ds
+	pushl	%eax
+	pushl	%ebp
+	pushl	%edi
+	pushl	%esi
+	pushl	%edx
+	pushl	%ecx
+	pushl	%ebx
+	ENCODE_FRAME_POINTER
+	cld
+	movl	$(__KERNEL_PERCPU), %ecx
+	movl	%ecx, %fs
+	UNWIND_ESPFIX_STACK
+	GS_TO_REG %ecx
+	movl	PT_GS(%esp), %edi		# get the function address
+	movl	PT_ORIG_EAX(%esp), %edx		# get the error code
+	movl	$-1, PT_ORIG_EAX(%esp)		# no syscall to restart
+	REG_TO_PTGS %ecx
+	SET_KERNEL_GS %ecx
+	movl	$(__USER_DS), %ecx
+	movl	%ecx, %ds
+	movl	%ecx, %es
+	TRACE_IRQS_OFF
+	movl	%esp, %eax			# pt_regs pointer
+	call	*%edi
+	jmp	ret_from_exception
+END(common_exception)
+
+
+When exception/interrupt occur, hardware can fetch the IDT entry with the
+interrupt ID. And perform some procedures before transferring to the interrupt
+routine, you can refer to the 6.12 in Intel sdm manual.
+
+For divide error, when divide_error() is entering, the kernel stack had been
+loaded into ss:esp/ss:rsp, so all the push operations will happen in the kernel
+stack.
+
+In ENTRY(divide_error), the 'pushl $0' and 'pushl $do_divide_error' will store
+the $0  to orig_ax, the address of do_divide_error() to %gs.
+
+struct pt_regs {
+	unsigned long bx;
+	unsigned long cx;
+	unsigned long dx;
+	unsigned long si;
+	unsigned long di;
+	unsigned long bp;
+	unsigned long ax;
+	unsigned long ds;
+	unsigned long es;
+	unsigned long fs;
+	unsigned long gs;
+	unsigned long orig_ax;
+	unsigned long ip;
+	unsigned long cs;
+	unsigned long flags;
+	unsigned long sp;
+	unsigned long ss;
+};
+
+And then all the pushl at the beginning of common_exception() will save those
+registers in the stack as the fields of struct pt_regs.
+
+Please keep in mind that, the register value pushed earlier will populate the
+high address of struct pt_regs.
+
+So, when reaching 'ENCODE_FRAME_POINTER', the struct pt_regs is ready in the
+stack.
+
+
+
+
+
+

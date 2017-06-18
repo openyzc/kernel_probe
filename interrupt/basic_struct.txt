@@ -1,0 +1,366 @@
+
+PLEASE keep in mind that, for GICv3, GITS_TRANSLATER is used to trigger ITS
+interrupt. It will be used to compose the msi_msg as the address part:
+
+static void its_irq_compose_msi_msg(struct irq_data *d, struct msi_msg *msg)
+{
+	struct its_device *its_dev = irq_data_get_irq_chip_data(d);
+	struct its_node *its;
+	u64 addr;
+
+	its = its_dev->its;
+	addr = its->phys_base + GITS_TRANSLATER;
+
+	msg->address_lo		= lower_32_bits(addr);
+	msg->address_hi		= upper_32_bits(addr);
+	msg->data		= its_get_event_id(d);
+
+	iommu_dma_map_msi_msg(d->irq, msg);
+}
+
+
+The driver should also write the eventid there which is specific to the
+corresonding device as the data of msi_msg.
+This data value is relevant to the specific device.
+
+The composed msi_msg will be written to the configure registers of the
+corresponding PCI/PCIE device.
+
+
+
+
+1. struct irq_domain
+
+Here, we only care about the radix tree mode.
+
+The hwirq is the key to search this radix tree.
+
+This field is where the core data stored:
+
+struct radix_tree_root revmap_tree;
+
+2. struct irq_desc
+
+This node is also stored in radix tree whose key should be virq;
+
+	struct irq_common_data	irq_common_data;
+	struct irq_data		irq_data;
+
+	irq_flow_handler_t	handle_irq;
+	struct irqaction	*action;	/* IRQ action list */
+
+These above fields are the curical things.
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+3. struct irq_data
+
+
+struct irq_data {
+	u32			mask;
+	unsigned int		irq;
+	unsigned long		hwirq;
+	struct irq_common_data	*common;
+	struct irq_chip		*chip;
+	struct irq_domain	*domain;
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	struct irq_data		*parent_data;
+#endif
+	void			*chip_data;
+};
+
+So, we can find the corresponding struct irq_chip now;
+It is time for struct irq_chip!
+
+4. struct irq_chip
+
+struct irq_chip {
+	struct device	*parent_device;
+	const char	*name;
+	unsigned int	(*irq_startup)(struct irq_data *data);
+	void		(*irq_shutdown)(struct irq_data *data);
+
+....
+
+There are so many irq hooks here:)
+
+5. struct irq_common_data
+
+struct irq_common_data {
+	unsigned int		__private state_use_accessors;
+#ifdef CONFIG_NUMA
+	unsigned int		node;
+#endif
+	void			*handler_data;
+	struct msi_desc		*msi_desc;
+	cpumask_var_t		affinity;
+#ifdef CONFIG_GENERIC_IRQ_IPI
+	unsigned int		ipi_offset;
+#endif
+};
+
+For MSI, here struct msi_desc *msi_desc is important.
+
+
+6. The possible msi calling chain:
+
+irq_startup 
+
+msi_domain_alloc_irqs 
+irq_domain_activate_irq --> __irq_domain_activate_irq 
+
+static const struct irq_domain_ops msi_domain_ops = {
+	.alloc		= msi_domain_alloc,
+	.free		= msi_domain_free,
+	.activate	= msi_domain_activate,
+	.deactivate	= msi_domain_deactivate,
+};
+
+msi_domain_activate(struct irq_domain *domain,
+				struct irq_data *irq_data) -->
+irq_chip_compose_msi_msg(irq_data, &msg) then irq_chip_write_msi_msg(irq_data,
+&msg) --> data->chip->irq_write_msi_msg(data, msg)
+
+For itsv3, this irq_write_msi_msg should be 'pci_msi_domain_write_msg';
+
+So, pci_msi_domain_write_msg --> __pci_write_msi_msg(desc, msg)
+
+Ok, in this __pci_write_msi_msg, the device driver will the data/address of msi
+messge to the PCI/PCIE relevant config registers. And this message corresponding
+to a virq and the irq_domain
+
+7. irq_domain_alloc_irqs_recursive
+
+This function is worth to discuss here.
+
+I think the target of this function is to allocate the domain-relevant hwirq and
+perform some necessary hwirq translation upward to the highest domain in the
+domain hierarchy.
+
+For GICv3, the recursive chain will be :
+
+its_irq_gic_domain_alloc -> irq_domain_alloc_irqs_parent -->
+irq_domain_alloc_irqs_recursive(domain->parent, ...) -->
+domain->ops->alloc(domain, irq_base, nr_irqs, arg) --> gic_irq_domain_alloc
+
+
+Please notes that, it seems the irq_domain_is_auto_recursive(domain) will always
+return false as no one had set the IRQ_DOMAIN_FLAG_AUTO_RECURSIVE in
+domain->flags;
+
+

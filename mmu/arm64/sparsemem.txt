@@ -292,4 +292,16 @@ pageblocks for each section, each pageblock need NR_PAGEBLOCK_BITS bits to
 pageblock attributes. So, SPARSEMEM will allocate this memory space for this
 pageblock flags array and set pageblock_flags which points to that array.
 
+========The difference between sparsemem and sparse_vmemmap? ==========
+
+*) sparse will try to allocate continguous memory pages for the 'struct page' of
+all the adjacent sections in the same NODE. But if it fails, then will fallback
+to allocate per-section. Which will lead to the memory pages for 'struct page'
+are not contiguous; But vmemmap will allocate all the memory for the same NODE
+and aligned to PMD_SIZE, and reserve these memory as buffer for the later usage
+by sparse_mem_map_populate(pnum, nodeid);
+
+*) vmemmap will reserve a specific virtual address space to get contiguous VA
+for the accesses to any 'struct page *' node.
+
 

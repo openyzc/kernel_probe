@@ -1,0 +1,593 @@
+
+
+1. mbigen_device_probe
+
+
+        p0_mbigen_peri_b: interrupt-controller@60080000 {
+                compatible = "hisilicon,mbigen-v2";
+                reg = <0x0 0x60080000 0x0 0x10000>;
+
+                mbigen_uart: uart_intc {
+                        msi-parent = <&p0_its_peri_b 0x120c7>;
+                        interrupt-controller;
+                        #interrupt-cells = <2>; 
+                        num-pins = <1>; 
+                };
+        };
+
+
+This dts node will be created as a platform device.
+Based on the 'compatible = "hisilicon,mbigen-v2";', the mbigen_device_probe()
+will be called.
+
+And the mbigen_uart is the child of p0_mbigen_peri_b. These codes are applied
+for:
+
+	for_each_child_of_node(pdev->dev.of_node, np) {
+		if (!of_property_read_bool(np, "interrupt-controller"))
+			continue;
+
+		parent = platform_bus_type.dev_root;
+		child = of_platform_device_create(np, NULL, parent);
+		if (!child)
+			return -ENOMEM;
+
+		if (of_property_read_u32(child->dev.of_node, "num-pins",
+					 &num_pins) < 0) {
+			dev_err(&pdev->dev, "No num-pins property\n");
+			return -EINVAL;
+		}
+
+		domain = platform_msi_create_device_domain(&child->dev,
+					num_pins, mbigen_write_msg,
+						   &mbigen_domain_ops,
+						   mgn_chip);
+		if (!domain)
+			return -ENOMEM;
+	}
+
+
+The biggest issue here is where the child->dev.msi_domain was set as
+platform_msi_create_device_domain() need this pointer to setup the relation
+between this newly platform domain and the msi-domain which is as parent domain.
+
+child = of_platform_device_create(np, NULL, parent)  -->
+of_platform_device_create_pdata ---> of_msi_configure(&dev->dev,
+dev->dev.of_node) --> dev_set_msi_domain(dev,
+			   of_msi_get_domain(dev, np, DOMAIN_BUS_PLATFORM_MSI));
+
+SO, of_msi_get_domain(dev, np, DOMAIN_BUS_PLATFORM_MSI) is the focus.
+
+	msi_np = of_parse_phandle(np, "msi-parent", 0);
+	if (msi_np && !of_property_read_bool(msi_np, "#msi-cells")) {
+		d = irq_find_matching_host(msi_np, token);
+		if (!d)
+			of_node_put(msi_np);
+		return d;
+	}
+
+SO, through the "msi-parent' property, the parent domain will be found by 'd =
+irq_find_matching_host(msp_np, token);' in the end.
+
+According to the dts configuration, it should be:
+                p0_its_peri_a: interrupt-controller@4c000000 {
+                        compatible = "arm,gic-v3-its";
+                        msi-controller;
+                        #msi-cells = <1>;
+                        reg = <0x0 0x4c000000 0x0 0x40000>;
+                };
+
+The corresponding domain will be created as 'DOMAIN_BUS_PLATFORM_MSI' bus_token
+type. The code path is :
+its_pmsi_init ---> platform_msi_create_irq_domain(of_node_to_fwnode(np),
+						    &its_pmsi_domain_info,
+						    parent)
+
+The domain is really created by:
+domain = msi_create_irq_domain(fwnode, info, parent); -->
+irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info) -->
+		irq_domain_create_tree(fwnode, ops, host_data)
+
+We can know that, this new domain's ops is msi_domain_ops, host data is
+'its_pmsi_domain_info' of struct msi_domain_info.
+
+
+We also want to trace the parent domain of this 'DOMAIN_BUS_PLATFORM_MSI'
+domain :
+
+its_of_probe(struct device_node *node) --> 
+its_probe_one(&res, &np->fwnode, of_node_to_nid(np)) --> 
+its_init_domain(struct fwnode_handle *handle, struct its_node *its) -->
+inner_domain = irq_domain_create_tree(handle, &its_domain_ops, its)
+
+This domain will have these fields:
+	inner_domain->parent = its_parent;
+	inner_domain->bus_token = DOMAIN_BUS_NEXUS;
+	inner_domain->flags |= IRQ_DOMAIN_FLAG_MSI_REMAP;
+	info->ops = &its_msi_domain_ops;
+	info->data = its;
+	inner_domain->host_data = info;
+
+So, we know for the dts node whose compatible property is "arm,gic-v3-its" will
+be used to create two irq domains in its_of_probe() and its_pmsi_init(), only
+the 'bus_token' field of irq_domain is different: DOMAIN_BUS_NEXUS and
+DOMAIN_BUS_PLATFORM_MSI.
+
+The domain hierarchy is below:
+its_parent  ----> domain whose bus_token is DOMAIN_BUS_NEXUS --> domain whose
+bus_token is DOMAIN_BUS_PLATFORM_MSI.
+
+2. How to build the mapping between hwirq and virq
+
+During the mbigen domain creation, platform_msi_create_device_domain() will be
+called to create a platform irq domain.
+
+1) platform_msi_alloc_priv_data(dev, nvec, write_msi_msg)
+
+A struct platform_msi_priv_data node will be allocated and initialised like
+these:
+
+	datap->devid = ida_simple_get(&platform_msi_devid_ida,
+				      0, 1 << DEV_ID_SHIFT, GFP_KERNEL);
+	datap->write_msg = write_msi_msg;
+	datap->dev = dev;
+
+So, datap->write_msg points to 'mbigen_write_msg';
+And :
+	data->host_data = host_data;
+a mbigne specific struct mbigen_device will be saved.
+
+2) 	domain = irq_domain_create_hierarchy(dev->msi_domain, 0, nvec,
+					     of_node_to_fwnode(dev->of_node),
+					     ops, data)
+
+A linear platform irq domain will be created whose ops is 'mbigen_domain_ops',
+host_data is 'struct platform_msi_priv_data' newly initialised.
+
+3) msi_domain_prepare_irqs(domain->parent, dev, nvec, &data->arg)
+
+Here, the domain->parent is the its-platform domain created in its_pmsi_init()
+by:
+
+platform_msi_create_irq_domain(of_node_to_fwnode(np),
+						    &its_pmsi_domain_info,
+						    parent)
+---> domain = msi_create_irq_domain(fwnode, info, parent)
+----> irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info)
+
+So, the ops is 'msi_domain_ops', host_data is 'its_pmsi_domain_info';
+
+Ok, go back to msi_domain_prepare_irqs():
+
+	ret = ops->msi_check(domain, info, dev);
+	if (ret == 0)
+		ret = ops->msi_prepare(domain, dev, nvec, arg);
+
+Please notes that, here, ops is 'struct msi_domain_ops' rather than 'struct
+irq_domain_ops'!
+As msi_domain_update_dom_ops(info) will be called in msi_create_irq_domain(),
+So, its_pmsi_domain_info.ops will be used.
+'ops' is its_pmsi_ops of its_pmsi_domain_info.
+
+So, msi_domain_ops_default.msi_check and its_pmsi_prepare() will be called.
+
+static int its_pmsi_prepare(struct irq_domain *domain, struct device *dev,
+			    int nvec, msi_alloc_info_t *info)
+{
+	struct msi_domain_info *msi_info;
+	u32 dev_id;
+	int ret, index = 0;
+
+	msi_info = msi_get_domain_info(domain->parent);
+
+	/* Suck the DeviceID out of the msi-parent property */
+	do {
+		struct of_phandle_args args;
+
+		ret = of_parse_phandle_with_args(dev->of_node,
+						 "msi-parent", "#msi-cells",
+						 index, &args);
+		if (args.np == irq_domain_get_of_node(domain)) {
+			if (WARN_ON(args.args_count != 1))
+				return -EINVAL;
+			dev_id = args.args[0];
+			break;
+		}
+	} while (!ret);
+
+	if (ret)
+		return ret;
+
+	/* ITS specific DeviceID, as the core ITS ignores dev. */
+	info->scratchpad[0].ul = dev_id;
+
+	return msi_info->ops->msi_prepare(domain->parent,
+					  dev, nvec, info);
+}
+
+WHen msi_info->ops->msi_prepare() are called, msi_info->ops points to
+'its_msi_domain_ops' initialised in its_init_domain().
+So, its_msi_prepare(domain->parent, dev, nvec, info) will be called.
+Here, 'dev' is the mbigen child device, nvec is from the 'num-pins' property.
+
+This function will initialise the info->scratchpad[0] of struct
+msi_alloc_info_t.
+
+Up to now, the 'msi_alloc_info_t	arg' of struct platform_msi_priv_data in
+platform_msi_create_device_domain() are ready.
+
+
+
+
+
+msi_capability_init  --> pci_msi_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSI) -->
+msi_domain_alloc_irqs(domain, &dev->dev, nvec) 
+
+
+
+            p0_pcie2_a: pcie@a00a0000 {
+                    compatible = "hisilicon,hip07-pcie-ecam";
+                    reg = <0 0xa8000000 0 0x800000>,<0 0xa00a0000 0 0x10000>;
+                        bus-range = <0x80 0x87>;
+                        msi-map = <0x8000 &p0_its_dsa_a 0x8000 0x800>;
+                        msi-map-mask = <0xffff>;
+                        #address-cells = <3>;
+                        #size-cells = <2>;
+                        device_type = "pci";
+                        dma-coherent;
+                ranges = <0x02000000 0 0xa8800000 0x0 0xa8800000 0 0x77f0000
+                                      0x01000000 0 0 0 0xafff0000 0 0x10000>;
+                        #interrupt-cells = <1>;
+                        interrupt-map-mask = <0xf800 0 0 7>;
+                        interrupt-map = <0x0 0 0 1 &mbigen_pcie2_a 671 4
+                                         0x0 0 0 2 &mbigen_pcie2_a 671 4
+                                         0x0 0 0 3 &mbigen_pcie2_a 671 4
+                                         0x0 0 0 4 &mbigen_pcie2_a 671 4>;
+
+
+        p0_mbigen_pcie_a: interrupt-controller@a0080000 {
+                compatible = "hisilicon,mbigen-v2";
+                reg = <0x0 0xa0080000 0x0 0x10000>;
+
+                mbigen_usb: intc_usb {
+                        msi-parent = <&p0_its_dsa_a 0x40080>;
+                        interrupt-controller;
+                        #interrupt-cells = <2>;
+                        num-pins = <2>;
+                };
+                mbigen_pcie2_a: intc_pcie2_a {
+                        msi-parent = <&p0_its_dsa_a 0x40087>;
+                        interrupt-controller;
+                        #interrupt-cells = <2>;
+                        num-pins = <10>;
+                };
+        };
+
+
+We need to where is the msi domain for our pci/pcie target device.
+
+For ARM64:
+2.1 pci_device_add --> pci_set_msi_domain(struct pci_dev *dev) -->
+pci_dev_msi_domain --> pci_msi_get_device_domain
+
+For OF, "msi-map" and "msi-map-mask" will be used to setup the relationship
+between RID(for PCI, BFD will be converted to RID) and MSI controller(then you
+can find the corresponding irq_domain);
+
+you can refer to the arch/arm64/boot/dts/hisilicon/hip07.dtsi, for PCIE RC,
+after pci_msi_get_device_domain --> of_msi_map_get_device_domain() will find the
+struct device_node whose handler was defined by 'msi-map = <0x8000 &p0_its_dsa_a
+0x8000 0x800>;' for PCI bus range [0x80, 0x87]. Please note the RID of PCIE is
+BDF of the RC which will be traversed by pci_for_each_dma_alias(pdev,
+get_msi_id_cb, &rid); And the functionarity of pci_msi_get_device_domain() -->
+of_msi_map_get_device_domain(&pdev->dev, rid) --> __of_msi_map_rid(dev, &np,
+rid) will find the matched 'struct device node' with the input 'rid' whose value
+is BDF. Actually, the &np will point to the '&p0_its_dsa_a', then the
+corresponding irq_domain will be returned through 'irq_find_matching_host(np,
+DOMAIN_BUS_PCI_MSI)'. Please note that the 'msi-map' has four 32-bits words:
+
+		u32 rid_base = be32_to_cpup(map + 0);
+		u32 phandle = be32_to_cpup(map + 1);
+		u32 out_base = be32_to_cpup(map + 2);
+		u32 rid_len = be32_to_cpup(map + 3);
+
+The input 'rid' must fall into [rid_base, rid_base + rid_len).
+ 
+
+For this &p0_its_dsa_a, it corresponds to :
+
+                p0_its_dsa_a: interrupt-controller@c6000000 {
+                        compatible = "arm,gic-v3-its";
+                        msi-controller;
+                        #msi-cells = <1>;
+                        reg = <0x0 0xc6000000 0x0 0x40000>;
+
+
+For gicv2m:
+
+pci_set_bus_msi_domain(struct pci_bus *bus) --> pci_host_bridge_msi_domain(b)
+--> pci_host_bridge_acpi_msi_domain(bus)
+
+b or bus should be the root bus here.
+
+struct irq_domain *pci_host_bridge_acpi_msi_domain(struct pci_bus *bus)
+{
+	struct fwnode_handle *fwnode;
+
+	if (!pci_msi_get_fwnode_cb)
+		return NULL;
+
+	fwnode = pci_msi_get_fwnode_cb(&bus->dev);
+	if (!fwnode)
+		return NULL;
+
+	return irq_find_matching_fwnode(fwnode, DOMAIN_BUS_PCI_MSI);
+}
+
+So,
+1) where the pci_msi_get_fwnode_cb is registered?
+
+gicv2m_init --> gicv2m_acpi_init(parent) --> 
+
+
+For x86(We don't touch iommu at this moment):
+
+pci_msi_setup_msi_irqs  --> arch_setup_msi_irqs(dev, nvec, type) -->
+x86_msi.setup_msi_irqs(dev, nvec, type) --> native_setup_msi_irqs -->
+msi_domain_alloc_irqs(domain, &dev->dev, nvec)
+
+The domain here should point to msi_default_domain whose parent domain is
+x86_vector_domain :
+
+arch_early_irq_init -->
+arch_init_msi_domain(x86_vector_domain) --> 
+	msi_default_domain = pci_msi_create_irq_domain(NULL,
+					&pci_msi_domain_info, parent);
+	--> domain = msi_create_irq_domain(fwnode, info, parent) -->
+		irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info)
+
+Please note 'pci_msi_domain_info' is struct msi_domain_info rather than struct
+irq_domain_ops. A struct msi_domain_ops pci_msi_domain_ops is a field of
+pci_msi_domain_info which works as the domain host_data.
+
+And the struct irq_domain_ops of newly irq_domain is msi_domain_ops.
+
+
+3. msi_domain_alloc_irqs
+
+It is time to go back the 'msi_domain_alloc_irqs'.
+
+	struct msi_domain_info *info = domain->host_data;
+	struct msi_domain_ops *ops = info->ops;
+
+So, for x86, ops is 'pci_msi_domain_ops', info is 'pci_msi_domain_info'.
+
+1) msi_domain_prepare_irqs(domain, dev, nvec, &arg)
+
+	ret = ops->msi_check(domain, info, dev);
+	if (ret == 0)
+		ret = ops->msi_prepare(domain, dev, nvec, arg);
+
+So, pci_msi_domain_check_cap() will be called first.
+Here, some confusions as multiple vectors can not pass this check as the default
+pci_msi_domain_info without setting the 'MSI_FLAG_MULTI_PCI_MSI' in flags of
+pci_msi_domain_info.
+
+.msi_prepare	= pci_msi_prepare will be called.
+
+
+	for_each_msi_entry(desc, dev) {
+		ops->set_desc(&arg, desc);
+
+		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+					       dev_to_node(dev), &arg, false,
+					       desc->affinity);
+pci_msi_set_desc() will be called. So,
+
+void pci_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+{
+	arg->msi_hwirq = pci_msi_domain_calc_hwirq(arg->msi_dev, desc);
+}
+
+irq_hw_number_t pci_msi_domain_calc_hwirq(struct pci_dev *dev,
+					  struct msi_desc *desc)
+{
+	return (irq_hw_number_t)desc->msi_attrib.entry_nr |
+		PCI_DEVID(dev->bus->number, dev->devfn) << 11 |
+		(pci_domain_nr(dev->bus) & 0xFFFFFFFF) << 27;
+}
+
+Till now, the msi_alloc_info_t arg had been initialised especially the
+arg->msi_hwirq.
+
+
+2) __irq_domain_alloc_irqs
+
+		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+					       dev_to_node(dev), &arg, false,
+					       desc->affinity);
+
+2.1) This function will allocate and initialise those important IRQ structures,
+such as irq_desc. The virq is also will be assigned too:
+
+		virq = irq_domain_alloc_descs(irq_base, nr_irqs, 0, node,
+					      affinity);
+
+	please keep in mind that the newly struct irq_desc will be inserted to
+	radix tree of irq_desc_tree by this :
+		irq_insert_desc(start + i, desc);
+	The key is virq.
+
+2.2) All the struct irq_data objects in the domain hierarchy will be allocated:
+
+irq_domain_alloc_irq_data(domain, virq, nr_irqs)
+
+		child->parent_data = irq_data;
+		irq_data->irq = child->irq;
+		irq_data->common = child->common;
+		irq_data->domain = domain;
+
+2.3) irq_domain_alloc_irqs_recursive
+
+domain->ops->alloc() will be called here:
+irq_domain_alloc_irqs_recursive(domain, virq, nr_irqs, arg) -->
+domain->ops->alloc(domain, irq_base, nr_irqs, arg)
+
+Here, the domain->ops-alloc is 'msi_domain_alloc'. You can refer to the
+arch_init_msi_domain() for the creation of msi_default_domain.
+
+static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+
+			    unsigned int nr_irqs, void *arg)
+{
+	struct msi_domain_info *info = domain->host_data;
+	struct msi_domain_ops *ops = info->ops;
+	irq_hw_number_t hwirq = ops->get_hwirq(info, arg);
+2.3.1)
+## Here 'ops' is pci_msi_domain_info.ops which points to 'pci_msi_domain_ops'.
+so, ops->get_hwirq is 'pci_msi_get_hwirq'.
+
+2.3.2)
+	if (irq_find_mapping(domain, hwirq) > 0)
+		return -EEXIST;
+### irq_find_mapping() will get the corresponding virq to the input 'hwirq' for
+this domain.
+## These code are for direct mapping. virq should same as hwirq.
+	if (hwirq < domain->revmap_direct_max_irq) {
+		data = irq_domain_get_irq_data(domain, hwirq);
+		if (data && data->hwirq == hwirq)
+			return hwirq;
+	}
+
+### These code are for linear mapping
+	if (hwirq < domain->revmap_size)
+		return domain->linear_revmap[hwirq];
+## These are for radix tree mapping
+	rcu_read_lock();
+	data = radix_tree_lookup(&domain->revmap_tree, hwirq);
+	rcu_read_unlock();
+	return data ? data->irq : 0;
+
+2.3.3)
+##alloc irq from parent
+
+	if (domain->parent) {
+		ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
+		if (ret < 0)
+			return ret;
+	}
+
+Here, domain->parent is x86_vector_domain, so x86_vector_alloc_irqs will be
+called in irq_domain_irqs_parent() through these codes:
+	domain = domain->parent;
+	if (domain)
+		return irq_domain_alloc_irqs_recursive(domain, irq_base,
+						       nr_irqs, arg);
+
+THe x86_vector_alloc_irqs() is in arch/x86/kernel/apic/vector.c;
+
+The major work of this function is to initialise the struct irq_data
+corresponding to this irq domain.
+	for (i = 0; i < nr_irqs; i++) {
+		irq_data = irq_domain_get_irq_data(domain, virq + i);
+### We can get the struct irq_data corresponds to the virq + i and domain.
+## Then start the initialization on the struct irq_data:
+		data = alloc_apic_chip_data(node);
+
+		irq_data->chip = &lapic_controller;
+		irq_data->chip_data = data;
+		irq_data->hwirq = virq + i;
+## It is worth to mention the hwirq is equal to (virq + i) for this top domain.
+
+##The following calling is important. Will initialise the struct apic_chip_data
+based on the input 'info'; It seems these are relevant to the IRQ affinity.
+
+		err = assign_irq_vector_policy(virq + i, node, data, info);
+
+
+2.3.4)
+The last step is :
+	for (i = 0; i < nr_irqs; i++) {
+		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
+
+msi_domain_ops_init() will be called.
+
+static int msi_domain_ops_init(struct irq_domain *domain,
+			       struct msi_domain_info *info,
+			       unsigned int virq, irq_hw_number_t hwirq,
+			       msi_alloc_info_t *arg)
+{
+	irq_domain_set_hwirq_and_chip(domain, virq, hwirq, info->chip,
+				      info->chip_data);
+	if (info->handler && info->handler_name) {
+		__irq_set_handler(virq, info->handler, 0, info->handler_name);
+		if (info->handler_data)
+			irq_set_handler_data(virq, info->handler_data);
+	}
+	return 0;
+}
+### For MSI, the 'info->chip_data' seems to be NULL.
+
+int irq_domain_set_hwirq_and_chip(struct irq_domain *domain, unsigned int virq,
+				  irq_hw_number_t hwirq, struct irq_chip *chip,
+				  void *chip_data)
+{
+	struct irq_data *irq_data = irq_domain_get_irq_data(domain, virq);
+
+	if (!irq_data)
+		return -ENOENT;
+
+	irq_data->hwirq = hwirq;
+	irq_data->chip = chip ? chip : &no_irq_chip;
+	irq_data->chip_data = chip_data;
+
+	return 0;
+}
+
+I think info->chip is 'pci_msi_controller', info->handler is 'handle_edge_irq';
+
+
+
+
+2.4) irq_domain_insert_irq
+
+	for (i = 0; i < nr_irqs; i++)
+		irq_domain_insert_irq(virq + i);
+
+static void irq_domain_insert_irq(int virq)
+{
+	struct irq_data *data;
+
+	for (data = irq_get_irq_data(virq); data; data = data->parent_data) {
+		struct irq_domain *domain = data->domain;
+		irq_hw_number_t hwirq = data->hwirq;
+
+		if (hwirq < domain->revmap_size) {
+			domain->linear_revmap[hwirq] = virq;
+		} else {
+			mutex_lock(&revmap_trees_mutex);
+			radix_tree_insert(&domain->revmap_tree, hwirq, data);
+			mutex_unlock(&revmap_trees_mutex);
+		}
+
+So, this function will link all the struct irq_data of domain hierarchy to their
+corresponding irq_domain's radix tree of revmap_tree.
+In this way, the relation between struct irq_data and hwirq in one irq domain is
+setup. Please know, hwirq is the key of this radix tree. All these are domain
+locally.
+
+The data->hwirq for each irq domain in the domain hierarchy are setup by:
+irq_domain_alloc_irqs_recursive(domain, virq, nr_irqs, arg) -->
+domain->ops->alloc(domain, irq_base, nr_irqs, arg).
+
+ONCE again, for MSI, this ops->alloc is msi_domain_alloc().
+
+One hint, irq_domain_alloc_irqs_recursive() seems not to allocate IRQ for all
+the ancestral domains at this moment as irq_domain_is_auto_recursive(domain)
+always return FALSE.
+
+
+

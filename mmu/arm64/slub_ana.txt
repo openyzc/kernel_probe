@@ -1,0 +1,159 @@
+kmem_cache_init is the initialization entry.
+
+kmem_cache_init --> create_boot_cache --> __kmem_cache_create(s, flags) -->
+kmem_cache_open(s, flags)
+
+*) the input flags is only SLAB_HWCACHE_ALIGN, but will be merged other flags
+later;
+*) in kmem_cache_open(),
+  when CONFIG_SLUB_DEBUG enabled, will
+
+	if (slub_debug && (!slub_debug_slabs || (name &&
+		!strncmp(slub_debug_slabs, name, strlen(slub_debug_slabs)))))
+		flags |= slub_debug;
+
+So, the flags will be updated with slub_debug.
+
+#if defined(CONFIG_SLUB_DEBUG_ON)
+static int slub_debug = DEBUG_DEFAULT_FLAGS;
+#else
+static int slub_debug;
+#endif
+
+As in normal cases, the CONFIG_SLUB_DEBUG_ON is disabled, so slub_debug is 0.
+
+1. calculate_sizes(s, -1)
+
+will setup these fields of struct kmem_cache :
+
+s->flags
+s->inuse  /**/
+s->offset
+s->red_left_pad
+s->size :
+	size = ALIGN(size, s->align);
+	s->size = size;
+s->allocflags this field will merge with the s->flags for page allocation.
+
+	s->oo = oo_make(order, size, s->reserved);
+	s->min = oo_make(get_order(size), size, s->reserved);
+	if (oo_objects(s->oo) > oo_objects(s->max))
+		s->max = s->oo;
+
+
+2. init_kmem_cache_nodes(s)
+
+	for_each_node_state(node, N_NORMAL_MEMORY) {
+		struct kmem_cache_node *n;
+
+		if (slab_state == DOWN) {
+			early_kmem_cache_node_alloc(node);
+			continue;
+		}
+
+Specially, for booting initialization, only call
+early_kmem_cache_node_alloc(node) for all nodes with NORMAL_MEMORY, without the
+calling below :
+
+		n = kmem_cache_alloc_node(kmem_cache_node,
+						GFP_KERNEL, node);
+
+--> early_kmem_cache_node_alloc(int node)
+
+	page = new_slab(kmem_cache_node, GFP_NOWAIT, node);
+	--> return allocate_slab(s,
+		flags & (GFP_RECLAIM_MASK | GFP_CONSTRAINT_MASK), node);
+
+*) What 'flags' will be applied for the slab page allocation?
+	flags &= gfp_allowed_mask;
+
+	flags |= s->allocflags;
+
+#define GFP_BOOT_MASK (__GFP_BITS_MASK & ~(__GFP_RECLAIM|__GFP_IO|__GFP_FS))
+
+page_alloc.c (src\mm):gfp_t gfp_allowed_mask __read_mostly = GFP_BOOT_MASK;
+
+So, the (__GFP_RECLAIM|__GFP_IO|__GFP_FS) will be removed from GFP_RECLAIM_MASK
+
+*) page allocation
+
+alloc_gfp = (flags | __GFP_NOWARN | __GFP_NORETRY) & ~__GFP_NOFAIL;
+if ((alloc_gfp & __GFP_DIRECT_RECLAIM) && oo_order(oo) > oo_order(s->min))
+		alloc_gfp = (alloc_gfp | __GFP_NOMEMALLOC) &
+		~(__GFP_RECLAIM|__GFP_NOFAIL);
+
+	page = alloc_slab_page(s, alloc_gfp, node, oo);
+
+	if (unlikely(!page)) {
+		oo = s->min;
+		alloc_gfp = flags;
+		/*
+		 * Allocation may have failed due to fragmentation.
+		 * Try a lower order alloc if possible
+		 */
+		page = alloc_slab_page(s, alloc_gfp, node, oo);
+
+So, firstly try to alloc_slab_page with the more complicated 'alloc_gfp';
+If fail, then apply the small order and a simple 'flags';
+
+	-- The slub pages will apply the compound page with the ___GFP_COMP
+	when order is > 0;
+	-- some fields of struct page will be initilised:
+		page->objects = oo_objects(oo);
+		page->slab_cache = s;
+		__SetPageSlab(page);
+		/* freelist is the offset where the first slub object is for */
+		page->freelist = fixup_red_left(s, start);
+		page->inuse = page->objects;
+		page->frozen = 1;
+
+	-- Also initialise all the slub objects in these slub pages
+		each slub object will set the field 'offset' by
+		'set_freepointer(s, p, p + s->size)'
+		Please note that, this 'offset' points to the start of
+		next object which bypasses the 'red_left_pad' READ_ZONE filling;
+	The last object will set the 'offset' as NULL;
+
+	-- inc_slabs_node(s, page_to_nid(page), page->objects)
+	Will not update the statistics fields of 'struct kmem_cache_node' for
+	the booting phrase;
+
+*) The initialization of first object
+
+The first object of kmem_cache_node is a struct kmem_cache_node in the slub
+page/pages.
+
+	n = page->freelist;
+	page->freelist = get_freepointer(kmem_cache_node, n);
+	page->inuse = 1;
+	page->frozen = 0;
+	kmem_cache_node->node[node] = n;
+
+Then init_kmem_cache_node(n); will initialise some fields of struct
+kmem_cache_node.
+
+But how to keep the relationship between slub page/pages and the struct
+kmem_cache_node object?
+
+We had set this in allocate_slab :
+	page->slab_cache = s;
+then we get get the struct kmem_cache *s from the corresponding struct page.
+
+And with __add_partial(n, page, DEACTIVATE_TO_HEAD);
+we linked the struct *page into 'n->partial' of struct kmem_cache_node *n
+object. Which means we can know the struct page through the 'partial' list of
+struct kmem_cach_node.
+
+
+3. alloc_kmem_cache_cpus(struct kmem_cache *s)
+
+	s->cpu_slab = __alloc_percpu(sizeof(struct kmem_cache_cpu),
+				     2 * sizeof(void *));
+
+	if (!s->cpu_slab)
+		return 0;
+
+	init_kmem_cache_cpus(s);
+
+
+

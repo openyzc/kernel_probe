@@ -32,8 +32,8 @@ static inline struct thread_info *task_thread_info(struct task_struct *task)
   -- __HAVE_THREAD_FUNCTIONS is only for IA64;
   -- when CONFIG_THREAD_INFO_IN_TASK is enabled, the thread_info is defined in
 	task_struct, so we can get the thread_info directly;
-	otherwise, we should use the void *stack which had been intialised as
-	pointer to the thread_info&stack sharable space;
+	otherwise, we should use the void *stack of struct task_struct which had
+	been initialised as a pointer to the thread_info&stack sharable space;
 
 So, How to identify the thread_info and stack??
 
@@ -61,10 +61,20 @@ union thread_union init_thread_union __init_task_data = {
 	INIT_THREAD_INFO(init_task)
 #endif
 };
+The global init_thread_union is defined and initialized with
+INIT_THREAD_INFO(tsk) macro for the 'thread_info' field of union thread_union;
+
+On arm64, in arch/arm64/include/asm/thread_info.h :
+#define INIT_THREAD_INFO(tsk)						\
+{									\
+	.preempt_count	= INIT_PREEMPT_COUNT,				\
+	.addr_limit	= KERNEL_DS,					\
+}
+
 
 So, if CONFIG_THREAD_INFO_IN_TASK isn't enabled, the init_thread_union will be
 initialised with INIT_THREAD_INFO(init_task) by different architectures.
-Otherwise, init_thread_union is used just as thread stack.
+Otherwise, init_thread_union is just used as thread stack.
 
 
 
@@ -109,7 +119,7 @@ For growsup stack:
 	|		|
 	|		|  thread_info (For non CONFIG_THREAD_INFO_IN_TASK)
 	|		|
-	-----------------  task->stack ( &init_stack )
+	-----------------  task->stack ( &init_stack ) points to
 
 For grows down stack :
 
@@ -122,7 +132,7 @@ For grows down stack :
 	|		|
 	|		| thread_info
 	|		|
-	----------------- task->stack ( &init_stack)
+	----------------- task->stack ( &init_stack) points to
 
 So, you can understand the definiton of end_of_stack() in task_stack.h;
 

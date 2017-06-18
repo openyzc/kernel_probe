@@ -1,0 +1,215 @@
+
+
+1. get_partial_node(struct kmem_cache *s, struct kmem_cache_node *n,
+				struct kmem_cache_cpu *c, gfp_t flags)
+
+migrate the non-cache slub page from struct kmem_cache_node to struct
+kmem_cache_cpu. Please note:
+
+*) When CONFIG_SLUB_CPU_PARTIAL, there are 'struct page *page;' and 'struct page
+*partial;'; These first pointer cooperating with 'void **freelist;' to
+manipulate the slub objects available currently. And the '*partial' is the
+alternative slub pages when can't get slub object from '**freelist';
+
+*) The first slub page in n->partial will be selected as the new 'struct page
+*pate' where page->freelist = NULL and page->inuse = page->objects;
+The others in n->partial will be moved to s->cpu_slab->partial;
+
+*) all the slub pages linked newly in s->cpu_slab are frozen.
+(through acquire_slab)
+*) Meanwhile, some older slub pages will be unfrozen and departed from
+s->cpu_slab->partial to the n->partial or freed by unfreeze_partials ->
+discard_slab(s, page); It seems all the slub pages in n->partial should be
+unfrozen;
+
+
+2. deactivate_slab(struct kmem_cache *s, struct page *page,
+				void *freelist)
+
+This function will deactivate the designated slub page in s->cpu_slab;
+
+It will rebase all the slub objects headed by 'void *freelist' to catenate the
+exiting page->freelist. All the slub objects in 'void *freelist' will be freed
+as unused objects and make the page->inuse--; Of-course, the 'void *freelist'
+can be NULL which represents All the frozen objects are used.
+
+After combination, we can know what is the status of this slub page.
+
+*) new.inuse == 0
+Which represents the slub page is FREE(No any space was allocated for objects);
+But whether freeing this page should also depend on this 'n->nr_partial >=
+s->min_partial'.
+If this condition is not matched, this page is not be assigned as M_FREE and
+will not be freed by discard_slab(s, page);
+
+*) new.freelist
+Which represents there are unpopulated space in this slub page for the slub
+objects. But whether there are space populated by some slub objects also depends
+on the new.inuse. If new.inuse is ZERO, then all space are free but
+'n->nr_partial >= s->min_partial' doesn't match. Otherwise, this page is parital
+populated. Then the page status will be assigned as M_PARTIAL;
+
+*) new.inuse && new.freelist == NULL
+which should represents M_FULL. (also new.inuse == new.objects)
+
+Based on the page status, this slub page will be linked to n->partial or
+n->full:
+
+*) M_PARTIAL
+add_partial(n, page, tail);
+!!! Please note that when n->nr_partial < s->min_partial, the M_FREE page will
+aslo be treated as M_PARTIAL;
+
+*) M_FULL
+Only for CONFIG_SLUB_DEBUG is enabled;
+Otherwise, the M_FULL page will be kept in n->partial list;
+
+If CONFIG_SLUB_DEBUG is disabled, there is no n->full. So, the slub page
+allocted by new_slab() must be stored in s->cpu_slab->page to avoid the lose of
+slub page. I think that is the reason about the following processings:
+
+in ___slab_alloc():
+	page = c->page;
+	if (likely(!kmem_cache_debug(s) && pfmemalloc_match(page, gfpflags)))
+		goto load_freelist;
+
+static inline int kmem_cache_debug(struct kmem_cache *s)
+{
+#ifdef CONFIG_SLUB_DEBUG
+	return unlikely(s->flags & SLAB_DEBUG_FLAGS);
+#else
+	return 0;
+#endif
+}
+
+static inline bool kmem_cache_has_cpu_partial(struct kmem_cache *s)
+{
+#ifdef CONFIG_SLUB_CPU_PARTIAL
+	return !kmem_cache_debug(s);
+#else
+	return false;
+#endif
+}
+
+So, Only when !CONFIG_SLUB_DEBUG or !(s->flags & SLAB_DEBUG_FLAGS), slub can
+apply the CONFIG_SLUB_CPU_PARTIAL really. And s->cpu_slab->page,
+s->cpu_slab->freelist are available.
+
+*) M_FREE
+The page will be freed;
+
+*) All the deactive page are unfrozen
+page->frozen = 0;
+
+3. How to allocate slab
+
+slab_alloc_node --> __slab_alloc -->___slab_alloc
+
+
+static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+		gfp_t gfpflags, int node, unsigned long addr)
+
+/*
+ * Firstly, get the percpu slub page. If valid, then will continue the
+ * processing relative to kmem_cache_has_cpu_partial.
+ */
+	page = c->page;
+	if (!page)
+		goto new_slab;
+redo:
+
+/* Only use the slub page with the same NUMA node. */
+
+	if (unlikely(!node_match(page, node))) {
+		int searchnode = node;
+
+		if (node != NUMA_NO_NODE && !node_present_pages(node))
+			searchnode = node_to_mem_node(node);
+
+		if (unlikely(!node_match(page, searchnode))) {
+			stat(s, ALLOC_NODE_MISMATCH);
+			deactivate_slab(s, page, c->freelist);
+			c->page = NULL;
+			c->freelist = NULL;
+			goto new_slab;
+		}
+	}
+	...
+
+/* It is greate there are available objects yet. */
+	/* must check again c->freelist in case of cpu migration or IRQ */
+	freelist = c->freelist;
+	if (freelist)
+		goto load_freelist;
+
+	freelist = get_freelist(s, page);
+/*
+ * I think this page is FULL page which was linked in c->partial before.
+ * Otherwise, the page->freelist should not be NULL.
+ */
+	if (!freelist) {
+		c->page = NULL;
+		stat(s, DEACTIVATE_BYPASS);
+		goto new_slab;
+	}
+
+	stat(s, ALLOC_REFILL);
+
+load_freelist:
+	/*
+	 * freelist is pointing to the list of objects to be used.
+	 * page is pointing to the page from which the objects are obtained.
+	 * That page must be frozen for per cpu allocations to work.
+	 */
+	VM_BUG_ON(!c->page->frozen);
+	c->freelist = get_freepointer(s, freelist);
+	c->tid = next_tid(c->tid);
+	return freelist;
+
+new_slab:
+/* As s->min_partial can reserve at least s->min_parital pages in
+ * s->cpu_slab->partial(You can refer to deactivate_slab).
+ * Then some M_FULL pages will still be kept in n->partial for
+ * kmem_cache_has_cpu_partial(). So, it is possible there are multiple slub
+ * pages in n->partial and after get_partial_node(), the s->cpu_slab->partial
+ * will have several pages. Some of them are FULL with NULL '*freelist'.
+ * I think that is why these code make sense in ___slab_allloc():
+ *	freelist = get_freelist(s, page);
+ *
+ *	if (!freelist) {
+ *		c->page = NULL;
+ *		stat(s, DEACTIVATE_BYPASS);
+ *		goto new_slab;
+ *	}
+ * As this is sepecific for FULL pages and those pages are in c->partial for
+ * reservation, here, we don't need to free them as they are M_FULL although
+ * they are linked in partial list.
+ * When the total 'n->nr_partial >= s->min_partial'is satisified, will trigger
+ * the page free by discard_slab(s, page) in
+ * deactivate_slab --> discard_slab(s, page) or when the total cached
+ * objects,'oldpage->pobjects' is bigger than 's->cpu_partial', then can trigger
+ * the release of all cached slub pages to n->parital or free part of those
+ * pages:
+ * get_partial_node -> put_cpu_partial -> unfreeze_partials() -->
+ * discard_slab(s, page) when (!new.inuse && n->nr_partial >= s->min_partial).
+ * All the M_FREE slub pages will be discarded/freed.
+ */
+
+	if (c->partial) {
+		page = c->page = c->partial;
+		c->partial = page->next;
+		stat(s, CPU_PARTIAL_ALLOC);
+		c->freelist = NULL;
+		goto redo;
+	}
+
+	freelist = new_slab_objects(s, gfpflags, node, &c);
+
+So, In summary,
+1) In the partial list, it is completely possible there are
+multiple pages whose status is M_FREE/M_FULL/M_PARTIAL;
+2) Only when SLUB_DEBUG doesn't work, the kmem_cache_has_cpu_partial will be
+enabled and c->partial, c->page will workable. I think probably the maintainer
+doesn't need the faster path for slub debug as it is slow in slub debug mode.
+
+

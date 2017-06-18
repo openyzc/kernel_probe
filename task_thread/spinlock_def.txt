@@ -1,0 +1,24 @@
+
+in include/linux/spinlock_api_smp.h :
+
+#ifdef CONFIG_INLINE_SPIN_LOCK
+#define _raw_spin_lock(lock) __raw_spin_lock(lock)
+#endif
+
+
+And kernel/locking/spinlock.c :
+
+#ifndef CONFIG_INLINE_SPIN_LOCK
+void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
+{
+	__raw_spin_lock(lock);
+}
+
+
+static inline void __raw_spin_lock(raw_spinlock_t *lock)
+{
+	preempt_disable();
+	spin_acquire(&lock->dep_map, 0, 0, _RET_IP_);
+	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
+}
+

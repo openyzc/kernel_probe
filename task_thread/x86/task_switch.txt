@@ -1,0 +1,112 @@
+
+asmlinkage __visible void __sched schedule(void)
+{
+	struct task_struct *tsk = current;
+
+	sched_submit_work(tsk);
+	do {
+		preempt_disable();
+		__schedule(false);
+		sched_preempt_enable_no_resched();
+	} while (need_resched());
+}
+
+static void __sched notrace __schedule(bool preempt)
+{
+	...
+	if (likely(prev != next)) {
+		rq->nr_switches++;
+		rq->curr = next;
+		++*switch_count;
+
+		trace_sched_switch(preempt, prev, next);
+
+		/* Also unlocks the rq: */
+		rq = context_switch(rq, prev, next, &rf);
+	} else {
+	...
+	}
+}
+
+static __always_inline struct rq *
+context_switch(struct rq *rq, struct task_struct *prev,
+	       struct task_struct *next, struct rq_flags *rf)
+{
+	...
+	/* Here we just switch the register state and the stack. */
+	switch_to(prev, next, prev);
+	barrier();
+
+	return finish_task_switch(prev);
+}
+
+For x86,
+
+#define switch_to(prev, next, last)					\
+do {									\
+	prepare_switch_to(prev, next);					\
+									\
+	((last) = __switch_to_asm((prev), (next)));			\
+} while (0)
+
+in entry_32.S :
+
+ENTRY(__switch_to_asm)
+	/*
+	 * Save callee-saved registers
+	 * This must match the order in struct inactive_task_frame
+	 */
+	pushl	%ebp
+	pushl	%ebx
+	pushl	%edi
+	pushl	%esi
+
+	/* switch stack */
+	movl	%esp, TASK_threadsp(%eax)
+	movl	TASK_threadsp(%edx), %esp
+
+#ifdef CONFIG_CC_STACKPROTECTOR
+	movl	TASK_stack_canary(%edx), %ebx
+	movl	%ebx, PER_CPU_VAR(stack_canary)+stack_canary_offset
+#endif
+
+	/* restore callee-saved registers */
+	popl	%esi
+	popl	%edi
+	popl	%ebx
+	popl	%ebp
+
+	jmp	__switch_to
+END(__switch_to_asm)
+
+
+This function '__switch_to_asm' is our emphasis.
+
+*) When calling __switch_to_asm(), CPU will push the next instruction following
+the '((last) = __switch_to_asm((prev), (next)));' into the stack frame;
+*) In __switch_to_asm(), the stack hasn't switched yet before these:
+	movl	%esp, TASK_threadsp(%eax)
+	movl	TASK_threadsp(%edx), %esp
+*) After that, the stack is new, but the EIP is not changed.
+	popl	%esi
+	popl	%edi
+	popl	%ebx
+	popl	%ebp
+
+	jmp	__switch_to
+
+All the above are happened in new stack.
+
+__switch_to is a function defined in arch/x86/kernel/process_32.c; So, when it
+return by 'ret', will pop the EIP saved in the new stack before this
+scheduling. So, CPU can continue the work on the new thread/task.
+
+Normally, the new EIP should be the end of 'switch_to(prev, next, prev);',
+finally will finished the corresponding 'schedule()' calling when the new
+thread/task was switched last time, and start the processing just after the
+'schedule()' for the new thread/task.
+
+This idea is very important to understand the task switch.
+
+
+

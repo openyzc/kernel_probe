@@ -1,0 +1,64 @@
+In mmu, there are many occasions to call some page flags operations such as
+PageHead(page).
+
+Where those are defined?
+
+In include/linux/page-flags.h, there is a enum pageflags, where all page flags
+are there in use.
+
+
+Also in include/linux/page-flags.h, we have these macros definition:
+
+#define TESTPAGEFLAG(uname, lname, policy)				\
+static __always_inline int Page##uname(struct page *page)		\
+	{ return test_bit(PG_##lname, &policy(page, 0)->flags); }
+
+#define SETPAGEFLAG(uname, lname, policy)				\
+static __always_inline void SetPage##uname(struct page *page)		\
+	{ set_bit(PG_##lname, &policy(page, 1)->flags); }
+
+#define CLEARPAGEFLAG(uname, lname, policy)				\
+static __always_inline void ClearPage##uname(struct page *page)		\
+	{ clear_bit(PG_##lname, &policy(page, 1)->flags); }
+
+We apply these to define the page flags operations such as PageHead.
+
+
+Compared with the following definitions:
+#define __SETPAGEFLAG(uname, lname, policy)				\
+static __always_inline void __SetPage##uname(struct page *page)		\
+	{ __set_bit(PG_##lname, &policy(page, 1)->flags); }
+
+#define __CLEARPAGEFLAG(uname, lname, policy)				\
+static __always_inline void __ClearPage##uname(struct page *page)	\
+	{ __clear_bit(PG_##lname, &policy(page, 1)->flags); }
+
+#define TESTSETFLAG(uname, lname, policy)				\
+static __always_inline int TestSetPage##uname(struct page *page)	\
+	{ return test_and_set_bit(PG_##lname, &policy(page, 1)->flags); }
+
+#define TESTCLEARFLAG(uname, lname, policy)				\
+static __always_inline int TestClearPage##uname(struct page *page)	\
+	{ return test_and_clear_bit(PG_##lname, &policy(page, 1)->flags); }
+
+The difference is between '__set_bit' and 'set_bit'. We know __set_bit doesn't
+guarantee the atomic as without the bus lock.
+
+We take PageHead() as the example, there are those definitions in
+include/linux/page-flags.h :
+
+__PAGEFLAG(Head, head, PF_ANY) CLEARPAGEFLAG(Head, head, PF_ANY)
+
+
+Please note that, the page flags is in the least significant bits, and the bits
+which are used to store section, zone ID are from most significant bit. you can
+refer to the include/linux/mm.h for these macros:
+
+/* Page flags: | [SECTION] | [NODE] | ZONE | [LAST_CPUPID] | ... | FLAGS | */
+#define SECTIONS_PGOFF		((sizeof(unsigned long)*8) - SECTIONS_WIDTH)
+#define NODES_PGOFF		(SECTIONS_PGOFF - NODES_WIDTH)
+#define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
+#define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
+
+
+

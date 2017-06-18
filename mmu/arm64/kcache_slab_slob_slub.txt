@@ -1,0 +1,48 @@
+
+The entry is kmem_cache_init().
+
+1. The relations among head files
+
+For struct kmem_cache, there are several definitiions in kernel. So, which is
+the right one?
+
+There are three head files which have the definition of struct kmem_cache. But
+there are these including relationship also:
+
+yzc@yzc-linaro:~/linaro/work_dir/its_v3/src$ grep -nrI 'linux\/slub_def.h' .
+--include=*.c --include=*.h
+./mm/slab.h:37:#include <linux/slub_def.h>
+yzc@yzc-linaro:~/linaro/work_dir/its_v3/src$ grep -nrI 'linux\/slab_def.h' .
+--include=*.c --include=*.h
+./mm/slab.h:33:#include <linux/slab_def.h>
+
+So, we only check the mm/slab.h :
+
+#ifdef CONFIG_SLOB
+......
+
+struct kmem_cache {
+	unsigned int object_size;/* The original size of the object */
+	unsigned int size;	/* The aligned/padded/added on size  */
+	unsigned int align;	/* Alignment as calculated */
+	unsigned long flags;	/* Active flags on the slab */
+	const char *name;	/* Slab name for sysfs */
+	int refcount;		/* Use counter */
+	void (*ctor)(void *);	/* Called on object slot creation */
+	struct list_head list;	/* List of all slab caches on the system */
+};
+
+#endif /* CONFIG_SLOB */
+
+#ifdef CONFIG_SLAB
+#include <linux/slab_def.h>
+#endif
+
+#ifdef CONFIG_SLUB
+#include <linux/slub_def.h>
+#endif
+
+
+So, For SLUB, the definition is in linux/slub_def.h;
+
+

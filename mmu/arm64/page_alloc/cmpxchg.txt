@@ -1,0 +1,81 @@
+On arm64, the cmpxchg relevant macros are in
+arch/arm64/include/asm/atomic_ll_sc.h :
+
+
+We only refer to the x86 to know what is going on for ARM64.
+
+You can refer to this website:
+
+http://www.longene.org/forum/viewtopic.php?t=2216
+
+前几天，为了这个函数花了好多时间，由于参考的资料有误，一直都没有看明白，直到google之后，总算搞明白了，因此写出来大家分享一下。
+在Linux内核中，提供了比较并交换的函数cmpxchg，代码在include/asm-i386/cmpxchg.h中，函数的原型是：
+
+代码: 全选
+    cmpxchg(void *ptr, unsigned long old, unsigned long new);
+
+
+函数完成的功能是：将old和ptr指向的内容比较，如果相等，则将new写入到ptr中，返回old，如果不相等，则返回ptr指向的内容。
+
+
+在linux中的实现是这样的。
+
+代码: 全选
+    #define cmpxchg(ptr,o,n)\
+        ((__typeof__(*(ptr)))__cmpxchg((ptr),(unsigned long)(o),\
+                        (unsigned long)(n),sizeof(*(ptr))))
+
+
+很明显，这个函数就是调用了__cmpxchg。
+
+代码: 全选
+    static inline unsigned long __cmpxchg(volatile void *ptr, unsigned long old,
+                          unsigned long new, int size)
+    {
+        unsigned long prev;
+        switch (size) {
+        case 1:
+            __asm__ __volatile__(LOCK_PREFIX "cmpxchgb %b1,%2"
+                         : "=a"(prev)
+                         : "q"(new), "m"(*__xg(ptr)), "0"(old)
+                         : "memory");
+            return prev;
+        case 2:
+            __asm__ __volatile__(LOCK_PREFIX "cmpxchgw %w1,%2"
+                         : "=a"(prev)
+                         : "r"(new), "m"(*__xg(ptr)), "0"(old)
+                         : "memory");
+            return prev;
+        case 4:
+            __asm__ __volatile__(LOCK_PREFIX "cmpxchgl %1,%2"
+                         : "=a"(prev)
+                         : "r"(new), "m"(*__xg(ptr)), "0"(old)
+                         : "memory");
+            return prev;
+        }
+        return old;
+    }
+
+
+以最为常用的4字节交换为例，主要的操作就是汇编指令cmpxchgl
+%1,%2，注意一下其中的%2，也就是后面的"m"(*__xg(ptr))。
+__xg是在这个文件中定义的宏：
+struct __xchg_dummy { unsigned long a[100]; };
+#define __xg(x) ((struct __xchg_dummy *)(x))
+那么%2经过预处理，展开就是"m"(*((struct __xchg_dummy
+*)(ptr)))，这种做法，就可以达到在cmpxchg中的%2是一个地址，就是ptr指向的地址。如果%2是"m"(ptr)，那么指针本身的值就出现在cmpxchg指令中。
+
+我手头有一份《奔腾指令速查》，其中对cmpxchg的说明是这样的：
+
+代码: 全选
+    CMPXCHG r/m32,r32 0F B1 /r CMPXCHG EBX,ECX
+；如果EAX与EBX相等，则ECX送EBX且ZF置1；否则EBX送ECX，且ZF清0
+
+
+文章里用的是MS的汇编格式，换成AT&T的格式就是：
+
+代码: 全选
+    cmpxchg %ecx,
+%ebx；如果EAX与EBX相等，则ECX送EBX且ZF置1；否则EBX送ECX，且ZF清0
+
+

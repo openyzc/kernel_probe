@@ -1,0 +1,53 @@
+
+kfree --> slab_free --> do_slab_free --> __slab_free
+
+
+in do_slab_free():
+
+*) if (likely(page == c->page))
+which means the objects to be freed are in the slub page of s->cpu_slab->page.
+we can directly update the page->freelist to point to the new freed object.
+
+	if (likely(page == c->page)) {
+		set_freepointer(s, tail_obj, c->freelist);
+
+		if (unlikely(!this_cpu_cmpxchg_double(
+				s->cpu_slab->freelist, s->cpu_slab->tid,
+				c->freelist, tid,
+				head, next_tid(tid)))) {
+
+			note_cmpxchg_failure("slab_free", s, tid);
+			goto redo;
+		}
+		stat(s, FREE_FASTPATH);
+	}
+
+*) __slab_free(s, page, head, tail_obj, cnt, addr)
+
+when page to be freed in c->partial, the similar operation as the c->page was
+performed.
+
+when page is in n->partial, there are three cases:
+
+*) M_PARTIAL ---> M_PARTIAL
+continue keep the page in the n->partial; ONly add the freed objects to the
+page->freelist;
+
+*) M_PARTIAL --> M_FREE (new.inuse == 0)
+When (!new.inuse && n->nr_partial >= s->min_partial)), go to slab_empty to free
+the corresponding page;
+
+*) M_FULL --> M_PARTIAL (!prior)
+Will be divided into two cases:
+1) kmem_cache_has_cpu_partial
+	put_cpu_partial(s, page, 1);
+	to link this page with c->partial;
+2) if (!kmem_cache_has_cpu_partial(s) && unlikely(!prior))
+	remove the page from full list to the n->partial;
+
+
+
+
+
+
+

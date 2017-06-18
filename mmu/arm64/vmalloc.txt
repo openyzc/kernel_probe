@@ -1,0 +1,45 @@
+
+The kernel vmalloc area is [VMALLOC_START, VMALLOC_END).
+
+pkmap is [PKMAP_BASE, PKMAP_BASE + PAGE_SIZE * (LAST_PKMAP + 1))
+
+kmap is [FIX_KMAP_BEGIN, FIX_KMAP_END]
+
+
+#define VMALLOC_OFFSET	(8 * 1024 * 1024)
+#define VMALLOC_START	((unsigned long)high_memory + VMALLOC_OFFSET)
+
+#ifdef CONFIG_HIGHMEM
+# define VMALLOC_END	(PKMAP_BASE - 2 * PAGE_SIZE)
+#else
+# define VMALLOC_END	(FIXADDR_START - 2 * PAGE_SIZE)
+#endif
+
+
+PAGE_OFFSET high_memory VMALLOC_START VMALLOC_END PKMAP_BASE
+	-------------------------------------------------------------------
+	|	|	|		|	 |	|		|
+	|direct	|8M	| VMALLOC	| 2 pages|PKMAP	|FIXADDR	|
+	|	|	|		|	 |option|		|
+	------------------------------------------------------------------
+
+The above is based on x86. ARM also support the HIGHMEM as it is specific for
+32bits.
+
+
+1. what are the difference between vmalloc, kmap(), kmap_atomic?
+
+*) All these three mechamisms are available for HIGHMEM;
+But pkmap and kmap are only for HIGHMEM. Vmalloc is also for NORMAL;
+*) kmap_atomic is based on FIXADDR.
+As FIX_KMAP_END = FIX_KMAP_BEGIN+(KM_TYPE_NR*NR_CPUS)-1, So,
+kmap is divided percpu, each cpu will has separate KMAP region coverd KM_TYPE_NR
+pages. Based on this percpu structure and the preempt disable, the kmap is
+non-blocking. This is different from pkmap/kmap where there is no global lock
+and is atomic; But I am confused why this kmap_atomic_prot() can be used in
+interrupt context. Is it because this kmap_atomic_prot() will not sleep? But it
+should not be concurrent.
+*) The pages for vmalloc() are probably not contiguous as those pages will be
+allocated one by one.
+
+

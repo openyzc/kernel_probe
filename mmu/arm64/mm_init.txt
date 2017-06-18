@@ -1,0 +1,80 @@
+corresponding to mm_init().
+
+static void __init mm_init(void)
+{
+	/*
+	 * page_ext requires contiguous pages,
+	 * bigger than MAX_ORDER unless SPARSEMEM.
+	 */
+	page_ext_init_flatmem();
+	mem_init();
+	kmem_cache_init();
+	percpu_init_late();
+	pgtable_init();
+	vmalloc_init();
+	ioremap_huge_init();
+}
+
+
+1. page_ext_init_flatmem()
+
+This is only for non-CONFIG_SPARSEMEM, that is to say, FLAT_MEMORY;
+We don't spend time on this at this moment;
+
+2. mem_init()
+
+Major work is to setup the buddy lists;
+
+3. kmem_cache_init()
+
+initialize the slub/slab/slob
+After this, the kmalloc can work.
+
+4. percpu_init_late
+
+In the setup_per_cpu_areas --> pcpu_embed_first_chunk -->
+pcpu_setup_first_chunk(), some static local arrays are used for the
+pcpu_first_chunk and pcpu_reserved_chunk as at that moment, slab is not ready.
+So, when slab is ready, we should replace these with the slab space.
+That is just what percpu_init_late() do.
+
+Please note the difference between pcpu_embed_first_chunk() and
+pcpu_page_first_chunk() :
+*) The percpu space for each cpu is page aligned in pcpu_page_first_chunk;
+*) One cpu corresponds one pcpu group in pcpu_page_first_chunk. But in
+pcpu_embed_first_chunk(), it is possible there are multiple cpu in the group.
+*) All page units of percpu area of pcpu_page_first_chunk() will be mapped to a
+continguous VM area; But the pages of percpu area are not necessarily physical
+contiguous;
+
+
+5. pgtable_init
+
+For ARM64,
+#define pgtable_cache_init	pgd_cache_init
+
+	pgd_cache = kmem_cache_create("pgd_cache", PGD_SIZE, PGD_SIZE,
+				      SLAB_PANIC, NULL);
+
+So, a new kmem_cache node will be created whose element size is PGD_SIZE:
+	#define PGD_SIZE	(PTRS_PER_PGD * sizeof(pgd_t))
+
+6. vmalloc_init
+
+*) initialize two percpu variables for each possible cpu:
+vmap_block_queue
+vfree_deferred
+*) insert the used VM area in vmlist initialized in early boot to the VM tree:
+	for (tmp = vmlist; tmp; tmp = tmp->next) {
+		va = kzalloc(sizeof(struct vmap_area), GFP_NOWAIT);
+		va->flags = VM_VM_AREA;
+		va->va_start = (unsigned long)tmp->addr;
+		va->va_end = va->va_start + tmp->size;
+		va->vm = tmp;
+		__insert_vmap_area(va);
+	}
+
+
+
+
+

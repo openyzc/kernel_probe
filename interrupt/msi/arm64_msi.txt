@@ -1,0 +1,165 @@
+
+
+
+1. How to bind a pci device with msi domain?
+
+pci_device_add --> pci_set_msi_domain(dev) --> pci_dev_msi_domain --> d =
+pci_msi_get_device_domain(dev)
+
+in pci_msi_get_device_domain(), there are two branches:
+
+1) DTS
+
+	dom = of_msi_map_get_device_domain(&pdev->dev, rid);
+
+2) ACPI + IORT
+
+	dom = iort_get_device_domain(&pdev->dev, rid);
+
+At last, the dev->msi_domain will be set by 'dev_set_msi_domain(&dev->dev, d)';
+
+
+2. How to implement the msi initialization?
+
+We take MSI as the example.
+
+msi_capability_init  ---> pci_msi_setup_msi_irqs(dev, nvec, PCI_CAP_ID_MSI)
+--->msi_domain_alloc_irqs(domain, &dev->dev, nvec)
+
+Please note that, the irq domain for the PCI RP is the one created in
+its_init_domain() whose domain parent is its_parent created in gic_init_bases().
+
+its_irq_domain_alloc --> its_alloc_device_irq(its_dev, &hwirq) will create the
+hwirq for this alloc of IRQ.
+
+
+
+3. How to send the MSI message?
+
+in drivers/pci/msi.c :
+__pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+
+The *msg will contain the data which will be writen to
+PCI_MSI_DATA_32/PCI_MSI_DATA_64; contine the address which will be written to
+PCI_MSI_ADDRESS_LO/PCI_MSI_ADDRESS_HI.
+
+
+msi_domain_activate(struct irq_domain *domain,
+				struct irq_data *irq_data) --->
+irq_chip_write_msi_msg(struct irq_data *data,
+					  struct msi_msg *msg) --->
+	data->chip->irq_write_msi_msg(data, msg)
+
+Here, chip->irq_write_msi_msg can be :
+
+irq-gic-v3-its-pci-msi.c (drivers/irqchip):
+	.irq_write_msi_msg = pci_msi_domain_write_msg,
+msi.c (drivers/pci):
+	chip->irq_write_msi_msg = pci_msi_domain_write_msg;
+platform-msi.c (drivers/base):
+	chip->irq_write_msi_msg = platform_msi_write_msg;
+
+Before calling irq_chip_write_msi_msg, irq_chip_compose_msi_msg(irq_data, &msg)
+will be called:
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	for (; data; data = data->parent_data)
+#endif
+		if (data->chip && data->chip->irq_compose_msi_msg)
+			pos = data;
+	if (!pos)
+		return -ENOSYS;
+
+	pos->chip->irq_compose_msi_msg(pos, msg);
+
+So, the struct irq_data of root domain will be used and call the
+pos->chip->irq_compose_msi_msg().
+
+3.1 the calling chain of 'chip->irq_write_msi_msg'
+
+probe_irq_on  --> irq_startup(desc, false)
+
+in irqdomain.c :
+
+msi_domain_alloc_irqs  --> 
+irq_domain_activate_irq --->
+__irq_domain_activate_irq --> domain->ops->activate(domain, irq_data) --->
+
+msi_domain_activate(struct irq_domain *domain,
+				struct irq_data *irq_data)
+ ---> irq_chip_write_msi_msg 
+
+void irq_domain_activate_irq(struct irq_data *irq_data)
+{
+	if (!irqd_is_activated(irq_data)) {
+		__irq_domain_activate_irq(irq_data);
+		irqd_set_activated(irq_data);
+	}
+}
+
+static void __irq_domain_activate_irq(struct irq_data *irq_data)
+{
+	if (irq_data && irq_data->domain) {
+		struct irq_domain *domain = irq_data->domain;
+
+		if (irq_data->parent_data)
+			__irq_domain_activate_irq(irq_data->parent_data);
+		if (domain->ops->activate)
+			domain->ops->activate(domain, irq_data);
+	}
+}
+
+So, the domain->ops->activate() will be called from top to bottom.
+
+
+
+I think for any MSI device, only need to execute activate hook one time, then
+the device can trigger MSI message when there are any interrupts need sent. All
+these are done by HW, I think.
+
+
+4. How mbigen works?
+
+1) mbigen_device_probe() --> 		domain =
+		platform_msi_create_device_domain(&child->dev, num_pins,
+					   mbigen_write_msg,
+					   &mbigen_domain_ops,
+					   mgn_chip) --->
+	domain = irq_domain_create_hierarchy(dev->msi_domain, 0, nvec,
+					     of_node_to_fwnode(dev->of_node),
+					     ops, data)
+
+#The domain is platform domain specific for mbigen child devices.
+#The host_data of irq domain is 'struct platform_msi_priv_data';
+
+
+mbigen_write_msg, mbigen_domain_ops
+
+
+2)
+The parent domain of mbigen platform domain is created in
+irq-gic-v3-its-pci-msi.c :
+
+its_pci_of_msi_init  --> its_pci_msi_init_one --> msi_create_irq_domain(fwnode,
+info, parent) --> irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info)
+
+#host_data of irq domain is 'struct msi_domain_info its_pci_msi_domain_info';
+# struct irq_domain_ops msi_domain_ops
+
+3) the parent domain of its-pci-msi is :
+
+its_of_probe --> its_probe_one(&res, &np->fwnode, of_node_to_nid(np)) -->
+its_init_domain(handle, its) --> inner_domain = irq_domain_create_tree(handle,
+&its_domain_ops, its)
+
+#host_data is 'struct msi_domain_info *info';
+#struct irq_domain_ops its_domain_ops whose inner_domain->bus_token =
+DOMAIN_BUS_NEXUS;
+# parent domain is its_parent;
+
+
+
+
+
+
+

@@ -1,0 +1,13 @@
+
+
+1.  pfmemalloc
+
+What is the use of flag PF_MEMALLOC?
+
+PF_MEMALLOC含义：
+
+当前进程有很多可以释放的内存，如果能分配一点紧急内存给当前进程，那么当前进程可以返回更多的内存给系统。非内存管理子系统不应该使用这个标记，除非这次分配保证会释放更大的内存给系统。如果每个子系统都滥用这个标记，可能会耗尽内存管理子系统的保留内存。
+
+You also can refer to https://lwn.net/Articles/594725/;
+
+

@@ -1,5 +1,333 @@
 
 start_kernel() --> setup_per_cpu_areas()
 
+For ARM64, HAVE_SETUP_PER_CPU_AREA is normally enabled depended on NUMA.
+So, the setup_per_cpu_areas(void) in numa.c will be applied.
+
+---Some configure items on ARM64
+
+HAVE_SETUP_PER_CPU_AREA
+
+--- The definition of static percpu variable
+in include/linux/percpu-defs.h :
+
+#define DEFINE_PER_CPU(type, name)					\
+	DEFINE_PER_CPU_SECTION(type, name, "")
+
+For ARM64, ARCH_NEEDS_WEAK_PER_CPU and CONFIG_DEBUG_FORCE_WEAK_PER_CPU are not
+defined, so :
+
+#define DEFINE_PER_CPU_SECTION(type, name, sec)				\
+	__PCPU_ATTRS(sec) PER_CPU_DEF_ATTRIBUTES			\
+	__typeof__(type) name
+
+#define __PCPU_ATTRS(sec)						\
+	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
+	PER_CPU_ATTRIBUTES
+
+
+==========The ARM64 percpu memory allocation ===========
+
+void __init setup_per_cpu_areas(void)
+{
+	unsigned long delta;
+	unsigned int cpu;
+	int rc;
+
+	/*
+	 * Always reserve area for module percpu variables.  That's
+	 * what the legacy allocator did.
+	 */
+	rc = pcpu_embed_first_chunk(PERCPU_MODULE_RESERVE,
+				    PERCPU_DYNAMIC_RESERVE, PAGE_SIZE,
+				    pcpu_cpu_distance,
+				    pcpu_fc_alloc, pcpu_fc_free);
+	if (rc < 0)
+		panic("Failed to initialize percpu areas.");
+
+	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
+	for_each_possible_cpu(cpu)
+		__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu];
+}
+
+So, The pcpu_embed_first_chunk() is the critical function. And we should know
+what are the exact meanings of pcpu_base_addr, pcpu_unit_offsets[].
+
+
+1. pcpu_build_alloc_info
+
+It is worth to take some time to understand this function.
+
+The major work of this function are :
+1) classfy all the available CPUs and divide them into groups based on the
+CPU proximity;
+
+Two static arrray defined in this function :
+	group_map[cpu] : the value is proximity group ID;
+	group_cnt[group] : How many CPUs in this proximity group;
+
+2) choose a right upa to make full use of the memory space allocated on a CPU.
+Which means that the memory cost is minimum with this choosen upa.
+
+	size_sum = PFN_ALIGN(static_size + reserved_size +
+			    max_t(size_t, dyn_size, PERCPU_DYNAMIC_EARLY_SIZE));
+	dyn_size = size_sum - static_size - reserved_size;
+
+	/*
+	 * Determine min_unit_size, alloc_size and max_upa such that
+	 * alloc_size is multiple of atom_size and is the smallest
+	 * which can accommodate 4k aligned segments which are equal to
+	 * or larger than min_unit_size.
+	 */
+	min_unit_size = max_t(size_t, size_sum, PCPU_MIN_UNIT_SIZE);
+
+	alloc_size = roundup(min_unit_size, atom_size);
+	upa = alloc_size / min_unit_size;
+
+Up to now, a rough 'upa' was selected. It is based on the sum of static_size +
+reserved_size + dyn_size and is the aliquot of alloc_size and min_unit_size;
+
+But this is not the final result. As it only consider the situation for one
+CPU. We need to find a 'upa' which are best for all possible CPUs. As the
+cpu count of one group is different, the remainder of a group with different
+'upa' is different too. (group_cnt[group] % upa)
+
+As each percpu space dispreading among all CPUs have the same size, if we can
+find a 'upa' to make the total percpu space units are minimal, then we can
+populate minimal memory, that is what we want.
+
+Based on this idea, some processes were done in this function. You can refer to
+the code lines from :
+	last_allocs = INT_MAX;
+	for (upa = max_upa; upa; upa--) {
+		...
+		if (allocs > last_allocs)
+			break;
+		last_allocs = allocs;
+		best_upa = upa;
+	}
+
+Based on the choosen 'upa', we can calculate the total unit for all possible
+CPUs :
+	for (group = 0; group < nr_groups; group++)
+		nr_units += roundup(group_cnt[group], upa);
+
+Then allocate the struct pcpu_alloc_info and initialise :
+	ai = pcpu_alloc_alloc_info(nr_groups, nr_units);
+	if (!ai)
+		return ERR_PTR(-ENOMEM);
+	cpu_map = ai->groups[0].cpu_map;
+
+	for (group = 0; group < nr_groups; group++) {
+		ai->groups[group].cpu_map = cpu_map;
+		cpu_map += roundup(group_cnt[group], upa);
+	}
+
+Please note that, ai->groups[0].cpu_map points to a consecutive memory, that is
+to say, it is an array whose element is 'int'. Actually, the cpu ID will be
+stored there a bit later :
+		for_each_possible_cpu(cpu)
+			if (group_map[cpu] == group)
+				gi->cpu_map[gi->nr_units++] = cpu;
+
+3) The understanding about all fields of struct pcpu_alloc_info
+
+	ai->static_size = static_size;
+	ai->reserved_size = reserved_size;
+	ai->dyn_size = dyn_size;
+/* unit_size is the size of each percpu space for one CPU. This is very
+ * important as the percpu space allocation will depend on this later.
+ */
+	ai->unit_size = alloc_size / upa;
+	ai->atom_size = atom_size;
+/* The total size to be allocated from one CPU, this size is aligned to the
+ * atom_size. If the atom_size is big enough, several percpu units will be back
+ * to back in this alloc_size memory area.
+ */
+	ai->alloc_size = alloc_size;
+
+	for (group = 0, unit = 0; group_cnt[group]; group++) {
+		struct pcpu_group_info *gi = &ai->groups[group];
+
+		/*
+		 * Initialize base_offset as if all groups are located
+		 * back-to-back.  The caller should update this to
+		 * reflect actual allocation.
+		 */
+		gi->base_offset = unit * ai->unit_size;
+
+		for_each_possible_cpu(cpu)
+			if (group_map[cpu] == group)
+				gi->cpu_map[gi->nr_units++] = cpu;
+		/* nr_units is the total unit count for one proximity group
+		 * which includes the alignment cost.
+		 */
+		gi->nr_units = roundup(gi->nr_units, upa);
+		unit += gi->nr_units;
+	}
+
+2. pcpu_embed_first_chunk
+
+1) first will call pcpu_build_alloc_info() to make a struct pcpu_alloc_info
+ready;
+2) allocate a consective memory area for a CPU proximity group
+	for (group = 0; group < ai->nr_groups; group++) {
+		struct pcpu_group_info *gi = &ai->groups[group];
+		ptr = alloc_fn(cpu, gi->nr_units * ai->unit_size, atom_size)
+		...
+		areas[group] = ptr;
+
+		base = min(ptr, base);
+		if (ptr > areas[highest_group])
+			highest_group = group;
+	}
+So, we know this memory area is allocated from the first valid CPU of the
+proximity group, the size is gi->nr_units * ai->unit_size and is aligned to
+atom_size.
+
+The new allocated memory pointer is VM and is stored into a local array of
+areas[].
+
+3) copy the initial static percpu variables to the new percpu area :
+		for (i = 0; i < gi->nr_units; i++, ptr += ai->unit_size) {
+			if (gi->cpu_map[i] == NR_CPUS) {
+				/* unused unit, free whole */
+				free_fn(ptr, ai->unit_size);
+				continue;
+			}
+			/* copy and return the unused part */
+			memcpy(ptr, __per_cpu_load, ai->static_size);
+			free_fn(ptr + size_sum, ai->unit_size - size_sum);
+		}
+
+So, the percpu memory area will be used like the below :
+
+		-------------------   The cost of alignment to 'upa'
+		| 	empty X	  |
+		-------------------
+		|	empty ... |
+		-------------------	---
+gi->nr_units-1	| ai->unit_size	  |	  |
+		-------------------	  |
+	- 2	| ai->unit_size	  |	  |
+		-------------------	   \
+	- 3	| ai->unit_size	  |	   /	alloc_size
+		-------------------	  |
+		|	...	  |	  |
+		-------------------	---
+	1	| ai->unit_size	  |
+		-------------------
+	0	| ai->unit_size	  |
+		-------------------
+
+4) update the base_offset
+
+	for (group = 0; group < ai->nr_groups; group++) {
+		ai->groups[group].base_offset = areas[group] - base;
+	}
+
+So, the ai->groups[group].base_offset is the distance from the lowests 'base'
+and the base address of percpu area for 'group'.
+
+5) the last step is rc = pcpu_setup_first_chunk(ai, base)
+
+As for this function, please refer to the next section.
+
+3. pcpu_setup_first_chunk
+
+I think this function majorly finishes these works:
+1) initialise the global array of 'pcpu_unit_offset'
+pcpu_unit_offset is actually an array whose index is cpu ID, whose value is the
+offset between its base percpu space address and the lowest percpu area address.
+
+2) create the list array of pcpu_slot[]
+
+3) initialise and linked the 'pcpu_first_chunk'
+
+
+===== What is the difference between embed and page percpu allocation?
+*) I think if your system has a big atom_size, then probablly embed is your
+preference.
+*) Only one group of ZERO in pcpu_alloc_info;
+All the CPUs are in the same group 0.
+each cpu will allocate its own pcpu area from its corresponding node rathern
+than one of the proximity group.
+*) the pcpu area will be mapped to VMALLOC too;
+
+
+======The offset of pcpu to the raw pcpu base
+
+In setup_per_cpu_areas(), after pcpu_embed_first_chunk() return, we had
+initialised the pcpu_unit_offsets[cpu] as the offset between pcpu base of cpu
+whose ID is 'cpu' and pcpu_base_addr(which is the lowest VA of all percpu base
+addresses). Then after the further process below, we can store the offset
+between percpu base of 'cpu' and the raw percpu base:
+
+	delta = (unsigned long)pcpu_base_addr - (unsigned long)__per_cpu_start;
+	for_each_possible_cpu(cpu)
+		__per_cpu_offset[cpu] = delta + pcpu_unit_offsets[cpu];
+
+Here, pcpu_unit_offsets[cpu] is assignated as base_offset of the 'cpu'.
+Which represents the offset between the start VM of 'cpu' percpu space and the
+lowest VM of all CPU groups' percpu areas:
+
+	for (group = 0; group < ai->nr_groups; group++) {
+		ai->groups[group].base_offset = areas[group] - base;
+	}
+
+	in pcpu_setup_first_chunk():
+	unit_off[cpu] = gi->base_offset + i * ai->unit_size;
+	...
+	pcpu_unit_offsets = unit_off;
+
+ok, __per_cpu_offset[cpu] is the difference between the start VM of 'cpu'
+percpu space and __per_cpu_start.
+
+
+Please note that, pcpu_group_offsets[] is same for all percpu chunks.
+Each chunk has pcpu_unit_size when new chunk is allocated. You can refer to
+pcpu_alloc_chunk().
+
+For the percpu setup in early boot, only the first chunk will be initialised in
+pcpu_setup_first_chunk().
+
+====== Several macros to convert the percpu variable========
+
+#define per_cpu_ptr(ptr, cpu)						\
+({									\
+	__verify_pcpu_ptr(ptr);						\
+	SHIFT_PERCPU_PTR((ptr), per_cpu_offset((cpu)));			\
+})
+
+#define raw_cpu_ptr(ptr)						\
+({									\
+	__verify_pcpu_ptr(ptr);						\
+	arch_raw_cpu_ptr(ptr);						\
+})
+
+These two macros can convert the global pcpu pointer to the local pointer
+specific for 'cpu';
+The raw_cpu_ptr(ptr) is for local cpu and more efficient;
+The per_cpu_ptr(ptr, cpu) is for the designated 'cpu';
+
+======= The macros for dynamic percpu area =======
+
+#ifndef __addr_to_pcpu_ptr
+#define __addr_to_pcpu_ptr(addr)					\
+	(void __percpu *)((unsigned long)(addr) -			\
+			  (unsigned long)pcpu_base_addr	+		\
+			  (unsigned long)__per_cpu_start)
+#endif
+#ifndef __pcpu_ptr_to_addr
+#define __pcpu_ptr_to_addr(ptr)						\
+	(void __force *)((unsigned long)(ptr) +				\
+			 (unsigned long)pcpu_base_addr -		\
+			 (unsigned long)__per_cpu_start)
+#endif
+
+__addr_to_pcpu_ptr(addr) will convert the VM of base percpu space to the global
+percpu variable address; This is the return value of pcpu_alloc() and can be
+used as the input parameter of per_cpu_ptr(ptr, cpu)/raw_cpu_ptr(ptr);
+
 
 

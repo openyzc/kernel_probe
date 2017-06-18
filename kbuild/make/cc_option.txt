@@ -1,0 +1,91 @@
+
+In Makefile, there are so many lines like:
+
+KBUILD_CFLAGS   += $(call cc-option, -fno-var-tracking-assignments)
+
+So, what does this means?
+
+1. As for the 'call', you can refer to the make manual:
+
+8.7 The call Function
+
+2. where is the definition of 'cc-option'?
+
+You can find this in scripts/Kbuild.include :
+
+# cc-option
+# Usage: cflags-y += $(call cc-option,-march=winchip-c6,-march=i586)
+
+cc-option = $(call try-run,\
+        $(CC) $(KBUILD_CPPFLAGS) $(CC_OPTION_CFLAGS) $(1) -c -x c /dev/null -o
+"$$TMP",$(1),$(2))
+
+
+And the try-run is defined as :
+# output directory for tests below
+TMPOUT := $(if $(KBUILD_EXTMOD),$(firstword $(KBUILD_EXTMOD))/)
+
+# try-run
+# Usage: option = $(call try-run, $(CC)...-o "$$TMP",option-ok,otherwise)
+# Exit code chooses option. "$$TMP" is can be used as temporary file and
+# is automatically cleaned up.
+try-run = $(shell set -e;               \
+        TMP="$(TMPOUT).$$$$.tmp";       \
+        TMPO="$(TMPOUT).$$$$.o";        \
+        if ($(1)) >/dev/null 2>&1;      \
+        then echo "$(2)";               \
+        else echo "$(3)";               \
+        fi;                             \
+        rm -f "$$TMP" "$$TMPO")
+
+So, the private function of cc-option will check which flag among $1 or $2 works
+well, and assign the workable flag to the left Make variable, such as
+'KBUILD_CFLAGS'.
+
+===================
+
+One more hint about the __KERNEL__ macro used in kernel code, such as:
+#ifndef __KERNEL__
+
+struct pt_regs {
+
+We find this definition in Makefile :
+KBUILD_CPPFLAGS := -D__KERNEL__
+
+As KBUILD_CPPFLAGS are used in these variables defined in scripts/Makefile.lib :
+
+orig_c_flags   = $(KBUILD_CPPFLAGS) $(KBUILD_CFLAGS) $(KBUILD_SUBDIR_CCFLAGS) \
+                 $(ccflags-y) $(CFLAGS_$(basetarget).o)
+_c_flags       = $(filter-out $(CFLAGS_REMOVE_$(basetarget).o), $(orig_c_flags))
+orig_a_flags   = $(KBUILD_CPPFLAGS) $(KBUILD_AFLAGS) $(KBUILD_SUBDIR_ASFLAGS) \
+                 $(asflags-y) $(AFLAGS_$(basetarget).o)
+_a_flags       = $(filter-out $(AFLAGS_REMOVE_$(basetarget).o), $(orig_a_flags))
+_cpp_flags     = $(KBUILD_CPPFLAGS) $(cppflags-y) $(CPPFLAGS_$(@F))
+
+__c_flags       = $(if $(obj),$(call addtree,-I$(src)) -I$(obj)) \
+                  $(call flags,_c_flags)
+__a_flags       = $(call flags,_a_flags)
+__cpp_flags     = $(call flags,_cpp_flags)
+endif
+
+And this macro:
+
+c_flags        = -Wp,-MD,$(depfile) $(NOSTDINC_FLAGS) $(LINUXINCLUDE)     \
+                 $(__c_flags) $(modkern_cflags)                           \
+                 $(basename_flags) $(modname_flags)
+
+And in scripts/Makefile.build :
+
+ifndef CONFIG_MODVERSIONS
+cmd_cc_o_c = $(CC) $(c_flags) -c -o $@ $<
+
+
+
+So, I think for kernel compilation, __KERNEL__ is defined.
+
+Then, the 'struct pt_regs' for kernel should apply the definition in
+arch/x86/include/asm/ptrace.h; The definition in
+arch/x86/include/uapi/asm/ptrace.h should be for the user-space head files.
+
+
+

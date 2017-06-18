@@ -1,0 +1,59 @@
+
+1. Why get_freepointer_safe is applied in slab_alloc_node fastpath?
+
+in mm/maccess.c :
+
+long __weak probe_kernel_read(void *dst, const void *src, size_t size)
+    __attribute__((alias("__probe_kernel_read")));
+
+long __probe_kernel_read(void *dst, const void *src, size_t size)
+{
+	long ret;
+	mm_segment_t old_fs = get_fs();
+
+	set_fs(KERNEL_DS);
+	pagefault_disable();
+	ret = __copy_from_user_inatomic(dst,
+			(__force const void __user *)src, size);
+	pagefault_enable();
+	set_fs(old_fs);
+
+	return ret ? -EFAULT : 0;
+}
+
+I think the major processing is in pagefault_disable().
+the comments for probe_kernel_read() has described clearly :
+ * We ensure that the copy_from_user is executed in atomic context so that
+ * do_page_fault() doesn't attempt to take mmap_sem.
+
+
+2. put_cpu_partial and unfreeze_partials
+
+put_cpu_partial(struct kmem_cache *s, struct page *page, int drain) will add the
+'*page' as frozen slub page/pages to 's->cpu_slab->partial'; Based on this
+function, the c->partial will be set as non-NULL node, then __slab_alloc can
+apply these lines:
+	if (c->partial) {
+		page = c->page = c->partial;
+		c->partial = page->next;
+		stat(s, CPU_PARTIAL_ALLOC);
+		c->freelist = NULL;
+		goto redo;
+	}
+to allocate a new slub object fastly.
+
+unfreeze_partials(struct kmem_cache *s, struct kmem_cache_cpu *c) will call
+add_partial(n, page, DEACTIVATE_TO_TAIL) to move the unfrozen slub page/pages
+from s->cpu_slab->partial to node[]->partial;
+
+3. new_slab_objects(s, gfpflags, node, &c)
+
+After new_slab_objects(),
+*) the c->page will be assigned with a frozen slub
+page/pages which is full(in_use == object) and page->freelist == NULL;
+*) c->page will be set as the frozen slub page;
+
+
+4. deactivate_slab
+
+

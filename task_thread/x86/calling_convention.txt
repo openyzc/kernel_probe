@@ -1,0 +1,49 @@
+
+
+You can refer to the abi_64.pdf and abi386_4.pdf for the standard calling
+convention and stack frame.
+
+
+for i386:
+
+1) Registers %ebp, %ebx, %edi, %esi, and %e p ‘‘belong’’ to the
+calling function. In other words, a called function must preserve these
+registers' values for its caller. Remaining registers ‘‘belong’’ to the called
+function. If a calling function wants to preserve such a register value across a
+function call, it must save the value in its local stack frame.
+
+I think the registers for calling function aren't volatile, the callee should
+save them in its own stack and restore when return to keep the original value.
+The other registers are volatile or scatch, so, caller must take the
+responsibility to keep those registers value.
+
+2) What registers are used to transfer parameters?
+
+________N_a_m__e_ ____________________U_s_a_g_e_________________
+%e a x 				Return value
+% e d x				Dividend register (divide operations)
+% e c x 			Count register (shift and string operations)
+% e b x 			Local register variable
+% e b p 			Stack frame pointer (optional) G
+% e s i 			Local register variable
+% e d i 			Local register variable
+%_e _s _p			S_ta_c_k_ _p_o_i_n_t_er_
+
+
+For x86_64:
+
+1. If the class is MEMORY, pass the argument on the stack.
+2. If the class is INTEGER, the next available register of the sequence %rdi,
+%rsi, %rdx, %rcx, %r8 and %r9 is used13.
+
+pointer belongs to the integer class.
+
+
+Registers %rbp, %rbx and
+%r12 through %r15 “belong” to the calling function and the called function is
+required to preserve their values. In other words, a called function must
+preserve these registers’ values for its caller. Remaining registers “belong” to
+the called function.5 If a calling function wants to preserve such a register
+value across a function call, it must save the value in its local stack frame.
+
+

@@ -1,0 +1,116 @@
+
+start_kernel --> build_all_zonelists(NULL, NULL)
+
+This function can also work after booting for hot-plug memory.
+
+Here we only care about the invokation for boot stage.
+
+build_all_zonelists --> build_all_zonelists_init --> __build_all_zonelists -->
+build_zonelists(pg_data_t *pgdat)
+
+This 'build_zonelists(pg_data_t *pgdat)' will initialise the 'node_zonelists[]'
+for the node corresponds to '*pgdat';
+
+The index of node_zonelists[] is parsed by some inline functions such as
+gfp_zonelist(flags). Just like this:
+
+static inline int gfp_zonelist(gfp_t flags)
+{
+#ifdef CONFIG_NUMA
+	if (unlikely(flags & __GFP_THISNODE))
+		return ZONELIST_NOFALLBACK;
+#endif
+	return ZONELIST_FALLBACK;
+}
+
+So, if the gfp_t flags without __GFP_THISNODE, then will apply the
+ZONELIST_NOFALLBACK, otherwise, will return ZONELIST_FALLBACK;
+
+
+1. Get the zone_type from gfp_t
+
+-------Another important macro----------
+
+static inline enum zone_type gfp_zone(gfp_t flags)
+{
+	enum zone_type z;
+	int bit = (__force int) (flags & GFP_ZONEMASK);
+
+	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+					 ((1 << GFP_ZONES_SHIFT) - 1);
+	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
+	return z;
+}
+
+This macro makes use the GFP_ZONE_TABLE and GFP_ZONE_BAD.
+
+*) all the processing is based on the lowest significant four bits; The
+GFP_ZONEMASK covers this;
+*) All the valid four bit combinations are represented in GFP_ZONE_TABLE;
+*) All the invalid four bit combinations are represented in GFP_ZONE_BAD;
+*) each GFP_ZONES_SHIFT in GFP_ZONE_TABLE is a segment where valid zone type is
+stored. The ZONE_NORMAL is the first segment; That is why GFP_ZONES_SHIFT is
+ZONES_SHIFT at most cases;
+*) In GFP_ZONE_BAD, the value of each invalid combination is the bit index where
+is set.
+
+So, based on the above keynotes, gfp_zone(gfp_t flags) will return the zone_type
+corresponds to the input 'gfp_t flags';
+
+2. The key of zonelist initialization
+
+2.1 The macros which have effect about the element sequences in zonelist
+
+#define ZONELIST_ORDER_NODE     1
+
+struct zonelist {
+	struct zoneref _zonerefs[MAX_ZONES_PER_ZONELIST + 1];
+};
+
+*) firstly find the closest node based on the distance and other factors from
+the local node(The node which is initialised this calling);
+*) traverse all the available zone types of that pickup node and fill them one
+by one from large zone type to small zone type;
+*) pickup the next node from all the unselected ones and loop again, until all
+online nodes were completed;
+
+#define ZONELIST_ORDER_ZONE     2 
+
+*) traverse all the online nodes and fill them into the global array of
+node_order[]; The nodes in node_order[] are ordered by the distance;
+*) from high zone type to low zone type, select the matched zone_type when
+traversing the node_order[], and fill in the zone pointer to
+zonelist->_zonerefs[] one bye one;
+*) looping until all zone type are finished;
+
+in __build_all_zonelists(), the percpu struct variable of boot_pagesets will be
+intialised:
+
+	for_each_possible_cpu(cpu) {
+		setup_pageset(&per_cpu(boot_pageset, cpu), 0);
+
+Probably the usage of struct per_cpu_pages pcp will be presented later in other
+technical notes, but not here at this moment.
+
+3. vm_total_pages = nr_free_pagecache_pages()  in build_all_zonelists
+
+*) traverse the fallback list of the node corresponds to current CPU;
+struct zonelist *zonelist = node_zonelist(numa_node_id(), GFP_KERNEL);
+*) calculate the free memory pages size over the hig wartermark for that node;
+
+	for_each_zone_zonelist(zone, z, zonelist, offset) {
+		unsigned long size = zone->managed_pages;
+		unsigned long high = high_wmark_pages(zone);
+		if (size > high)
+			sum += size - high;
+	}
+
+Here, the 'offset' is the requested zone type.
+for_each_zone_zonelist(zone, z, zonelist, offset) will traverse each zone whose
+type is not bigger than 'offset';
+*) substract the high mark pages size from the zone->managed_pages to calculate
+the sum;
+
+
+
+

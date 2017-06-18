@@ -1,0 +1,65 @@
+
+The entry function is pcpu_alloc.
+
+Please keep these notes in mind:
+*) There are three pcpu areas :
+	static, which corresponding to the __per_cpu_start and __per_cpu_end;
+	reserved, which is specific for module percpu variables;
+	dynamic, which is allocated during run time;
+
+For dynamic pcpu area, the struct pcpu_chunk and the pcpu_slot[] are defined
+for it.
+
+As the booting also need to use some dynamic percpu variables, in
+setup_per_cpu_areas() will firstly setup a struct pcpu_chunk pointed by
+pcpu_first_chunk.
+
+	setup_per_cpu_areas --> pcpu_embed_first_chunk(PERCPU_MODULE_RESERVE,
+				    PERCPU_DYNAMIC_RESERVE --->
+		pcpu_setup_first_chunk()
+
+So, there are one available pcpu chunk for the dynamic allocation.
+
+*) The dynamic pcpu area can extend if needed
+
+two cases can trigger the extension:
+  -- chunk->map_alloc is not enough and there are no unpopulated pages in all
+	pcup_chunk node;
+  -- list_empty(&pcpu_slot[pcpu_nr_slots - 1]), which means no biggest pcpu slot
+	is available;
+
+Then pcpu_create_chunk() will be called to create new pcpu_chunk whose size is
+pcpu_unit_size. This new chunk will be linked to the pcpu_slot[pcpu_nr_slots -
+1];
+
+
+1. struct pcpu_chunk
+
+struct pcpu_chunk {
+	struct list_head	list;		/* linked to pcpu_slot lists */
+	int			free_size;	/* free bytes in the chunk */
+/* The biggest size of all free segments in this chunk. will be update in
+ * pcpu_alloc_area;
+ */
+	int			contig_hint;	/* max contiguous size hint */
+	void			*base_addr;	/* base address of this chunk */
+/*
+ * *map is an array whose value is the offset of a allocated pcpu continguous
+ * segment.
+ * if the LSB is '1', then represents this map[] is populated.
+ */
+	int			map_used;
+	int			map_alloc;	/* # of map entries allocated */
+	int			*map;		/* allocation map */
+	struct list_head	map_extend_list;/* on pcpu_map_extend_chunks */
+
+	void			*data;		/* chunk data */
+/* the index of the first unpopulated map[]. */
+	int			first_free;	/* no free below this */
+	bool			immutable;	/* no [de]population allowed */
+/* also the count of bits set in populated[]. */
+	int			nr_populated;	/* # of populated pages */
+	unsigned long		populated[];	/* populated bitmap */
+};
+
+

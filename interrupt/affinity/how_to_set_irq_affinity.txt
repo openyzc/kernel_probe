@@ -1,0 +1,49 @@
+
+
+Here, only x86 will be presented.
+
+in arch/x86/kernel/apic :
+
+apic_set_affinity
+
+assign_irq_vector(irq, data, dest)
+
+--> __assign_irq_vector
+
+
+The __assign_irq_vector is not so easy to be understanded as it seems also
+support the IRQ migration.
+
+1. A idle vector among all the CPUs of vector_searchmask will be picked up, and
+bind this relation:
+
+	for_each_cpu(new_cpu, vector_searchmask)
+		per_cpu(vector_irq, new_cpu)[vector] = irq_to_desc(irq);
+
+So, I think 'irq' can be redirected to vector among multiple CPUs of
+vectore_searchmask.
+
+2. how the struct acpi_chip_data is initialised?
+
+	d->cfg.vector = vector;
+	cpumask_copy(d->domain, vector_cpumask);
+
+3. How to select the vector?
+
+increased by step 16 started from 0x31;
+if rearch the first_system_vector,
+	increase the 'offset';
+
+		vector += 16;
+		if (vector >= first_system_vector) {
+			offset = (offset + 1) % 16;
+			vector = FIRST_EXTERNAL_VECTOR + offset;
+		}
+
+Which means we can start from 0x32 this time.
+
+
+If you want to know something more about irqbalance,
+
+https://access.redhat.com/solutions/677073
+
