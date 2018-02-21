@@ -1,0 +1,110 @@
+
+When calling mmap() to setup a anonymous shared mapping, the process will get
+to here in mmap_region():
+
+	} else if (vm_flags & VM_SHARED) {
+		error = shmem_zero_setup(vma);
+		if (error)
+			goto free_vma;
+	}
+
+shmem_zero_setup
+	--> file = __shmem_file_setup("dev/zero", size, vma->vm_flags,
+		S_PRIVATE)
+	vma->vm_file = file;
+	vma->vm_ops = &shmem_vm_ops;
+
+
+#define IS_PRIVATE(inode)	((inode)->i_flags & S_PRIVATE)
+will check the 'S_PRIVATE' in the 'inode->i_flags'.
+
+
+
+对于shmem, 有一些几点值得注意：
+1. shmem 目前的实现大多是基于 tmpfs系统的。否则是 ramfs;
+2. anonymous shared 的mmap 是基于shmem实现的。
+/dev/zero
+这个char设备只要带MAP_SHARED进行mmap时，实际是不需要传入'int
+fd'参数的。尽管此次mmap的操作效果是non-anoymous，但实际上是file-mapped的。
+参考 drivers/char/mem.c中的 get_unmapped_area_zero()
+	if (flags & MAP_SHARED) {
+		/*
+		 * mmap_zero() will call shmem_zero_setup() to create a file,
+		 * so use shmem's get_unmapped_area in case it can be huge;
+		 * and pass NULL for file as in mmap.c's get_unmapped_area(),
+		 * so as not to confuse shmem with our handle on "/dev/zero".
+		 */
+		return shmem_get_unmapped_area(NULL, addr, len, pgoff, flags);
+	}
+
+对应的，mmap实际是调用 mmap_zero()，在那里会通过shmem_zero_setup(vma)创建
+S_PRIVATE的shmem file，表示此file只是kernel内部可见/使用，因此S_PRIVATE
+保证内核在处理此shmem file时，不执行与普通文件操作类似的 security.c
+中的安全检查。
+
+但是如果 /dev/zero 是 MAP_PRIVATE 或者 直接open /read，那么不会调用到
+get_unmapped_area_zero(), 而是 通用的 ‘current->mm->get_unmapped_area(file,
+addr, len, pgoff, flags);‘。例如以下的代码是 MAP_PRIVATE的 file-mapping方式。
+
+fd = open("/dev/zero", O_RDWR); 
+a = mmap (0, 4096e4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FILE, fd, 0);
+
+
+其它普通的ANONYMOUS mapping, 如果是MAP_SHARED的，那么也是基于shmem file的：
+
+get_unmapped_area -->
+	} else if (flags & MAP_SHARED) {
+		/*
+		 * mmap_region() will call shmem_zero_setup() to create a file,
+		 * so use shmem's get_unmapped_area in case it can be huge.
+		 * do_mmap_pgoff() will clear pgoff, so match alignment.
+		 */
+		pgoff = 0;
+		get_area = shmem_get_unmapped_area;
+	}
+
+mmap_region -->
+	} else if (vm_flags & VM_SHARED) {
+		error = shmem_zero_setup(vma);
+		if (error)
+			goto free_vma;
+	}
+
+3. shmem同时也支持 普通S_IFREG 的shmem
+file文件操作，包括创建，symlink，mknod等。 譬如在 tmpfs 挂载的root
+目录下创建文件，或 temp file, log file等都是在 tmpfs中的。
+这些文件的操作是传统的，只是没有disk-backed，数据都是在内存中。
+
+参见 shmem_get_inode ：
+		case S_IFREG:
+			inode->i_mapping->a_ops = &shmem_aops;
+			inode->i_op = &shmem_inode_operations;
+			inode->i_fop = &shmem_file_operations;
+			mpol_shared_policy_init(&info->policy,
+						 shmem_get_sbmpol(sbinfo));
+			break;
+
+
+这个 shmem_get_inode 有以下调用路径：
+
+1） shmem_fill_super --> shmem_get_inode
+
+在tmpfs/ramfs mount时会被调用。
+
+2) shmem_tmpfile/shmem_mknod --> shmem_get_inode
+
+普通的文件操作
+
+3） __shmem_file_setup --> shmem_get_inode
+
+这里 __shmem_file_setup 主要两个调用路径：
+
+shmem_kernel_file_setup/shmem_zero_setup， 这里都是创建 带S_PRIVATE的shmem file;
+
+shmem_file_setup--> __shmem_file_setup(name, size, flags, 0)
+
+诸如 SYSCALL_DEFINE2(memfd_create, 等外部调用。
+
+
+
+

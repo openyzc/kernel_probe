@@ -1,0 +1,158 @@
+
+
+1. Some basic info
+
+1.1 CONFIG_ZONE_DMA32 and CONFIG_ZONE_DMA
+
+CONFIG_ZONE_DMA32 is only for X86_64:
+
+config ZONE_DMA32
+        def_bool y if X86_64
+
+Which means the DMA is below 4G.
+
+CONFIG_ZONE_DMA is configuarable :
+
+config ZONE_DMA
+        bool "DMA memory allocation support" if EXPERT
+        default y
+
+1.2 max_low_pfn and max_pfn, high_memory
+
+Actually, these variables are set before the page table initialization by
+init_mem_mapping(), because they will be used there.
+We discuss at this moment although it is a bit late.
+
+1) set 'max_pfn' based on the e820 info
+
+	max_pfn = e820__end_of_ram_pfn();
+
+	/* update e820 for memory not covered by WB MTRRs */
+	mtrr_bp_init();
+	if (mtrr_trim_uncached_memory(max_pfn))
+		max_pfn = e820__end_of_ram_pfn();
+
+	max_possible_pfn = max_pfn;
+
+Now, 'max_pfn' is the maximum physical page number based on the E820.
+
+2) For X86_32,
+
+#ifdef CONFIG_X86_32
+	/* max_low_pfn get updated here */
+	find_low_pfn_range();
+
+
+void __init find_low_pfn_range(void)
+{
+	/* it could update max_pfn */
+
+	if (max_pfn <= MAXMEM_PFN)
+		lowmem_pfn_init();
+	else
+		highmem_pfn_init();
+}
+
+#define MAXMEM_PFN	PFN_DOWN(MAXMEM)
+-- MAXMEM is the maximum physical direct addr theoretically. For X86_32, it is:
+#define MAXMEM	(VMALLOC_END - PAGE_OFFSET - __VMALLOC_RESERVE)
+
+__VMALLOC_RESERVE is 128M;
+
+For X86_64,
+
+#define MAXMEM		_AC(__AC(1, UL) << MAX_PHYSMEM_BITS, UL)
+
+But for x86_32, MAXMEM_PFN is not the maximum physical PFN, it is the possible
+direct PFN.
+
+-- when max_pfn <= MAXMEM_PFN, we will try to descrease max_low_pfn to satisfy
+the 'highmem_pages' requirement.
+If highmem_page && max_low_pfn - highmem_page > 64M, then
+	max_low_pfn -= highmem_pages;
+otherwise, max_low_pfn is kept as max_pfn;
+
+-- When max_pfn > MAXMEM_PFN, which means there are space between MAXMEM_PFN and
+max_pfn.
+We can use HIGHMEM for this case.
+
+max_low_pfn will be:
+
+	max_low_pfn = MAXMEM_PFN;
+/*
+ * max_pfn is big enough, but highmem_pages is small, decrease the max_pfn.
+ * which means we can not use all the available memory.
+ */
+	if (highmem_pages + MAXMEM_PFN < max_pfn)
+		max_pfn = MAXMEM_PFN + highmem_pages;
+/*
+ * We can make use all the available memory. But highmem_pages is too big. So
+ * that 'highmem_pages' will be dropped.
+ */
+	if (highmem_pages + MAXMEM_PFN > max_pfn) {
+		printk(KERN_WARNING MSG_HIGHMEM_TOO_SMALL,
+			pages_to_mb(max_pfn - MAXMEM_PFN),
+			pages_to_mb(highmem_pages));
+		highmem_pages = 0;
+	}
+
+For this case, if CONFIG_HIGHMEM/CONFIG_HIGHMEM64G is disabled, will print some
+WARNING messages.
+
+
+
+
+config HIGHMEM
+        def_bool y
+        depends on X86_32 && (HIGHMEM64G || HIGHMEM4G)
+
+config HIGHMEM64G
+        bool "64GB"
+        depends on !M486
+        select X86_PAE
+        ---help---
+          Select this if you have a 32-bit processor and more than 4
+          gigabytes of physical RAM.
+
+For high_memory of x86_32, it is set by initmem_init() in numa_32.c;
+void __init initmem_init(void)
+{
+	x86_numa_init();
+
+#ifdef CONFIG_HIGHMEM
+	highstart_pfn = highend_pfn = max_pfn;
+	if (max_pfn > max_low_pfn)
+		highstart_pfn = max_low_pfn;
+	printk(KERN_NOTICE "%ldMB HIGHMEM available.\n",
+	       pages_to_mb(highend_pfn - highstart_pfn));
+	high_memory = (void *) __va(highstart_pfn * PAGE_SIZE - 1) + 1;
+#else
+	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE - 1) + 1;
+#endif
+
+/*
+ * When CONFIG_HIGHMEM is enabled, the max_pfn should normally > max_low_pfn.
+ * Then high_memory is where 'max_low_pfn' start, which means the gap between
+ * max_pfn and max_low_pfn is HIGHMEM;
+ * If CONFIG_HIGHMEM is disabled, no matter what the difference between max_pfn
+ * and max_low_pfn is, just set high_memory as 'max_low_pfn' although kernel
+ * doesn't use the memory over 'high_memory';
+ */
+
+3) For X86_64
+
+/*
+ * When 'max_pfn' > 4G, then set the 'max_low_pfn' as the maximum E820 available
+ * PFN that is just below 4G;
+ * Otherwise, just set max_low_pfn = max_pfn, which means without HIGHMEM.
+ */
+	if (max_pfn > (1UL<<(32 - PAGE_SHIFT)))
+		max_low_pfn = e820__end_of_low_ram_pfn();
+	else
+		max_low_pfn = max_pfn;
+/* There is no HIGHMEM on X86_64, just set high_memory is the __va(max_pfn). */
+	high_memory = (void *)__va(max_pfn * PAGE_SIZE - 1) + 1;
+
+
+In summary, high_memory is not less than max_low_pfn << PAGE_SHIFT;
+

@@ -1,0 +1,162 @@
+
+in kernel/fork.c, there is this function definition:
+
+pid_t kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
+{
+	return _do_fork(flags|CLONE_VM|CLONE_UNTRACED, (unsigned long)fn,
+		(unsigned long)arg, NULL, NULL, 0);
+}
+
+When this new kernel thread is scheduled, the '*fn(*arg)' will be started as
+thread entry. But how to implement this?
+
+1. After the call of kernel_thread(), the newly created thread will not
+certainly be scheduled. kernel_thread() only create this thread and make it
+ready to be scheduled.
+
+2. when system boots, only PID0 is running, that is:
+init_task = INIT_TASK(init_task);
+
+This thread is run at the time when scheduler hasn't enabled. So it is obvious
+for init_task not to be run by schedule()/__schedule();
+
+But all the other threads should be scheduled based on __schedule();
+
+3. Supposed the newly kernel thread which created by kernel_thread() is
+scheduled now...
+
+__schedule(bool preempt) --> rq = context_switch(rq, prev, next, &rf) -->
+switch_to(prev, next, prev) -->
+
+#define switch_to(prev, next, last) 					\
+do {									\
+	prepare_switch_to(prev, next);					\
+									\
+	((last) = __switch_to_asm((prev), (next)));			\
+} while (0)
+
+we analyse the __switch_to_asm() for X86_64 here :
+
+ENTRY(__switch_to_asm)
+	/*
+	 * Save callee-saved registers
+	 * This must match the order in inactive_task_frame
+	 */
+	pushq	%rbp
+	pushq	%rbx
+	pushq	%r12
+	pushq	%r13
+	pushq	%r14
+	pushq	%r15
+
+	/* switch stack */
+	movq	%rsp, TASK_threadsp(%rdi)
+	movq	TASK_threadsp(%rsi), %rsp
+
+#ifdef CONFIG_CC_STACKPROTECTOR
+	movq	TASK_stack_canary(%rsi), %rbx
+	movq	%rbx, PER_CPU_VAR(irq_stack_union)+stack_canary_offset
+#endif
+
+	/* restore callee-saved registers */
+	popq	%r15
+	popq	%r14
+	popq	%r13
+	popq	%r12
+	popq	%rbx
+	popq	%rbp
+
+	jmp	__switch_to
+END(__switch_to_asm)
+
+
+To be more convenient to describe, suppose the old thread which will be switched
+out is A, the new thread is B.
+
+##When __switch_to_asm() is called with
+'(last) = __switch_to_asm((prev), (next))', the next instruction will be pushed
+to the kernel stack of thread A.
+
+Then the push operations of __switch_to_asm() are also stored data into the
+stack of thread A as the stack hasn't been switched at that moment.
+
+## Stack switch
+	movq	%rsp, TASK_threadsp(%rdi)
+	movq	TASK_threadsp(%rsi), %rsp
+
+## Pop out some data from the thread B's stack
+
+	popq	%r15
+	popq	%r14
+	popq	%r13
+	popq	%r12
+	popq	%rbx
+	popq	%rbp
+## After these 'popq', the %rsp points to the 'unsigned long ret_addr' of struct
+inactive_task_frame if the thread B is the newly forked thread and hasn't been
+scheduled before.
+
+You can refer to the copy_thread_tls(). There, has these code:
+	frame->ret_addr = (unsigned long) ret_from_fork;
+	...
+	if (unlikely(p->flags & PF_KTHREAD)) {
+		/* kernel thread */
+		memset(childregs, 0, sizeof(struct pt_regs));
+		frame->bx = sp;		/* function */
+		frame->r12 = arg;
+		return 0;
+	}
+
+So, ret_from_fork() will be called, then the 'frmae->bx' will be called in the
+processing of ret_from_fork() in entry_64.S/entry_32.S;
+
+There is a big change on switch_to() in 2016/8. You can refer to this patchset :
+https://lkml.org/lkml/2016/8/13/62
+
+x86: Rewrite switch_to()
+
+## If the thread B is not the first time to be scheduled, which means thread B
+had been switched out before this schedule in. So, these codes were executed in
+the time when B was switched out last time:
+
+ENTRY(__switch_to_asm)
+	/*
+	 * Save callee-saved registers
+	 * This must match the order in inactive_task_frame
+	 */
+	pushq	%rbp
+	pushq	%rbx
+	pushq	%r12
+	pushq	%r13
+	pushq	%r14
+	pushq	%r15
+
+Then we know in thread B's kernel stack, a struct like that was built:
+
+struct inactive_task_frame {
+#ifdef CONFIG_X86_64
+	unsigned long r15;
+	unsigned long r14;
+	unsigned long r13;
+	unsigned long r12;
+#endif
+	unsigned long bx;
+	unsigned long bp;
+	unsigned long ret_addr;
+};
+
+Here, 'ret_addr' is not ret_from_fork() which only works for the first
+schedule. 'ret_addr' should point to the next instruction just after the calling
+of __switch_to_asm() in macro switch_to().
+
+That is the normal path of schedule().
+
+
+
+As for how the execv() start the user-land entry function, please refer to
+how_iret_from_syscall.txt;
+It is no business of the schedule().
+
+
+
+

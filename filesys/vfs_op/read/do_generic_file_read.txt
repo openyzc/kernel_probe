@@ -1,0 +1,35 @@
+In mm/filemap.c :
+
+static ssize_t do_generic_file_read(struct file *filp, loff_t *ppos,
+		struct iov_iter *iter, ssize_t written)
+
+The 'ssize_t written' is the count written successfully to the buffer. Normally,
+it is ZERO. But it can be non-zero as the input count.
+After do_generic_file_read(), a total byte-count will be returned which covers
+the input 'ssize_t written'.
+
+	written += ret;
+	...
+	return written ? written : error;
+
+The 'loff_t *ppos' works as the input/output parameter. As input, it was
+initialized as the caller designated file offset. As output, it is modified by:
+	*ppos = kiocb.ki_pos;
+after the 'ret = call_read_iter(filp, &kiocb, &iter);' in new_sync_read().
+
+
+/* aligned down the '*ppos' as the starting page index for this READ. */
+	index = *ppos >> PAGE_SHIFT;
+/* The end page index(exclusive) for this READ. */
+	last_index = (*ppos + iter->count + PAGE_SIZE-1) >> PAGE_SHIFT;
+/* The starting page offset for this READ. It is based on the initial '*ppos'.*/
+	offset = *ppos & ~PAGE_MASK;
+
+/* These two lines calculate the page idex and page offset in last READ. Please
+ * note that 'prev_index' is the page index where the last READ happened, but
+ * 'prev_offset' is the next byte position to the page offset where the last
+ * READ was ended. */
+	prev_index = ra->prev_pos >> PAGE_SHIFT;
+	prev_offset = ra->prev_pos & (PAGE_SIZE-1);
+
+

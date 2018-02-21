@@ -1,0 +1,66 @@
+
+
+paging_init --> kmap_init()
+
+static void __init kmap_init(void)
+{
+	unsigned long kmap_vstart;
+
+	/*
+	 * Cache the first kmap pte:
+	 */
+	kmap_vstart = __fix_to_virt(FIX_KMAP_BEGIN);
+	kmap_pte = kmap_get_fixmap_pte(kmap_vstart);
+}
+
+Here, we need to comment something about 'kmap_pte =
+kmap_get_fixmap_pte(kmap_vstart)'. The 'kmap_pte' points to the PTE
+corresponding to FIX_KMAP_BEGIN.
+
+For FIX_KMAP, there are some fix entries for that:
+
+#ifdef CONFIG_X86_32
+	FIX_KMAP_BEGIN,	/* reserved pte's for temporary kernel mappings */
+	FIX_KMAP_END = FIX_KMAP_BEGIN+(KM_TYPE_NR*NR_CPUS)-1,
+
+The entries between FIX_KMAP_BEGIN ~ FIX_KMAP_END is larger than one page, we
+can't allocate the page table in the similar way as PKAMP.
+
+To improve the access efficiency and find the right entry for a KMAP request, it
+is better to allocate those page tables in contiguous pages.
+
+This call path achieve this:
+
+	early_ioremap_page_table_range_init -->
+		page_table_range_init(vaddr, end, pgd_base)
+
+
+1. kmap_atomic
+
+void *kmap_atomic(struct page *page)
+{
+	return kmap_atomic_prot(page, kmap_prot);
+}
+
+
+2. kunmap_atomic
+
+#define kunmap_atomic(addr)                                     \
+do {                                                            \
+	BUILD_BUG_ON(__same_type((addr), struct page *));       \
+	__kunmap_atomic(addr);                                  \
+} while (0)
+
+
+Kernel use this percpu variable to manage the PTE entry for FIX_KMAP.
+
+## __kmap_atomic_idx is the available idx for this CPU
+DECLARE_PER_CPU(int, __kmap_atomic_idx);
+
+-- each cpu has KM_TYPE_NR entries;
+-- kmap_atomic_idx_push() will return the current '__kmap_atomaic_idx' and
+increase by 1;
+-- kmap_atomic_idx_pop() decrease by 1 and return the new value;
+-- kmap_atomic_idx() return the current '__kmap_atomic_idx' - 1;
+
+

@@ -1,0 +1,151 @@
+
+What is the syscall for the mmap()?
+
+1. on x86_32, it will be:
+
+in mm/mmap.c :
+
+SYSCALL_DEFINE1(old_mmap, struct mmap_arg_struct __user *, arg)
+
+#ifdef __ARCH_WANT_SYS_OLD_MMAP
+struct mmap_arg_struct {
+	unsigned long addr;
+	unsigned long len;
+	unsigned long prot;
+	unsigned long flags;
+	unsigned long fd;
+	unsigned long offset;
+};
+
+As for '__ARCH_WANT_SYS_OLD_MMAP', in arch/x86/include/asm/unistd.h :
+
+# ifdef CONFIG_X86_32
+
+#  include <asm/unistd_32.h>
+#  define __ARCH_WANT_STAT64
+#  define __ARCH_WANT_SYS_IPC
+#  define __ARCH_WANT_SYS_OLD_MMAP
+#  define __ARCH_WANT_SYS_OLD_SELECT
+
+
+in arch/x86/include/asm/syscall.h :
+
+#if defined(CONFIG_X86_32)
+#define ia32_sys_call_table sys_call_table
+
+2. how to initialize the ia32_sys_call_table[__NR_syscall_compat_max+1] ?
+
+
+We can find the definition of ia32_sys_call_table[] in
+arch/x86/entry/syscall_32.c :
+
+__visible const sys_call_ptr_t ia32_sys_call_table[__NR_syscall_compat_max+1] =
+{
+	/*
+	 * Smells like a compiler bug -- it doesn't work
+	 * when the & below is removed.
+	 */
+	[0 ... __NR_syscall_compat_max] = &sys_ni_syscall,
+#include <asm/syscalls_32.h>
+};
+
+
+So, the default entry values are &sys_ni_syscall. The final setting should
+depend on the '#include <asm/syscalls_32.h>';
+
+Where is the file of asm/syscalls_32.h?
+
+we can't find this file in the pure kernel source tree.
+Actually it is generated during the kernel compile.
+
+	arch/x86/include/generated/asm/syscalls_32.h
+
+How this file is created?
+
+in arch/x86/entry/syscalls/Makefile :
+
+$(out)/syscalls_32.h: $(syscall32) $(systbl)
+        $(call if_changed,systbl)
+
+and where is the cmd_systbl for '$(call if_changed, systbl)'?
+
+syshdr := $(srctree)/$(src)/syscallhdr.sh
+systbl := $(srctree)/$(src)/syscalltbl.sh
+
+quiet_cmd_syshdr = SYSHDR  $@
+      cmd_syshdr = $(CONFIG_SHELL) '$(syshdr)' '$<' '$@' \
+                   '$(syshdr_abi_$(basetarget))' \
+                   '$(syshdr_pfx_$(basetarget))' \
+                   '$(syshdr_offset_$(basetarget))'
+quiet_cmd_systbl = SYSTBL  $@
+      cmd_systbl = $(CONFIG_SHELL) '$(systbl)' $< $@
+
+We can trace to the 'arch/x86/entry/syscalls', there are two shell files :
+
+yzc@yzc-linaro:~/linaro/work_dir/its_v3/src/arch/x86/entry/syscalls$ ls
+Makefile  syscall_32.tbl  syscall_64.tbl  syscallhdr.sh  syscalltbl.sh
+
+syscalls_32.h is the output of syscalltbl.sh;
+
+we can check what it looks like in syscalls_32.h :
+
+#ifdef CONFIG_X86_32
+__SYSCALL_I386(90, sys_old_mmap, )
+#else
+__SYSCALL_I386(90, sys32_mmap, )
+#endif
+
+
+As __SYSCALL_I386 is defined in syscall_32.c :
+#define __SYSCALL_I386(nr, sym, qual) [nr] = sym,
+
+extern asmlinkage long sys_ni_syscall(unsigned long, unsigned long, unsigned
+long, unsigned long, unsigned long, unsigned long);
+
+__visible const sys_call_ptr_t ia32_sys_call_table[__NR_syscall_compat_max+1] =
+{
+	/*
+	 * Smells like a compiler bug -- it doesn't work
+	 * when the & below is removed.
+	 */
+	[0 ... __NR_syscall_compat_max] = &sys_ni_syscall,
+#include <asm/syscalls_32.h>
+};
+
+
+So, after '#include <asm/syscalls_32.h>', the entries of ia32_sys_call_table[]
+are initialized.
+
+Last issue is remained: How to include the head files in the
+arch/x86/include/generated ?
+
+In the top Makefile :
+
+LINUXINCLUDE    := \
+		-I$(srctree)/arch/$(hdr-arch)/include \
+		-I$(objtree)/arch/$(hdr-arch)/include/generated/uapi \
+		-I$(objtree)/arch/$(hdr-arch)/include/generated \
+		$(if $(KBUILD_SRC), -I$(srctree)/include) \
+		-I$(objtree)/include
+
+
+So, those '<asm/*.h>' are searched in these 'LINUXINCLUDE' pathes, no matter
+'asm/' or 'uapi/asm'.
+
+
+
+Now, we can be back to the issues we concern, what is the syscall entry for
+mmap?
+
+SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, pgoff)
+
+This is the final entry for mmap^_^;
+
+
+
+
+
+
+

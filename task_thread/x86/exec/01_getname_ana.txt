@@ -1,0 +1,86 @@
+
+For execve(), we should first copy the 'filename' from user-space to kernel
+space. That is what getname(filename) will do.
+
+Let's dive into this.
+
+
+struct filename *
+getname(const char __user * filename)
+{
+	return getname_flags(filename, 0, NULL);
+}
+
+
+#define EMBEDDED_NAME_MAX	(PATH_MAX - offsetof(struct filename, iname))
+
+struct filename *
+getname_flags(const char __user *filename, int flags, int *empty)
+{
+
+	result = __getname();
+	if (unlikely(!result))
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * First, try to embed the struct filename inside the names_cache
+	 * allocation
+	 */
+	kname = (char *)result->iname;
+	result->name = kname;
+
+	len = strncpy_from_user(kname, filename, EMBEDDED_NAME_MAX);
+	if (unlikely(len < 0)) {
+		__putname(result);
+		return ERR_PTR(len);
+	}
+	...
+
+		result->name = kname;
+		len = strncpy_from_user(kname, filename, PATH_MAX);
+		if (unlikely(len < 0)) {
+			__putname(kname);
+			kfree(result);
+			return ERR_PTR(len);
+		}
+		if (unlikely(len == PATH_MAX)) {
+			__putname(kname);
+			kfree(result);
+			return ERR_PTR(-ENAMETOOLONG);
+		}
+
+So, the core is the strncpy_from_user().
+It is defined in lib/strncpy_from_user.c;
+
+You can find there is no the old access_ok() checking here. Actually, the
+equivalent checking will be:
+
+	max_addr = user_addr_max();
+	src_addr = (unsigned long)src;
+	if (likely(src_addr < max_addr)) {
+
+Then do_strncpy_from_user --> unsafe_get_user --> __get_user_size -->
+__get_user_asm
+
+#define __get_user_asm(x, addr, err, itype, rtype, ltype, errret)	\
+	asm volatile("\n"						\
+		     "1:	mov"itype" %2,%"rtype"1\n"		\
+		     "2:\n"						\
+		     ".section .fixup,\"ax\"\n"				\
+		     "3:	mov %3,%0\n"				\
+		     "	xor"itype" %"rtype"1,%"rtype"1\n"		\
+		     "	jmp 2b\n"					\
+		     ".previous\n"					\
+		     _ASM_EXTABLE(1b, 3b)				\
+		     : "=r" (err), ltype(x)				\
+		     : "m" (__m(addr)), "i" (errret), "0" (err))
+
+we know that from the above code, if there are some execptions occurred during
+the copy, the 'x' will be set as ZERO, and 'err' will be set as the 'errret'. No
+any real fixing to help we can get the valid data. This is acceptable. The fixup
+only want to terminate the operation when exceptions happen to avoid the
+infinitive exeception handings.
+
+
+
+

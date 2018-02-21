@@ -1,0 +1,73 @@
+
+
+__mutex_lock --> __mutex_lock_common
+
+
+两条调用路径，
+
+当 #ifdef CONFIG_DEBUG_LOCK_ALLOC 时，在 include/linux/mutex.h 中，
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+void __sched
+mutex_lock_nested(struct mutex *lock, unsigned int subclass)
+{
+	__mutex_lock(lock, TASK_UNINTERRUPTIBLE, subclass, NULL, _RET_IP_);
+}
+
+
+#define mutex_lock_interruptible(lock) mutex_lock_interruptible_nested(lock, 0)
+
+int __sched
+mutex_lock_interruptible_nested(struct mutex *lock, unsigned int subclass)
+{
+	return __mutex_lock(lock, TASK_INTERRUPTIBLE, subclass, NULL, _RET_IP_);
+}
+
+没有 CONFIG_DEBUG_LOCK_ALLOC时，使用 kernel/locking/mutex.c中的函数，
+
+void __sched mutex_lock(struct mutex *lock)
+{
+	might_sleep();
+
+	if (!__mutex_trylock_fast(lock))
+		__mutex_lock_slowpath(lock);
+}
+
+
+
+1. __mutex_trylock_or_owner
+
+如果当前 owner是 current，将返回 NULL，否则返回 当前的 owner.
+
+2. __mutex_lock_common
+
+struct mutex结构中的 spinlock_t		wait_lock 是用于保护 struct mutex
+避免多于一个访问并发。
+
+每个 需要等待mutex的thread, 将使用 一个 struct mutex_waiter waiter 节点 挂入到
+lock->wait_list中，然后
+		spin_unlock(&lock->wait_lock);
+		schedule_preempt_disabled();
+
+等待wakeup。
+一旦被wakeup，将再次尝试 调用 __mutex_trylock(lock)来lock mutex，直到成功返回T.
+在没能成功 lock前，不会 从 lock->wait_lock中删除 对应的 struct mutex_waiter：
+也就是不会调用
+	mutex_remove_waiter(lock, &waiter, current);
+
+
+
+
+表示当前 的mutex_waiter是lock->wait_lock中first 的节点，将首先被wakeup.
+#define MUTEX_FLAG_WAITERS	0x01
+表示当前 mutex_waiter节点成为了 first节点
+#define MUTEX_FLAG_HANDOFF	0x02
+
+#define MUTEX_FLAG_PICKUP	0x04
+
+另外，请注意 mutex_optimistic_spin(lock, ww_ctx, use_ww_ctx, NULL) 会被用于优化
+mutex 获取的效率。在 当前 mutex owner 在运行且 wait_lock中没有更高优先级的
+task在排队时，可以不sleep而是等待。
+
+
+

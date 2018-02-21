@@ -1,0 +1,17 @@
+
+
+This function will find the gap whose starting address is minimal and matches
+the VM range and the alignment.
+
+
+1. find the most left VMA whose rb_subtree_gap >= lenghth;
+
+2. check the gap between current VMA and previous VMA;
+
+3. As all left subtrees are finished check, traversing the right subtree;
+
+4. return to the '1' for all the sub VMAs;
+
+5. If can't find the qualified VMA, then traverse upstreaming;
+
+

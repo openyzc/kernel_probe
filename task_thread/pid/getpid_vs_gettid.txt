@@ -1,0 +1,87 @@
+
+
+       pid_t gettid(void);
+
+       Note: There is no glibc wrapper for this system call; see NOTES.
+
+DESCRIPTION
+       gettid()  returns  the  caller's thread ID (TID).  In a single-threaded
+       process, the thread ID is equal to the process ID (PID, as returned  by
+       getpid(2)).  In a multithreaded process, all threads have the same PID,
+       but each one has a unique TID.
+
+
+       pid_t getpid(void);
+       pid_t getppid(void);
+
+DESCRIPTION
+       getpid() returns the process ID of the calling process.  (This is often
+       used by routines that generate unique temporary filenames.)
+
+
+We will trace these two system calls to know what exactly will be returned from
+the kernel.
+
+
+In kernel/sys.c :
+
+SYSCALL_DEFINE0(getpid)
+{
+	return task_tgid_vnr(current);
+}
+
+/* Thread ID - the internal kernel "pid" */
+SYSCALL_DEFINE0(gettid)
+{
+	return task_pid_vnr(current);
+}
+
+1. getpid
+
+pid_t pid_vnr(struct pid *pid)
+{
+	return pid_nr_ns(pid, task_active_pid_ns(current));
+}
+
+static inline struct pid *task_tgid(struct task_struct *task)
+{
+	return task->group_leader->pids[PIDTYPE_PID].pid;
+}
+
+static inline pid_t task_tgid_vnr(struct task_struct *tsk)
+{
+	return pid_vnr(task_tgid(tsk));
+}
+
+1) task_tgid(tsk) will return the 'task->group_leader->pids[PIDTYPE_PID].pid' as
+the target; If the task is main thread, task->group_leader points to itself in
+copy_process(). So, 'pid' is same as the 'task_pid(tsk)', then pid_nr_ns(pid,
+task_active_pid_ns(current)) will return the pid_t whose level is equal to that
+of the main thread; 
+2) task_active_pid_ns(current) will return the lowest struct pid_namespace of
+'current'. If 'current' is non-main thread of some thread group, then no new
+lower pid_namespace was created during the fork/clone. So, the pid_namespace of
+'current' is same as that of the main thread. When pid_nr_ns(pid, xxx) runs, the
+local pid of main thread will be returned.
+That is what getpid() wants.
+
+
+
+
+
+
+
+SYSCALL_DEFINE0(getppid)
+{
+	int pid;
+
+	rcu_read_lock();
+	pid = task_tgid_vnr(rcu_dereference(current->real_parent));
+	rcu_read_unlock();
+
+	return pid;
+}
+
+So, getppid() is to get the thread group ID/Process ID of 'current's parent';
+
+

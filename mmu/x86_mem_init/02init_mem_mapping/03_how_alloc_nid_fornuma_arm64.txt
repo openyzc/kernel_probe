@@ -1,0 +1,73 @@
+
+
+We only discuss the ACPI method here.
+
+1. SRAT and MADT
+
+This is only for ARM64.
+
+acpi_numa_gicc_affinity_init()
+
+
+1.1 PXM and process ACPI UID
+
+In SRAT, there are the relation between PXM and processor local ACPI UID/APIC
+ID/x2APIC ID. This relation is stored in :
+
+	static int pxm_to_node_map[MAX_PXM_DOMAINS];
+
+The index is PXM. The value is the node id which is controled by nodes_found_map
+bitstring: static nodemask_t nodes_found_map = NODE_MASK_NONE;
+
+	static int node_to_pxm_map[MAX_NUMNODES];
+The index is node, the value is PXM;
+
+So, with PXM, we can be assigned a unique node id.
+
+All these are done by :
+
+	node = acpi_map_pxm_to_node(pxm);
+
+1.2 Get APIC ID from MADT by process UID
+
+
+	mpidr = acpi_map_madt_entry(pa->acpi_processor_uid);
+
+This function will setup the relation between processor and the interrupt
+controller that processor is bound to.
+
+For ARM64, the return value is MPIDR, for x86, the return value is APIC ID.
+
+
+This return value will be saved like that:
+
+	early_node_cpu_hwid[cpus_in_srat].node_id = node;
+	early_node_cpu_hwid[cpus_in_srat].cpu_hwid =  mpidr;
+
+So, we can know which node id a processer is relevant to. The index of
+early_node_cpu_hwid[] is the cpu id(logical);
+
+
+In SART:
+	PXM  -----------> Node  id
+	Processor UID
+
+In MADT:
+	Processor UID -----> APIC ID/MPIDR
+				Node id
+	logic CPU id
+
+
+2. 
+
+in include/linux/topology.h :
+
+#ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
+DECLARE_PER_CPU(int, numa_node);
+
+
+For x86, arm64, the 'CONFIG_USER_PERCPU_NUMA_NODE_ID' is enabled by default.
+
+This percpu variable stores the relation between cpu id and node id;
+
+

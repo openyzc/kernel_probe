@@ -1,0 +1,43 @@
+
+There are many protection bit enumeration definitions:
+
+#define VM_READ		0x00000001	/* currently active flags */
+#define VM_WRITE	0x00000002
+#define VM_EXEC		0x00000004
+#define VM_SHARED	0x00000008
+
+/* mprotect() hardcodes VM_MAYREAD >> 4 == VM_READ, and so for r/w/x bits. */
+#define VM_MAYREAD	0x00000010	/* limits for mprotect() etc */
+#define VM_MAYWRITE	0x00000020
+#define VM_MAYEXEC	0x00000040
+#define VM_MAYSHARE	0x00000080
+
+
+How to apply these in mmap()??
+
+1. 'unsigned long pgoff' is used to define the protection attributes of the
+mapping
+
+There are these processes in do_mmap() relevant to protection :
+
+** Add PROT_EXEC to 'prot' when 'READ_IMPLIES_EXEC' and has 'PROT_READ'
+
+	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+		if (!(file && path_noexec(&file->f_path)))
+			prot |= PROT_EXEC;
+
+2. The default vm_flags will be assigned to 'VM_MAYREAD | VM_MAYWRITE |
+VM_MAYEXEC'
+
+	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+So, the initial vm_flags will has 'VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC';
+The final vm_flags will be adjusted according to the input 'flags' for this
+mapping. You can refer to the code of do_mmap().
+
+	## The write attribute of vm_flags is also infected by whether the file
+support write mode;
+	## (VM_GROWSDOWN|VM_GROWSUP) only works for anonymous private mapping;
+
+

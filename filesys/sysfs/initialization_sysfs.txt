@@ -1,0 +1,245 @@
+
+in mm/ksysfs.c :
+
+core_initcall(ksysfs_init);
+
+So, this calling chain is:
+
+ksysfs_init() --> kernel_kobj = kobject_create_and_add("kernel", NULL) -->
+sysfs_create_group(kernel_kobj, &kernel_attr_group)
+
+
+This 'kernel_kobj = kobject_create_and_add("kernel", NULL)' will initialize the
+kernel_kobj :
+
+1) kobj = kobject_create()
+
+
+struct kobject *kobject_create(void)
+{
+	struct kobject *kobj;
+
+	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+	if (!kobj)
+		return NULL;
+
+	kobject_init(kobj, &dynamic_kobj_ktype);
+	return kobj;
+}
+
+So, the 'struct kobj_type	*ktype' of kernel_obj will point to
+'dynamic_kobj_ktype';
+
+2) retval = kobject_add(kobj, parent, "%s", name)
+
+The core of this process is 'kobject_add_varg(kobj, parent, fmt, args)';
+
+static __printf(3, 0) int kobject_add_varg(struct kobject *kobj,
+					   struct kobject *parent,
+					   const char *fmt, va_list vargs)
+{
+	int retval;
+
+	retval = kobject_set_name_vargs(kobj, fmt, vargs);
+	if (retval) {
+		printk(KERN_ERR "kobject: can not set name properly!\n");
+		return retval;
+	}
+	kobj->parent = parent;
+	return kobject_add_internal(kobj);
+}
+
+kobject_set_name_vargs() will set the 'kobj->name = s';
+
+
+For the struct kobject of 'kernel', the struct kernfs_node should be
+'sysfs_root_kn', you can refer to sysfs_create_dir_ns();
+
+kobject_add_internal() --> create_dir(kobj) --> sysfs_create_dir_ns(kobj,
+kobject_namespace(kobj)) --> kernfs_create_dir_ns()
+will create struct kernfs_node and setup the relationship between struct
+kernfs_node and struct kobject :
+
+	kn->priv = priv;
+and
+	kobj->sd = kn;
+
+Here, priv points to the struct kobject.
+
+
+==================================
+
+how to create the sysfs file of /sys/kernel/mm/transparent_hugepage/enabled:
+
+1. core_initcall(ksysfs_init)
+
+kernel_kobj = kobject_create_and_add("kernel", NULL);
+error = sysfs_create_group(kernel_kobj, &kernel_attr_group);
+
+Please note that, the parent kobject here is NULL.
+And the ktype of struct kobject will be set as dynamic_kobj_ktype by:
+kobject_create() --> kobject_init(kobj, &dynamic_kobj_ktype)
+
+sysfs_create_group() will create some attribute files in the same attribute
+group under the directory corresponding to the kernel_kobj.
+All those newly created attribute files are children of the kernel_kobj.
+
+This ksysfs_init will create /sys/kernel/ and those files under this directory.
+
+2. postcore_initcall(mm_sysfs_init)
+
+static int __init mm_sysfs_init(void)
+{
+	mm_kobj = kobject_create_and_add("mm", kernel_kobj);
+	if (!mm_kobj)
+		return -ENOMEM;
+
+	return 0;
+}
+
+So, /sys/kernel/mm will not create any files in this directory as without the
+calling of sysfs_create_group();
+
+3. hugepage_init_sysfs
+
+ubsys_initcall(hugepage_init) --> hugepage_init_sysfs(&hugepage_kobj)
+
+--> *hugepage_kobj = kobject_create_and_add("transparent_hugepage", mm_kobj);
+	will create the directory of 'transparent_hugepage';
+
+--> sysfs_create_group(*hugepage_kobj, &hugepage_attr_group);
+--> err = sysfs_create_group(*hugepage_kobj, &khugepaged_attr_group);
+
+There is one difference between these two callings.
+
+static struct attribute_group hugepage_attr_group = {
+	.attrs = hugepage_attr,
+};
+
+struct attribute_group khugepaged_attr_group = {
+	.attrs = khugepaged_attr,
+	.name = "khugepaged",
+};
+
+There is no name field for khugepaged_attr_group!
+
+You can refer to the process of sysfs_create_group -->internal_create_group():
+
+	if (grp->name) {
+		kn = kernfs_create_dir(kobj->sd, grp->name,
+				       S_IRWXU | S_IRUGO | S_IXUGO, kobj);
+
+Here, a new sysfs directory will be created with the name 'grp->name';
+
+
+==============How will the attribute's store/show hook be called?=====
+1. how is the definition of struct kobj_attribute used?
+
+create_files --> sysfs_add_file_mode_ns will initialize a struct kernfs_ops node
+and will be assigned to the struct kernfs_elem_attr attr of struct kernfs_node :
+
+__kernfs_create_file() will :
+
+	kn = kernfs_new_node(parent, name, (mode & S_IALLUGO) | S_IFREG, flags);
+	if (!kn)
+		return ERR_PTR(-ENOMEM);
+
+	kn->attr.ops = ops;
+	kn->attr.size = size;
+	kn->ns = ns;
+	kn->priv = priv;
+
+Here, ops is the struct kernfs_ops, and priv points to the struct attribute
+node this process targets for.
+
+We can take a look at sysfs_file_kfops_rw :
+
+static const struct kernfs_ops sysfs_file_kfops_rw = {
+	.seq_show	= sysfs_kf_seq_show,
+	.write		= sysfs_kf_write,
+};
+
+static ssize_t sysfs_kf_write(struct kernfs_open_file *of, char *buf,
+			      size_t count, loff_t pos)
+{
+	const struct sysfs_ops *ops = sysfs_file_ops(of->kn);
+	struct kobject *kobj = of->kn->parent->priv;
+
+	if (!count)
+		return 0;
+
+	return ops->store(kobj, of->kn->priv, buf, count);
+}
+
+So, dynamic_kobj_ktype --> kobj_sysfs_ops --> kobj_attr_store
+
+Please note 'of->kn->priv' for ops->store is setup by :
+__kernfs_create_file(parent, attr->name, mode & 0777, size, ops,
+				  (void *)attr, ns, key)
+when create_files --> sysfs_add_file_mode_ns(parent, *attr, false,
+						       mode, NULL);
+for each struct attribute entry of struct attribute_group.
+
+So, the process of kobj_attr_store() here is easily understood :
+
+static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct kobj_attribute *kattr;
+	ssize_t ret = -EIO;
+
+	kattr = container_of(attr, struct kobj_attribute, attr);
+	if (kattr->store)
+		ret = kattr->store(kobj, kattr, buf, count);
+	return ret;
+}
+
+Finally, the definition such as:
+static struct kobj_attribute enabled_attr =
+	__ATTR(enabled, 0644, enabled_show, enabled_store);
+
+will be called.
+
+2. How to open the sysfs object?
+
+kernfs_fop_open
+
+const struct file_operations kernfs_file_fops = {
+	.read		= kernfs_fop_read,
+	.write		= kernfs_fop_write,
+	.llseek		= generic_file_llseek,
+	.mmap		= kernfs_fop_mmap,
+	.open		= kernfs_fop_open,
+	.release	= kernfs_fop_release,
+	.poll		= kernfs_fop_poll,
+	.fsync		= noop_fsync,
+};
+
+where is the 'file->f_path.dentry->d_fsdata' assigned??
+
+	--> kernfs_iop_lookup
+
+	kn = kernfs_find_ns(parent, dentry->d_name.name, ns);
+
+	/* no such entry */
+	if (!kn || !kernfs_active(kn)) {
+		ret = NULL;
+		goto out_unlock;
+	}
+	kernfs_get(kn);
+	dentry->d_fsdata = kn;
+
+const struct inode_operations kernfs_dir_iops = {
+	.lookup		= kernfs_iop_lookup,
+	.permission	= kernfs_iop_permission,
+	.setattr	= kernfs_iop_setattr,
+	.getattr	= kernfs_iop_getattr,
+	.listxattr	= kernfs_iop_listxattr,
+
+	.mkdir		= kernfs_iop_mkdir,
+	.rmdir		= kernfs_iop_rmdir,
+	.rename		= kernfs_iop_rename,
+};
+
+
+

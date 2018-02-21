@@ -1,0 +1,110 @@
+
+
+https://doc.opensuse.org/documentation/leap/tuning/html/book.sle.tuning/cha.tuning.numactl.html
+
+
+
+ Automatic NUMA balancing happens in three basic steps:
+
+    A task scanner periodically scans a portion of a task's address space and
+marks the memory to force a page fault when the data is next accessed.
+
+    The next access to the data will result in a NUMA Hinting Fault. Based on
+this fault, the data can be migrated to a memory node associated with the task
+accessing the memory.
+
+    To keep a task, the CPU it is using and the memory it is accessing together,
+the scheduler groups tasks that share data. 
+
+The unmapping of data and page fault handling incurs overhead. However, commonly
+the overhead will be offset by threads accessing data associated with the CPU. 
+
+
+
+change_prot_numa() will set the PTE as PAGE_NONE for the CONFIG_NUMA_BALANCING.
+This modification will trigger the NUMA Hiting fault.
+
+
+FOLL_NUMA
+
+I think with the FOLL_NUMA, the page fault handler will treat the
+pte_protnone(pte) as NULL PTE :
+
+	if ((flags & FOLL_NUMA) && pte_protnone(pte))
+		goto no_page;
+
+Then trigger the faultin_page():
+
+		page = follow_page_mask(vma, start, foll_flags, &page_mask);
+		if (!page) {
+			int ret;
+			ret = faultin_page(tsk, vma, start, &foll_flags,
+					nonblocking);
+
+
+Without the FOLL_NUMA, the non-empty pte_protnone(pte) will be treated as normal
+page, this is not the target of automatical NUMA balancing or NUMA hinting
+fault. We want the pte_protnone(pte) can trigger the faultin_page -->
+handle_mm_fault
+
+
+/*
+	 * If FOLL_FORCE and FOLL_NUMA are both set, handle_mm_fault
+	 * would be called on PROT_NONE ranges. We must never invoke
+	 * handle_mm_fault on PROT_NONE ranges or the NUMA hinting
+	 * page faults would unprotect the PROT_NONE ranges if
+	 * _PAGE_NUMA and _PAGE_PROTNONE are sharing the same pte/pmd
+	 * bitflag. So to avoid that, don't set FOLL_NUMA if
+	 * FOLL_FORCE is set.
+	 */
+
+
+
+ * @mm:		mm_struct of target mm
+ * @start:	starting user address
+ * @nr_pages:	number of pages from start to pin
+ * @write:	whether pages will be written to by the caller
+ * @force:	whether to force access even when user mapping is currently
+ *		protected (but never forces write access to shared mapping).
+ * @pages:	array that receives pointers to the pages pinned.
+...
+
+long get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long start, unsigned long nr_pages, int write,
+		int force, struct page **pages, struct vm_area_struct **vmas)
+{
+	int flags = FOLL_TOUCH;
+
+	if (pages)
+		flags |= FOLL_GET;
+	if (write)
+		flags |= FOLL_WRITE;
+	if (force)
+		flags |= FOLL_FORCE;
+
+	return __get_user_pages(tsk, mm, start, nr_pages, flags, pages, vmas,
+				NULL);
+}
+
+
+As for FOLL_FORCE, there is a processing in __get_user_pages to avoid the
+conflict between FOLL_FORCE and FOLL_NUMA:
+
+	if (!(gup_flags & FOLL_FORCE))
+		gup_flags |= FOLL_NUMA;
+
+FOLL_FORCE will allow the access request even there are no corresponding
+'VM_WRITE' or 'VM_READ'. But it seems the target VMA at least has one of these :
+
+	if (vma->vm_flags & (VM_READ | VM_WRITE | VM_EXEC))
+		gup_flags |= FOLL_FORCE;
+
+Or the caller ensures accesses on the target VMA is OK no matter what 'vm_flags'
+are supported at that moment. You can refer to get_arg_page() and mem_rw().
+
+Based on the above, I think that special processing for FOLL_FORCE and FOLL_NUMA
+doesn't make much sense. The caller should decide what 'gup_flags' is reasonable
+for your wants.
+
+
+

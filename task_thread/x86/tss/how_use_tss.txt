@@ -1,0 +1,71 @@
+
+1. setup TSS
+
+When a new thread is forking, this will be called:
+
+	load_sp0(tss, next);
+
+static inline void load_sp0(struct tss_struct *tss,
+			    struct thread_struct *thread)
+{
+	native_load_sp0(tss, thread);
+}
+
+static inline void
+native_load_sp0(struct tss_struct *tss, struct thread_struct *thread)
+{
+	tss->x86_tss.sp0 = thread->sp0;
+#ifdef CONFIG_X86_32
+	/* Only happens when SEP is enabled, no need to test "SEP"arately: */
+	if (unlikely(tss->x86_tss.ss1 != thread->sysenter_cs)) {
+		tss->x86_tss.ss1 = thread->sysenter_cs;
+		wrmsr(MSR_IA32_SYSENTER_CS, thread->sysenter_cs, 0);
+	}
+#endif
+}
+
+struct tss_struct *tss = &per_cpu(cpu_tss, cpu);
+
+
+So, the percpu variable of cpu_tss will be initialized as the thread stack(sp0)
+for the thread which will be scheduled to run in __switch_to().
+
+	load_sp0(t, &current->thread);
+
+The TSS had been setup as one GDT entry in set_tss_desc(cpu, t). In this setup,
+only the address of percpu TSS variable was set into GDT entry. As the address
+of percpu TSS will not changed and shared among all threads who targets to that
+CPU, only need to update the data of the percpu TSS entry, no need to
+'set_tss_desc(cpu, t)' again.
+
+2. apply TSS
+
+TSS works as a GDT entry which is percpu variable:
+
+	DEFINE_PER_CPU_PAGE_ALIGNED(struct gdt_page, gdt_page)
+
+The GDT of Linux is not task-specific, it is percpu. So, TSS is aslo percpu.
+The GDT index of TSS is :
+	GDT_ENTRY_TSS
+
+
+In cpu_init(), has these code to apply TSS:
+
+	load_sp0(t, thread);
+	set_tss_desc(cpu, t);
+	load_TR_desc();
+
+#define load_TR_desc()				native_load_tr_desc()
+
+
+static inline void native_load_tr_desc(void)
+{
+	...
+	asm volatile("ltr %w0"::"q" (GDT_ENTRY_TSS*8));
+	...
+}
+
+After this 'ltr', the TSS had been loaded into TR register for each CPU, don'
+need to access GDT for TSS anymore.
+
+

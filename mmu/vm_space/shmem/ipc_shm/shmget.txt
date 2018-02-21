@@ -1,0 +1,220 @@
+
+In ipc/shm.c :
+
+SYSCALL_DEFINE3(shmget, key_t, key, size_t, size, int, shmflg)
+{
+	struct ipc_namespace *ns;
+	static const struct ipc_ops shm_ops = {
+		.getnew = newseg,
+		.associate = shm_security,
+		.more_checks = shm_more_checks,
+	};
+	struct ipc_params shm_params;
+
+	ns = current->nsproxy->ipc_ns;
+
+	shm_params.key = key;
+	shm_params.flg = shmflg;
+	shm_params.u.size = size;
+
+	return ipcget(ns, &shm_ids(ns), &shm_ops, &shm_params);
+}
+
+
+The initial 'nsproxy->ipc_ns' should point to 'init_ipc_ns.ids[IPC_SHM_IDS]' for
+the PID0.
+
+	{
+		.procname	= "shm_next_id",
+		.data		= &init_ipc_ns.ids[IPC_SHM_IDS].next_id,
+		.maxlen		= sizeof(init_ipc_ns.ids[IPC_SHM_IDS].next_id),
+		.mode		= 0644,
+		.proc_handler	= proc_ipc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &int_max,
+	},
+
+
+'key' is not the key value of IPC SHM IDR which is from the 'shm_ids(ns)' of
+'struct ipc_namespace *ns'. You can refer to this path:
+
+SYSCALL_DEFINE3(shmget,
+	--> newseg()
+		--> ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni)
+
+Actually, ipc_findkey() reveal what is the key ID for IPC SHM IDR more clearly.
+
+static struct kern_ipc_perm *ipc_findkey(struct ipc_ids *ids, key_t key)
+{
+	struct kern_ipc_perm *ipc;
+	int next_id;
+	int total;
+
+	for (total = 0, next_id = 0; total < ids->in_use; next_id++) {
+		ipc = idr_find(&ids->ipcs_idr, next_id);
+
+		if (ipc == NULL)
+			continue;
+
+		if (ipc->key != key) {
+			total++;
+			continue;
+		}
+
+'next_id' is the search key for 'ids->ipcs_idr'. Its range is [0, SEQ_MULTIPLIER
+ or IPCMNI). But this range is only for IDR. The 'int id' of struct
+kern_ipc_perm is not equal to this id key of IDR, will do some convertions:
+
+	if (next_id < 0) {
+		new->seq = ids->seq++;
+		if (ids->seq > IPCID_SEQ_MAX)
+			ids->seq = 0;
+	} else {
+		new->seq = ipcid_to_seqx(next_id);
+		ids->next_id = -1;
+	}
+
+	new->id = ipc_buildid(id, new->seq);
+
+So, new->id will be 'SEQ_MULTIPLIER * seq + id', it is a combination of IDR id
+and the 'new->seq' which is increased sequently or configured by proc parameter
+of 'shm_next_id'.
+
+And the 'struct kern_ipc_perm	shm_perm' of 'struct shmid_kernel' will be bound
+to the IDR slot through this path:
+
+newseg()
+	--> shp = ipc_rcu_alloc(sizeof(*shp))
+	/* setup a shm file with the the name of 'sprintf(name, "SYSV%08x",
+	 * key)' for non SHM_HUGETLB SHM file. Of-course, SHM is sharable. */
+	--> file = shmem_kernel_file_setup(name, size, acctflag)
+	--> id = ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni)
+		--> dr_alloc(&ids->ipcs_idr, new,
+	/* Here, the 'new' will be inserted to the IDR slot. */
+
+And the input parameter 'key' will be stored like that:
+
+	shp->shm_perm.key = key;
+	...
+	sprintf(name, "SYSV%08x", key);
+
+And used in ipc_findkey() like that:
+		if (ipc->key != key) {
+			total++;
+			continue;
+		}
+
+
+1.1 ipc_addid
+
+id = ipc_addid(&shm_ids(ns), &shp->shm_perm, ns->shm_ctlmni);
+
+Some field members will be initialised in ipc_addid() :
+
+	new->deleted = false;
+	...
+	current_euid_egid(&euid, &egid);
+	new->cuid = new->uid = euid;
+	new->gid = new->cgid = egid;
+	...
+	new->id = ipc_buildid(id, new->seq);
+
+1.2 'i_ino' of struct inode
+
+
+In newseg():
+	file_inode(file)->i_ino = shp->shm_perm.id;
+
+Propably we can get the struct shmid_kernel by this 'i_ino'.
+
+
+=======================
+
+
+In mmap_region(), for anonymous VM_SHARED mode, will do this:
+
+	} else if (vm_flags & VM_SHARED) {
+		error = shmem_zero_setup(vma);
+		if (error)
+			goto free_vma;
+	}
+
+
+int shmem_zero_setup(struct vm_area_struct *vma)
+{
+	struct file *file;
+	loff_t size = vma->vm_end - vma->vm_start;
+
+	/*
+	 * Cloning a new file under mmap_sem leads to a lock ordering conflict
+	 * between XFS directory reading and selinux: since this file is only
+	 * accessible to the user through its mapping, use S_PRIVATE flag to
+	 * bypass file security, in the same way as shmem_kernel_file_setup().
+	 */
+	file = __shmem_file_setup("dev/zero", size, vma->vm_flags, S_PRIVATE);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = file;
+	vma->vm_ops = &shmem_vm_ops;
+
+
+So, How to use the SHM file 'dev/zero' in the SHM filesystem?
+
+I was thought this 'dev/zero' is just '/dev/zero' when we run 'dd if=/dev/zero'
+to build some ramdisk. But it seems not true.
+
+The /dev/zero is char device and is initiailised in this path:
+
+drivers/char/mem.c :
+
+chr_dev_init()
+	--> 	device_create(mem_class, NULL, MKDEV(MEM_MAJOR, minor),
+		      NULL, devlist[minor].name);
+
+	 [5] = { "zero", 0666, &zero_fops, 0 },
+
+
+
+You can find these char devices of 'devlist[]' definition in /dev/.
+
+
+
+One more thing,
+
+unsigned long
+get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
+		unsigned long pgoff, unsigned long flags)
+{
+	...
+	get_area = current->mm->get_unmapped_area;
+	if (file) {
+		if (file->f_op->get_unmapped_area)
+			get_area = file->f_op->get_unmapped_area;
+	} else if (flags & MAP_SHARED) {
+		/*
+		 * mmap_region() will call shmem_zero_setup() to create a file,
+		 * so use shmem's get_unmapped_area in case it can be huge.
+		 * do_mmap_pgoff() will clear pgoff, so match alignment.
+		 */
+		pgoff = 0;
+		get_area = shmem_get_unmapped_area;
+	}
+
+
+So, if there is definition of 'file->f_op->get_unmapped_area', then apply it;
+otherwise, just apply the generici 'current->mm->get_unmapped_area' for the
+file-mapped. For anonymous shared mapping, 'shmem_get_unmapped_area' will be
+called although it only has many processes for SHMEM_HUGE.
+
+
+
+But how to use 'dev/zero' in SHM file-system for anonymous shared??
+
+I hope I can analyse in other docs.
+
+But vma_is_anonymous(vmf->vma) is not TRUE for SHM mapping, as :
+	vma->vm_ops = &shmem_vm_ops;
+

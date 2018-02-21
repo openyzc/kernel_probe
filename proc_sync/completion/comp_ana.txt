@@ -1,0 +1,23 @@
+
+1. 结构定义
+struct completion {
+	unsigned int done;
+	wait_queue_head_t wait;
+};
+
+第一个 done表示是否completion. 为0时表示还没有完成，某个task完成处理后，会done++
+（实际是通过 complete()完成 done++）。
+
+wait_queue_head_t wait是一个链表头，所有等待 completion variable的tasks都会在
+do_wait_for_common中创建一个 wait_queue_t 节点，然后
+__add_wait_queue_tail_exclusive(&x->wait, &wait) 挂入到 struct completion的
+wait_queue_head_t wait中。
+
+需要注意， complete()允许多次调用。 个人觉得多次调用的次数应该与
+do_wait_for_common()调用次数一致，且 任何do_wait_for_common()应该在 任何
+complete()之前完成。
+
+反正done 表示 有多少个task触发了 complete()，以便wakeup 对应个waiter。
+
+
+

@@ -1,0 +1,497 @@
+
+
+sparse_memory_present_with_active_regions(MAX_NUMNODES) --> memory_present()
+
+
+sparse_init()
+
+
+# SPARSEMEM_EXTREME (which is the default) does some bootmem
+# allocations when memory_present() is called.  If this cannot
+# be done on your architecture, select this option.  However,
+# statically allocating the mem_section[] array can potentially
+# consume vast quantities of .bss, so be careful.
+#
+config SPARSEMEM_STATIC
+        bool
+
+#
+# Architecture platforms which require a two level mem_section in SPARSEMEM
+# must select this option. This is usually for architecture platforms with
+# an extremely sparse physical address space.
+#
+config SPARSEMEM_EXTREME
+        def_bool y
+        depends on SPARSEMEM && !SPARSEMEM_STATIC
+
+1. setup the mem_section[]
+
+void __init sparse_memory_present_with_active_regions(int nid)
+{
+	unsigned long start_pfn, end_pfn;
+	int i, this_nid;
+
+	for_each_mem_pfn_range(i, nid, &start_pfn, &end_pfn, &this_nid)
+		memory_present(this_nid, start_pfn, end_pfn);
+}
+
+When CONFIG_SPARSEMEM is enabled, the memory_present() is defined in sparse.c;
+
+-- For each region in memblock.memory, will be divided into sections based on
+the PAGES_PER_SECTION granularity;
+
+void __init memory_present(int nid, unsigned long start, unsigned long end)
+{
+	unsigned long pfn;
+/* align 'start' down to PAGES_PER_SECTION boundary. */
+	start &= PAGE_SECTION_MASK;
+/* check the 'start', 'end' are valid memory PFN. */
+	mminit_validate_memmodel_limits(&start, &end);
+/*
+ * Traverse all the sections which cover [start, end). The last section is
+ * the one which cover the 'end', because the section ID is calculated by
+ * 'unsigned long section = pfn_to_section_nr(pfn);' with the section boundary
+ * PFN. But If the next adjacent memblock.memory region doesn't have a gap whose
+ * size is not less than PAGES_PER_SECTION, it will make there are memory
+ * sections overlapped which belong to different node. I think that is why
+ * node_map_pfn_alignment() is called in numa_register_memblks();
+ */
+	for (pfn = start; pfn < end; pfn += PAGES_PER_SECTION) {
+		unsigned long section = pfn_to_section_nr(pfn);
+		struct mem_section *ms;
+/*
+ * only works for SPARSEMEM_EXTREME.
+ * 'root = SECTION_NR_TO_ROOT(section_nr)' will get the entry index of
+ * mem_section[] where 'section_nr' should be saved in;
+ * The following will allocate 'SECTIONS_PER_ROOT' struct mem_section nodes for
+ * the mem_section[root] :
+ * 'section = sparse_index_alloc(nid);' 
+ */
+		sparse_index_init(section, nid);
+/*
+ * This function is for NODE_NOT_IN_PAGE_FLAGS.
+ * For this case, the node ID will be saved into
+ * 'section_to_node_table[NR_MEM_SECTIONS]';
+ */
+		set_section_nid(section, nid);
+/* stored the nid into 'ms->section_mem_map'; */
+		ms = __nr_to_section(section);
+		if (!ms->section_mem_map)
+			ms->section_mem_map = sparse_encode_early_nid(nid) |
+							SECTION_MARKED_PRESENT;
+	}
+}
+
+2. sparse_init
+/*
+ * This check is necessary. As '#define SECTION_ROOT_MASK
+ * (SECTIONS_PER_ROOT - 1)' and '#define SECTIONS_PER_ROOT       (PAGE_SIZE /
+ * sizeof (struct mem_section))', we must ensure the SECTION_ROOT_MASK is power
+ * of 2.
+ */
+	BUILD_BUG_ON(!is_power_of_2(sizeof(struct mem_section)));
+
+2.1 alloc_usemap_and_memmap
+
+	size = sizeof(unsigned long *) * NR_MEM_SECTIONS;
+	usemap_map = memblock_virt_alloc(size, 0);
+	if (!usemap_map)
+		panic("can not allocate usemap_map\n");
+	alloc_usemap_and_memmap(sparse_early_usemaps_alloc_node,
+							(void *)usemap_map);
+## Each section will correspond to one (unsigned long *) variable;
+
+static void __init alloc_usemap_and_memmap(void (*alloc_func)
+					(void *, unsigned long, unsigned long,
+					unsigned long, int), void *data)
+{
+	...
+/*
+ * Traverse all sections to find whether some section is present in the system
+ * memory configuration, memory_present() had made 'present_section_nr(pnum)' of
+ * section 'pnum' return Non-NULL. And 'sparse_early_nid(ms)' get the node id
+ * for this section. So, this loop will get the first present section and the
+ * corresponding node id;
+ */
+	for (pnum = 0; pnum < NR_MEM_SECTIONS; pnum++) {
+		struct mem_section *ms;
+
+		if (!present_section_nr(pnum))
+			continue;
+		ms = __nr_to_section(pnum);
+		nodeid_begin = sparse_early_nid(ms);
+		pnum_begin = pnum;
+		break;
+	}
+/*
+ * This loop start the traverse from 'pnum_begin + 1';
+ * Will collect all the sections which belong to the same node. 'map_count' is
+ * the count of all the sections for 'nodeid_begin';
+ */
+	map_count = 1;
+	for (pnum = pnum_begin + 1; pnum < NR_MEM_SECTIONS; pnum++) {
+		struct mem_section *ms;
+		int nodeid;
+
+		if (!present_section_nr(pnum))
+			continue;
+		ms = __nr_to_section(pnum);
+		nodeid = sparse_early_nid(ms);
+		if (nodeid == nodeid_begin) {
+			map_count++;
+			continue;
+		}
+		/* ok, we need to take cake of from pnum_begin to pnum - 1*/
+		alloc_func(data, pnum_begin, pnum,
+						map_count, nodeid_begin);
+		/* new start, update count etc*/
+		nodeid_begin = nodeid;
+		pnum_begin = pnum;
+		map_count = 1;
+	}
+/*
+ * For each node, will call alloc_func() with the section range and the section
+ * counter, the node id.
+ */
+
+/* This is the last section range... */
+	alloc_func(data, pnum_begin, NR_MEM_SECTIONS,
+						map_count, nodeid_begin);
+
+2.2 sparse_early_usemaps_alloc_node
+
+
+static void __init sparse_early_usemaps_alloc_node(void *data,
+				 unsigned long pnum_begin,
+				 unsigned long pnum_end,
+				 unsigned long usemap_count, int nodeid)
+{
+	void *usemap;
+	unsigned long pnum;
+	unsigned long **usemap_map = (unsigned long **)data;
+	int size = usemap_size();
+
+	usemap = sparse_early_usemaps_alloc_pgdat_section(NODE_DATA(nodeid),
+							  size * usemap_count);
+	if (!usemap) {
+		pr_warn("%s: allocation failed\n", __func__);
+		return;
+	}
+
+	for (pnum = pnum_begin; pnum < pnum_end; pnum++) {
+		if (!present_section_nr(pnum))
+			continue;
+		usemap_map[pnum] = usemap;
+		usemap += size;
+		check_usemap_section_nr(nodeid, usemap_map[pnum]);
+	}
+}
+
+1) size = usemap_size()
+
+unsigned long usemap_size(void)
+{
+	return BITS_TO_LONGS(SECTION_BLOCKFLAGS_BITS) * sizeof(unsigned long);
+}
+
+#define SECTION_BLOCKFLAGS_BITS \
+	((1UL << (PFN_SECTION_SHIFT - pageblock_order)) * NR_PAGEBLOCK_BITS)
+
+-- Each page block should populate NR_PAGEBLOCK_BITS of 'enum pageblock_bits',
+So we need  SECTION_BLOCKFLAGS_BITS for one memory section;
+-- usemap_size() will return the total memory size for the pageblock bits of
+one section;
+
+2) allocate all the memory for all the sections of one node
+	usemap = sparse_early_usemaps_alloc_pgdat_section(NODE_DATA(nodeid),
+							  size * usemap_count);
+
+-- When CONFIG_MEMORY_HOTREMOVE is enabled, this
+sparse_early_usemaps_alloc_pgdat_section() will allocate the 'usemap' from the
+same node where the 'NODE_DATA(nodeid)' is from, that node id is probably not
+'NODE_DATA(nodeid)->node_id'.
+
+I want to talk about where 'NODE_DATA()' is allocated.
+
+Normally, the calling path is :
+
+numa_init -->
+numa_register_memblks --> alloc_node_data(nid) will set 'node_data[nid] = nd;'
+
+Another path is:
+setup_arch() -->
+init_cpu_to_node() -->
+init_memory_less_node() --> alloc_node_data(nid)
+
+Because init_memory_less_node() is only called in this condition :
+		if (!node_online(node))
+			init_memory_less_node(node);
+
+I think this path is only for memory-less nodes.
+And the 'pgdat->node_id' is set also.
+
+-- Otherwise, will allocate that memory region with 'pgdat->node_id':
+
+static unsigned long * __init
+sparse_early_usemaps_alloc_pgdat_section(struct pglist_data *pgdat,
+					 unsigned long size)
+{
+	return memblock_virt_alloc_node_nopanic(size, pgdat->node_id);
+}
+
+But at this moment, 'pgdat->node_id' is not set and the node id is NUMA_NO_NODE;
+
+2.4 sparse_early_mem_maps_alloc_node
+
+config SPARSEMEM_ALLOC_MEM_MAP_TOGETHER
+        def_bool y
+        depends on SPARSEMEM && X86_64
+
+This function is only for CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER as it is
+called by:
+
+#ifdef CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER
+	size2 = sizeof(struct page *) * NR_MEM_SECTIONS;
+	map_map = memblock_virt_alloc(size2, 0);
+	if (!map_map)
+		panic("can not allocate map_map\n");
+	alloc_usemap_and_memmap(sparse_early_mem_maps_alloc_node,
+							(void *)map_map);
+#endif
+
+static void __init sparse_early_mem_maps_alloc_node(void *data,
+				 unsigned long pnum_begin,
+				 unsigned long pnum_end,
+				 unsigned long map_count, int nodeid)
+{
+	struct page **map_map = (struct page **)data;
+	sparse_mem_maps_populate_node(map_map, pnum_begin, pnum_end,
+					 map_count, nodeid);
+}
+
+The input 'data' is a pointer to 'struct page *' array.
+This array is double layers, the first index is section ID;
+
+void __init sparse_mem_maps_populate_node(struct page **map_map,
+					  unsigned long pnum_begin,
+					  unsigned long pnum_end,
+					  unsigned long map_count, int nodeid)
+{
+	...
+	unsigned long size = sizeof(struct page) * PAGES_PER_SECTION;
+	void *vmemmap_buf_start;
+/*
+ * Allocate all the 'struct page' for the sections of [pnum_begin, pnum_end)
+ * which is in the 'nodeid'. Which means the memory space for the page frames of
+ * 'nodeid'. Those 'struct page' like a 'struct page' pool which start from
+ * 'vmemmap_buf' and 'vmemmap_buf_end';
+ */
+	size = ALIGN(size, PMD_SIZE);
+	vmemmap_buf_start = __earlyonly_bootmem_alloc(nodeid, size * map_count,
+			 PMD_SIZE, __pa(MAX_DMA_ADDRESS));
+
+	if (vmemmap_buf_start) {
+		vmemmap_buf = vmemmap_buf_start;
+		vmemmap_buf_end = vmemmap_buf_start + size * map_count;
+	}
+
+/*
+ * The key here is 'map_map[pnum] = sparse_mem_map_populate(pnum, nodeid)'.
+ */
+	for (pnum = pnum_begin; pnum < pnum_end; pnum++) {
+		struct mem_section *ms;
+
+		if (!present_section_nr(pnum))
+			continue;
+
+		map_map[pnum] = sparse_mem_map_populate(pnum, nodeid);
+		if (map_map[pnum])
+			continue;
+
+2.4.1 when CONFIG_SPARSEMEM_VMEMMAP is not enabled
+
+struct page __init *sparse_mem_map_populate(unsigned long pnum, int nid)
+{
+	struct page *map;
+	unsigned long size;
+
+	map = alloc_remap(nid, sizeof(struct page) * PAGES_PER_SECTION);
+	if (map)
+		return map;
+
+	size = PAGE_ALIGN(sizeof(struct page) * PAGES_PER_SECTION);
+	map = memblock_virt_alloc_try_nid(size,
+					  PAGE_SIZE, __pa(MAX_DMA_ADDRESS),
+					  BOOTMEM_ALLOC_ACCESSIBLE, nid);
+	return map;
+}
+
+-- The alloc_remap() is NULL on x86;
+-- The real allocation is done by 'memblock_virt_alloc_try_nid()';
+-- The physical memory needed is allocated here directly;
+
+
+2.4.2 CONFIG_SPARSEMEM_VMEMMAP is enabled
+
+config SPARSEMEM_VMEMMAP
+        bool "Sparse Memory virtual memmap"
+        depends on SPARSEMEM && SPARSEMEM_VMEMMAP_ENABLE
+        default y
+
+arch/x86/Kconfig:1502:	select SPARSEMEM_VMEMMAP_ENABLE if X86_64
+
+The sparse_mem_map_populate() is in mm/sparse-vmemmap.c;
+
+struct page * __meminit sparse_mem_map_populate(unsigned long pnum, int nid)
+{
+	unsigned long start;
+	unsigned long end;
+	struct page *map;
+
+	map = pfn_to_page(pnum * PAGES_PER_SECTION);
+	start = (unsigned long)map;
+	end = (unsigned long)(map + PAGES_PER_SECTION);
+
+	if (vmemmap_populate(start, end, nid))
+		return NULL;
+/*
+ * This 'map' points to the first 'struct page' of the allocated 'struct page'
+ * space.
+ */
+	return map;
+}
+
+1) map = pfn_to_page(pnum * PAGES_PER_SECTION)
+
+The 'pfn_to_page' is __pfn_to_page defined in
+include/asm-generic/memory_model.h:
+
+#elif defined(CONFIG_SPARSEMEM_VMEMMAP)
+
+/* memmap is virtually contiguous.  */
+#define __pfn_to_page(pfn)	(vmemmap + (pfn))
+#define __page_to_pfn(page)	(unsigned long)((page) - vmemmap)
+
+in arch/x86/include/asm/pgtable_64.h :
+
+#define vmemmap ((struct page *)VMEMMAP_START)
+
+in arch/x86/include/asm/pgtable_64_types.h :
+
+#define VMALLOC_START	__VMALLOC_BASE
+
+So, here, pfn_to_page(pnum * PAGES_PER_SECTION) only return the virtual address
+of the page frame area of section 'pnum';
+The real physical pages are not allocated here.
+
+2) vmemmap_populate(start, end, nid)
+
+Here, 'start', 'end' are the virtual range of the page frame area.
+
+In arch/x86/mm/init_64.c :
+
+int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+{
+/* to_vmem_altmap() is only for CONFIG_ZONE_DEVICE */
+	struct vmem_altmap *altmap = to_vmem_altmap(start);
+	int err;
+
+	if (boot_cpu_has(X86_FEATURE_PSE))
+		err = vmemmap_populate_hugepages(start, end, node, altmap);
+	else if (altmap) {
+		pr_err_once("%s: no cpu support for altmap allocations\n",
+				__func__);
+		err = -ENOMEM;
+	} else
+/* normally, kernel should enter this calling.. */
+		err = vmemmap_populate_basepages(start, end, node);
+	if (!err)
+		sync_global_pgds(start, end - 1);
+	return err;
+}
+
+In mm/sparse-vmemmap.c :
+
+int __meminit vmemmap_populate_basepages(unsigned long start,
+					 unsigned long end, int node)
+
+-- The page table for virtual memory range will be setup by
+vmemmap_pgd_populate, vmemmap_p4d_populate, vmemmap_pud_populate,
+vmemmap_pmd_populate; All these intermediate pages are allocted by 
+-- vmemmap_pte_populate() will call alloc_block_buf(PAGE_SIZE, node) to
+allocate the pages for accessing 'struct page' entries from the 'vmemmap_buf'
+pool which is setup by sparse_mem_maps_populate_node(); All these pages are
+direct mapped because the memblock_virt_alloc_try_nid() allocate the physical
+memory from the range below 'memblock.current_limit' :
+
+	setup_arch --> memblock_set_current_limit(get_max_mapped());
+
+
+2.4.3 
+
+We are back to sparse_mem_maps_populate_node():
+
+	for (pnum = pnum_begin; pnum < pnum_end; pnum++) {
+		struct mem_section *ms;
+
+		if (!present_section_nr(pnum))
+			continue;
+
+		map_map[pnum] = sparse_mem_map_populate(pnum, nodeid);
+		if (map_map[pnum])
+			continue;
+/*
+ * This is the abnormal processing.
+ * map_map[pnum] is 0 means sparse_mem_map_populate() fails. So, just set the
+ * 'ms->section_mem_map = 0' to indicate the mapping is invalid.
+ */
+		ms = __nr_to_section(pnum);
+		pr_err("%s: sparsemem memory map backing failed some memory will
+not be available\n",
+		       __func__);
+		ms->section_mem_map = 0;
+	}
+
+/* free the unused physical space from the pool... */
+	if (vmemmap_buf_start) {
+		/* need to free left buf */
+		memblock_free_early(__pa(vmemmap_buf),
+				    vmemmap_buf_end - vmemmap_buf);
+		vmemmap_buf = NULL;
+		vmemmap_buf_end = NULL;
+	}
+
+
+2.5 setup the struct mem_section
+
+in sparse_init():
+
+	for (pnum = 0; pnum < NR_MEM_SECTIONS; pnum++) {
+		if (!present_section_nr(pnum))
+			continue;
+
+		usemap = usemap_map[pnum];
+		if (!usemap)
+			continue;
+
+#ifdef CONFIG_SPARSEMEM_ALLOC_MEM_MAP_TOGETHER
+		map = map_map[pnum];
+#else
+		map = sparse_early_mem_map_alloc(pnum);
+#endif
+		if (!map)
+			continue;
+
+		sparse_init_one_section(__nr_to_section(pnum), pnum, map,
+								usemap);
+	}
+
+-- usermap_map[pnum] points to the pageblock_flags of section 'pnum', it is
+setup by sparse_early_usemaps_alloc_node();
+-- map_map[pnum] points to the first 'struct page' for the first physical page
+frame of section 'pnum'. It is setup by sparse_early_mem_maps_alloc_node();
+-- This will set the ms->section_mem_map, ms->pageblock_flags :
+
+	sparse_init_one_section(__nr_to_section(pnum), pnum, map,
+						usemap);
+

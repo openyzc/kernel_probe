@@ -1,0 +1,439 @@
+关于 mbigen
+的驱动，之前已经写了一些docs来进行分析描述。但是感觉都是写的不成体系。
+
+这里将重新整理编写，且全部使用中文。E文还是写的不那么清晰，自己后续读着也觉得费劲。
+
+
+1. ARM64的中断架构
+
+我们知道，kernel中的 irq是hierarchy的。
+
+gic v3/v4 通过 FIQ/IRQ 连接到core来触发interrupt；
+
+而 gic下 还有 its 作为 MSI中断控制器；
+
+MBIGEN是更下层的controller, 依照hisilicon的手册，会将中断上报给 its 或 GICD.
+
+
+
+2. ARM64 中断软件架构
+
+2.1 GIC的初始化 (top irq domain)
+
+OF 注册：
+IRQCHIP_DECLARE(gic_v3, "arm,gic-v3", gic_of_init);
+
+	GICD 占用 reg0， GICR 从reg 1开始，具体'reg' entries数由
+	"#redistributor-regions"设定；
+
+gic_of_init --> gic_init_bases
+
+ACPI 注册：
+IRQCHIP_ACPI_DECLARE(gic_v3, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V3,
+		     gic_acpi_init);
+	GICD, GICR的entries 数，都在 MADT中描述； GICR 和 GICC 只配置其中之一。
+
+gic_acpi_init --> gic_init_bases
+
+于是，以下函数是初始化总入口，
+static int __init gic_init_bases(void __iomem *dist_base,
+				 struct redist_region *rdist_regs,
+				 u32 nr_redist_regions,
+				 u64 redist_stride,
+				 struct fwnode_handle *handle)
+
+	dist_base是GICD经过ioremap后的地址；
+	rdist_regs指向一个 struct redist_region 数组，此数组的entries数是
+	nr_redist_regions; redist_regions 在ACPI中是0，在DTS中由
+	"redistributor-stride"决定。
+
+对于此 gic_init_bases(), 主要的处理包括：
+1） 在gic_data中设置 GICD对应的数据，譬如基地址；
+2） 在gic_data中设置 GICR/GICC对应的数据， 
+3） 创建irq domain;
+	gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
+						 &gic_data);
+struct fwnode_handle *handle 是此gic对应的device的 fwnode_handle.
+此domain的 'void *host_data' 指向 static struct gic_chip_data gic_data；
+此domain的 struct irq_domain_ops是 gic_irq_domain_ops；
+
+static const struct irq_domain_ops gic_irq_domain_ops = {
+	.translate = gic_irq_domain_translate,
+	.alloc = gic_irq_domain_alloc,
+	.free = gic_irq_domain_free,
+	.select = gic_irq_domain_select,
+};
+
+4） ITS的初始化
+
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+		its_init(handle, &gic_data.rdists, gic_data.domain);
+
+
+2.2 ITS domain
+
+这里的 '*handle' 指向 gic 设备的fwnode_handle. '*rdists' 指向
+gic_data.rdists，'*parent_domain' 是gic controller所创建的 irq_domain.
+
+int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
+		    struct irq_domain *parent_domain)
+{
+	struct device_node *of_node;
+
+	its_parent = parent_domain;
+	of_node = to_of_node(handle);
+	if (of_node)
+		its_of_probe(of_node);
+	else
+		its_acpi_probe();
+
+	if (list_empty(&its_nodes)) {
+		pr_warn("ITS: No ITS available, not enabling LPIs\n");
+		return -ENXIO;
+	}
+
+	gic_rdists = rdists;
+	its_alloc_lpi_tables();
+	its_lpi_init(rdists->id_bits);
+
+	return 0;
+}
+
+1) its_of_probe 或 its_acpi_probe
+
+its_of_probe 通过输入的 struct device_node *node 为起点遍历 所有的 OF
+设备，找寻匹配 .compatible	= "arm,gic-v3-its" 的设备，然后完成以下处理：
+
+		if (!of_property_read_bool(np, "msi-controller")) {
+			pr_warn("%s: no msi-controller property, ITS ignored\n",
+				np->full_name);
+			continue;
+		}
+
+		if (of_address_to_resource(np, 0, &res)) {
+			pr_warn("%s: no regs?\n", np->full_name);
+			continue;
+		}
+
+		its_probe_one(&res, &np->fwnode, of_node_to_nid(np));
+
+its_probe_one 的主要功能：
+	## 分配并初始化 struct its_node；
+	## err = its_init_domain(handle, its);
+		此函数将创建对应 ITS设备的 irq domain,
+		irq_domain_ops是its_domain_ops，最初host_data是指向 struct
+		its_node，但是下面的处理会更改'host_data':
+
+	inner_domain->parent = its_parent;
+	inner_domain->bus_token = DOMAIN_BUS_NEXUS;
+	inner_domain->flags |= IRQ_DOMAIN_FLAG_MSI_REMAP;
+	info->ops = &its_msi_domain_ops;
+	info->data = its;
+	inner_domain->host_data = info;
+所以，对于ITS的irq_domain来说，host_data指向了一个 struct
+msi_domain_info，在此结构中的 void *data指向 struct its_node;而在此
+msi_domain_info中有一个'struct msi_domain_ops	*ops' 指向 ITS专用的 msi
+ops。对于 GIC v3/v4的ITS,就是 its_msi_domain_ops； 另外比较关键的是 bus_token是
+DOMAIN_BUS_NEXUS，此token在 its_pmsi_init_one中找寻 msi platform 的 irq
+domain的parent domain时使用。
+
+static const struct irq_domain_ops its_domain_ops = {
+	.alloc			= its_irq_domain_alloc,
+	.free			= its_irq_domain_free,
+	.activate		= its_irq_domain_activate,
+	.deactivate		= its_irq_domain_deactivate,
+};
+
+static struct msi_domain_ops its_msi_domain_ops = {
+	.msi_prepare	= its_msi_prepare,
+};
+
+
+以上是基于 OF的分析。
+对于ACPI, 解析 MADT的 ITS的 subtable，ACPI_MADT_TYPE_GENERIC_TRANSLATOR ：
+static void __init its_acpi_probe(void)
+{
+	acpi_table_parse_madt(ACPI_MADT_TYPE_GENERIC_TRANSLATOR,
+			      gic_acpi_parse_madt_its, 0);
+}
+
+对于每个 iort_register_domain_token， 会调用 iort_register_domain_token创建一个
+struct iort_its_msi_chip 节点到 iort_msi_chip_list 中以便 IORT处理时使用。
+
+具体参见 its_acpi_probe --> gic_acpi_parse_madt_its 
+
+2.3 msi platform 设备
+
+static int __init its_pmsi_init(void)
+{
+	its_pmsi_of_init();
+	its_pmsi_acpi_init();
+	return 0;
+}
+early_initcall(its_pmsi_init);
+
+
+暂且以 OF的初始化函数 its_pmsi_of_init为对象。
+
+static void __init its_pmsi_of_init(void)
+{
+	struct device_node *np;
+
+	for (np = of_find_matching_node(NULL, its_device_id); np;
+	     np = of_find_matching_node(np, its_device_id)) {
+		if (!of_property_read_bool(np, "msi-controller"))
+			continue;
+
+		its_pmsi_init_one(of_node_to_fwnode(np), np->full_name);
+	}
+}
+
+注意这里的 its_device_id中的 compatible = "arm,gic-v3-its"，就是 gic
+its驱动的its_of_probe所扫描的相同 its设备。只是对于 platfrom msi是调用：
+	its_pmsi_init_one(of_node_to_fwnode(np), np->full_name);
+而 its 是调用
+	its_probe_one(&res, &np->fwnode, of_node_to_nid(np));
+
+
+static int __init its_pmsi_init_one(struct fwnode_handle *fwnode,
+				const char *name)
+{
+	struct irq_domain *parent;
+/* 找到之前注册的 DOMAIN_BUS_NEXUS 类型的  ITS domain */
+	parent = irq_find_matching_fwnode(fwnode, DOMAIN_BUS_NEXUS);
+	if (!parent || !msi_get_domain_info(parent)) {
+		pr_err("%s: unable to locate ITS domain\n", name);
+		return -ENXIO;
+	}
+/* 使用本地定义的 struct msi_domain_info来创建 platform msi irq domain.
+ * static struct msi_domain_info its_pmsi_domain_info = {
+	.flags	= (MSI_FLAG_USE_DEF_DOM_OPS | MSI_FLAG_USE_DEF_CHIP_OPS),
+	.ops	= &its_pmsi_ops,
+	.chip	= &its_pmsi_irq_chip,
+	};
+ * 其中， chip 的系列 operations 是:
+		chip->irq_mask = irq_chip_mask_parent;
+		chip->irq_unmask = irq_chip_unmask_parent;
+		chip->irq_eoi = irq_chip_eoi_parent;
+		chip->irq_set_affinity = msi_domain_set_affinity;
+		chip->irq_write_msi_msg = platform_msi_write_msg;
+ * struct msi_domain_ops 中的 msi_init, set_desc 是：
+		ops->msi_init = platform_msi_init;
+		ops->set_desc = platform_msi_set_desc;
+ * 此外， platform_msi_create_irq_domain 还完成以下处理：
+	domain = msi_create_irq_domain(fwnode, info, parent);
+	if (domain)
+		domain->bus_token = DOMAIN_BUS_PLATFORM_MSI;
+ */
+	if (!platform_msi_create_irq_domain(fwnode, &its_pmsi_domain_info,
+					    parent)) {
+		pr_err("%s: unable to create platform domain\n", name);
+		return -ENXIO;
+	}
+
+	pr_info("Platform MSI: %s domain created\n", name);
+	return 0;
+}
+
+struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+					 struct msi_domain_info *info,
+					 struct irq_domain *parent)
+{
+/* 对于 plaftorm msi, 这里会更新 info->ops 中的 某些hooks:
+ * ops->get_hwirq = msi_domain_ops_default.get_hwirq;
+ * ops->msi_check = msi_domain_ops_default.msi_check;
+ * ops->msi_prepare应该是指向 its_pmsi_domain_info 中的its_pmsi_prepare；
+ */
+	if (info->flags & MSI_FLAG_USE_DEF_DOM_OPS)
+		msi_domain_update_dom_ops(info);
+/* 更新 struct irq_chip 中的 :
+ * chip->irq_set_affinity = msi_domain_set_affinity;
+ */
+	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
+		msi_domain_update_chip_ops(info);
+/* 这里创建的 gic-v3-its 对应的 irq controller 的domain 的 struct
+ * msi_domain_ops是 msi_domain_ops。 */
+	return irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info);
+}
+
+
+总结一下各个层次的 irq_domain.
+
+
+"arm,gic-v3"
+gic_init_bases ：
+	gic_irq_domain_ops gic_data 
+
+.compatible  = "arm,gic-v3-its"
+
+its_init_domain (domain的 flags使用 IRQ_DOMAIN_FLAG_MSI_REMAP）:
+its_domain_ops 私有定义struct msi_domain_info  DOMAIN_BUS_NEXUS its_parent
+
+its_pmsi_init_one (domain 的 flags 使用 IRQ_DOMAIN_FLAG_MSI标志） :
+msi_domain_ops  its_pmsi_domain_info  DOMAIN_BUS_PLATFORM_MSI DOMAIN_BUS_NEXUS
+
+
+.compatible = "hisilicon,mbigen-v2"
+
+mbigen_of_create_domain :
+mbigen_domain_ops struct platform_msi_priv_data（其中的 host_data指向struct
+	mbigen_device）
+	通过 msi_domain_prepare_irqs(domain->parent, dev, nvec, &data->arg) 调用
+	parent domain 的 struct msi_domain_info 中的 struct msi_domain_ops 的
+	ops->msi_check 和 ops->msi_prepare；
+	分别是 msi_domain_ops_check 和 its_pmsi_prepare；
+
+msi_domain_ops_check直接返回0.
+我们分析一下 its_pmsi_prepare的处理。
+static int its_pmsi_prepare(struct irq_domain *domain, struct device *dev,
+			    int nvec, msi_alloc_info_t *info)
+{
+	struct msi_domain_info *msi_info;
+	u32 dev_id;
+	int ret;
+/* 传入的 *domain 是指向 its_pmsi_init_one 中创建的 platform msi domain.
+ * 而domain->parent 应该是 its_init_domain 中创建的 its domain. 因此
+ * msi_info是指向 its_init_domain中初始化的 struct msi_domain_info。 */
+	msi_info = msi_get_domain_info(domain->parent);
+
+/* 这里会根据 msi-parent中的 phandle 来解释 msi-parent中的数据。实际使用的是
+ * parent domain 节点中配置的 '#msi-cells' 来获得 dev_id. 然后将此数据保存到
+ * struct platform_msi_priv_data 结构的 msi_alloc_info_t arg中。*/
+	if (dev->of_node)
+		ret = of_pmsi_get_dev_id(domain, dev, &dev_id);
+	else
+		ret = iort_pmsi_get_dev_id(dev, &dev_id);
+	if (ret)
+		return ret;
+
+	/* ITS specific DeviceID, as the core ITS ignores dev. */
+	info->scratchpad[0].ul = dev_id;
+/* msi_info->ops指向 its_msi_domain_ops。因此调用 its_msi_prepare */
+	return msi_info->ops->msi_prepare(domain->parent,
+					  dev, nvec, info);
+}
+
+its_msi_prepare()的主要功能是：
+	its_dev = its_create_device(its, dev_id, nvec)
+
+创建 struct its_device 节点，并将此节点通过 its_send_mapd(dev, 1) 产生
+GITS_CMD_MAPD命令添加/注册到 ITS中。
+
+这里需要注意的是，platform msi设备传入的请求的 LPI 数，也就是nvec.
+具体分配了哪些LPI ID给此次请求，是经过 its_create_device -->
+its_lpi_alloc_chunks(nvecs, &lpi_base, &nr_lpis) 后从 lpi_bitmap
+中选择idle的bit来产生的。这里的 bit表示 chunk 的ID 号。
+因此，LPI不是请求时指定的，而是分配的。
+分配出来的 LPI 等是保存在：
+
+	dev->event_map.lpi_base = lpi_base;
+	dev->event_map.nr_lpis = nr_lpis;
+
+也就是 struct its_device 的 struct event_lpi_map	event_map 中。
+具体参见 its_create_device()中的处理。
+
+
+3. ITS命令操作
+
+3.1 MAPD
+
+MAPD DeviceID, ITT_addr, Size
+
+在 platform MSI 设备开始初始化时，会调用到以下 call path：
+
+its_create_device
+	--> its_send_mapd(dev, 1)
+		->its_send_single_command(dev->its, its_build_mapd_cmd, &desc）
+		--> its_build_mapd_cmd
+
+以上处理会通过发出 GITS_CMD_MAPD 命令 在 device table中添加一个对应
+desc->its_mapd_cmd.dev->device_id 的entry，其中的 ITT_addr specifies bits[51:8]
+of the physical address of the ITT，Size is a 5-bit number that specifies the
+supported number of bits for the device, minus one.
+这里的 ITT_addr 是在 device_id对应的设备被created时才动态分配的。具体参考
+its_create_device：
+
+	nr_ites = max(2UL, roundup_pow_of_two(nvecs));
+	sz = nr_ites * its->ite_size;
+	sz = max(sz, ITS_ITT_ALIGN) + ITS_ITT_ALIGN - 1;
+	itt = kzalloc(sz, GFP_KERNEL);
+
+而 对应此device的 lpi_base 和 所分配的 LPI 数量 由以下处理确定：
+	lpi_map = its_lpi_alloc_chunks(nvecs, &lpi_base, &nr_lpis);
+	if (lpi_map)
+		col_map = kzalloc(sizeof(*col_map) * nr_lpis, GFP_KERNEL);
+其中， unsigned long *its_lpi_alloc_chunks(int nr_irqs, int *base, int
+*nr_ids)会从 lpi_bitmap 指向的 chunk bitmap中分配free的lpi
+chunks。最终分配的chunks个数是最大的连续free，因此chunks个数可能不能满足请求的
+'nvecs'个LPI中断。实际上，真正分配的LPI数目是在入参 '*nr_ids' 中保存而返回的：
+
+	*base = its_chunk_to_lpi(chunk_id);
+	*nr_ids = nr_chunks * IRQS_PER_CHUNK;
+
+函数
+its_lpi_alloc_chunks()返回的是此device_id对应设备所分配/占据的LPI的bitmap指针。
+
+而在 its_build_mapd_cmd()中会将传入的 struct its_cmd_desc *desc 中保存的 ITT phy
+address和ITT表的size,以及 device id 填写在struct its_cmd_block结构的
+raw_cmd[]中，然后等待ITS硬件来完成实际的表格数据配置。
+具体的ITS命令操作参见 GIC spec的 6.2.8;
+请注意，这里的 size也是由传入的 nvecs 决定的，每个event/local irq对应 一个
+ITE,也就是 ITT中的一个entry。
+
+因此 MAPD DeviceID, ITT_addr, Size 的功能是构建 device table中的对应DTE。
+因为ITTbase是device table中的一个关键数据，需要在DTE被设置之前就按照event/local
+irq的数目来分配ITT从而得到 ITT base。
+
+3.2 MAPC
+
+此命令的语法为 MAPC ICID, RDbase
+其中 ICID 是 collection table 的index. 而
+RDbase是某个LPI被routed的目标PE对应的redistributor的地址。
+因为redistributor与 PE存在一一对应关系，目前ITS driver选择cpu id作为 ICID。
+可以参考 its_cpu_init_collection()中对 struct its_node结构中
+collections[]的设置。
+
+此命令应该会生成一个CTE。
+调用路径为：
+
+its_cpu_init_collection --> its_send_mapc(its, &its->collections[cpu], 1)
+
+
+3.3 MAPTI
+
+此命令的语法为：
+MAPTI DeviceID, EventID, pINTID, ICID
+
+其中， EventID是在目前ITS driver中是 device内部的irq号；
+pINTID是分配给DeviceID对应device的LPI号；
+这两个关键参数的产生，可以参考 its_irq_domain_alloc()中的实现。
+
+调用路径为 ：
+its_irq_domain_activate --> its_send_mapti(its_dev, d->hwirq, event)
+
+此命令应该能完成 ITT, CT 两个表格中对应entries的设置.
+
+desc.its_mapti_cmd.phys_id 中的是 分配的全局 LPI；
+desc.its_mapti_cmd.event_id 是 its_get_event_id(d)将struct irq_data中的'unsigned
+long		hwirq' 转换为 device内部的 event_id。
+
+ts_dev->event_map.col_map[event] 中反映的是 event ID与 collection
+ID/CPU ID的对应关系。event ID是device内部的，collection ID是PE级的。
+
+ICID在目前 ITS driver中，也用作 struct its_node的 ‘struct its_collection
+*collections‘的下标。此 struct its_collection *collections 在以下函数中初始化：
+
+	its_cpu_init_collection();
+	its_set_affinity();
+
+然后通过 dev_event_to_col()使用此struct its_collection *collections。在
+its_send_single_command()中会使用此结构中保留的数据来进行GITS_CMD_SYNC的处理。
+
+
+
+
+
+
+

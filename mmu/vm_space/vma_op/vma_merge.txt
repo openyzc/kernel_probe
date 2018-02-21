@@ -1,0 +1,54 @@
+
+
+int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
+	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
+	struct vm_area_struct *expand)
+
+
+
+	if (next && !insert) {
+		struct vm_area_struct *exporter = NULL, *importer = NULL;
+
+		if (end >= next->vm_end) {
+			if (next == expand) {
+			/* case 8 is special. 'vma' points to the 'next'',
+			 * 'expand == vma->vm_next' */
+				remove_next = 3;
+				VM_WARN_ON(file != next->vm_file);
+				swap(vma, next);
+			} else {
+				/*
+				 * case 1, 6, 7, remove_next == 2 is case 6,
+				 * remove_next == 1 is case 1 or 7.
+				 */
+				remove_next = 1 + (end > next->vm_end);
+				VM_WARN_ON(remove_next == 2 &&
+					   end != next->vm_next->vm_end);
+				VM_WARN_ON(remove_next == 1 &&
+					   end != next->vm_end);
+				/* trim end to next, for case 6 first pass */
+				end = next->vm_end;
+			}
+
+			exporter = next;
+			importer = vma;
+			if (remove_next == 2 && !next->anon_vma)
+				exporter = next->vm_next;
+		} else if (end > next->vm_start) {
+
+
+???? what is the 'exporter' and 'importer' for?
+
+For case 8, importer is the vma segment where the new VMA will be merged to,
+'exporter' is the vma which will be overriden.
+
+For case 6, the input parameter of 'end' is the 'vm_next' of
+'vma->vm_next->vm_next->vm_end'.
+
+For case 5, importer is the parameter of 'vma', the one as the merge
+destination. exporter is the VMA which will be shrinked/modified;
+
+For case 4, importer is 'vma->vm_next', the one as the merge destionation.
+exporter is the VMA which will be shrinked/modified, here, it is 'vma';
+
+

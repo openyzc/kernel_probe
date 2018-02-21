@@ -1,0 +1,11 @@
+
+static int shmem_fault(struct vm_fault *vmf)作为 static const struct
+vm_operations_struct shmem_vm_ops的 ‘int (*fault)(struct vm_fault *vmf);‘ 。
+
+do_fault --> do_shared_fault --> __do_fault --> vma->vm_ops->fault(vmf)
+
+从而调用到 shmem的 shmem_fault().
+
+此函数主要是分配page并添加到swap-cache的radix-tree中。
+
+

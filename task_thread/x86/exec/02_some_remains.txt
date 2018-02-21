@@ -1,0 +1,23 @@
+
+The following issues are not touched now.
+We will trace these after we had made the execve() process more clear on the
+skeleton.
+
+1. unshare_files()
+
+It seems a new struct files_struct duplicated from current task will be pointed
+by the local 'displaced';
+
+2. file = do_open_execat(fd, filename, flags)
+
+will open the binary file on the filesystem.
+
+3. sched_exec
+
+Should be relative to the cpu migration.
+
+
+
+
+
+

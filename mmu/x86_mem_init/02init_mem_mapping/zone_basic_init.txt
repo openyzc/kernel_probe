@@ -1,0 +1,23 @@
+
+
+
+build_all_zonelists --> build_all_zonelists_init
+
+static noinline void __init
+build_all_zonelists_init(void)
+{
+	__build_all_zonelists(NULL);
+	mminit_verify_zonelist();
+	cpuset_init_current_mems_allowed();
+}
+
+
+__build_all_zonelists() --> build_zonelists(pg_data_t *pgdat)
+
+
+The input parameter is one of
+	struct pglist_data *node_data[MAX_NUMNODES] __read_mostly;
+
+
+
+

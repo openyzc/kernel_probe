@@ -1,0 +1,263 @@
+As for VFS internal API, you can refer to vfs.txt in kernel tree.
+
+
+
+This do_last() is the key function of syscall open.
+
+static int do_last(struct nameidata *nd,
+		   struct file *file, const struct open_flags *op,
+		   int *opened)
+
+It will be called by path_openat() to process the last component of path-name.
+
+
+1. when the last component is ./ or ../
+
+	if (nd->last_type != LAST_NORM) {
+		error = handle_dots(nd, nd->last_type);
+		if (unlikely(error))
+			return error;
+		goto finish_open;
+	}
+
+As './' or '../' don't need to lookup by do_last, so 'goto finish_open'
+directly. (should be lookup by link_path_walk(s, nd) before do_last()).
+
+Then we can start the lookup at the next step.
+
+2. how to lookup
+
+Two cases for lookup:
+with O_CREAT or without O_CREAT.
+
+2.1 non O_CREAT
+
+For this case, the last component can contain the last '/' character.
+So, it seems directory can't be created with open(xxx, O_CREAT, ...);
+
+At first, try this call to lookup fast.
+
+	error = lookup_fast(nd, &path, &inode, &seq);
+
+If it is successful('error' is > 0), then 'goto finish_lookup;' directly.
+
+Which means kernel successfully finds the last component at this moment in the
+most fastest way. Finally, will call this to initialize the 'struct file' for
+the file described by the input 'struct filename *pathname':
+
+	error = vfs_open(&nd->path, file, current_cred());
+		--> 	file->f_path = *path;
+	    return do_dentry_open(file, d_backing_inode(dentry), NULL, cred);
+
+If the return 'error' of lookup_fast() is < 0, then some errors happened during
+RCU-mode lookup. The 'path_openat(&nd, op, flags | LOOKUP_RCU)' will return
+directly. But if the return 'error' is -ECHILD, we can try the Ref-mode lookup :
+	if (unlikely(filp == ERR_PTR(-ECHILD)))
+		filp = path_openat(&nd, op, flags);
+
+If the return 'error' of lookup_fast() is 0, this case is normally happened for 
+Ref-mode lookup. For RCU-mode lookup, if lookup_fast() return 0, the nd->flags
+must had been cleared the LOOKUUP_RCU. (actually, unlazy_walk(nd) will do this)
+	0 means there is no matched dentry for the lookup.
+
+For the open operation, when lookup_fast() return 0, will try the following
+lookup :
+
+	error = lookup_open(nd, &path, file, op, got_write, opened);
+
+This lookup_open() will create a new dentry & inode when lookup only find the
+negative dentry dentry(whose inode filed is NULL) or non-existing for the last
+component. I don't understand this when there is no O_CREAT for this 'open'
+calling. How can the kernel create the new dentry for the requested dname by
+dir_inode->i_op->lookup()?? and call dir_inode->i_op->create() for negative
+dentry??
+
+Although for the 'open' without O_CREAT for non-existing dentry will return
+-ENOENT finally :
+
+	if (unlikely(d_is_negative(path.dentry))) {
+		path_to_nameidata(&path, nd);
+		return -ENOENT;
+	}
+
+
+
+In error handling of path_openat():
+
+	if (unlikely(error)) {
+		if (error == -EOPENSTALE) {
+			if (flags & LOOKUP_RCU)
+				error = -ECHILD;
+			else
+				error = -ESTALE;
+		}
+		file = ERR_PTR(error);
+	}
+
+This '-ESTALE' will be used accompanied with 'LOOKUP_REVAL' :
+	if (unlikely(filp == ERR_PTR(-ESTALE)))
+		filp = path_openat(&nd, op, flags | LOOKUP_REVAL);
+
+But at this moment, it seems only to work for 'NFS' or 'fuse'.
+
+2.2 O_CREAT
+
+Only mention something about O_EXCL.
+
+O_EXCL should be in conjunction with O_CREAT. In this case, if 'pathname'
+already exists, then open will return FAIL :
+
+In do_last() when !(*opened & FILE_CREATED) :
+
+	if (unlikely((open_flag & (O_EXCL | O_CREAT)) == (O_EXCL | O_CREAT))) {
+		path_to_nameidata(&path, nd);
+		return -EEXIST;
+	}
+
+2.3 the branches of do_last
+
+finish_lookup:
+	error = step_into(nd, &path, 0, inode, seq);
+	if (unlikely(error))
+		return error;
+
+Which means the lookup had successfully found the qualified dentry which is
+positive and the matching dentry/inode/mnt are stored in '&path'. For this
+branch, the matching dentry is not created newly.
+
+
+
+finish_open:
+	/* Why this, you ask?  _Now_ we might have grown LOOKUP_JUMPED... */
+	error = complete_walk(nd);
+	if (error)
+		return error;
+	audit_inode(nd->name, nd->path.dentry, 0);
+	error = -EISDIR;
+	if ((open_flag & O_CREAT) && d_is_dir(nd->path.dentry))
+		goto out;
+	error = -ENOTDIR;
+	if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(nd->path.dentry))
+		goto out;
+
+This 'finish_open' branch is specfic for 'LAST_DOT' or 'LAST_DOTDOT';
+We know the O_CREAT for directory is invalid.
+And 'finish_open' is the next step of 'finish_lookup:';
+
+
+
+finish_open_created:
+	error = may_open(&nd->path, acc_mode, open_flag);
+	if (error)
+		goto out;
+	BUG_ON(*opened & FILE_OPENED); /* once it's opened, it's opened */
+	error = vfs_open(&nd->path, file, current_cred());
+	if (error)
+		goto out;
+	*opened |= FILE_OPENED;
+
+This branch will be jumped to when the newly dentry is created.
+
+The core is :
+	error = vfs_open(&nd->path, file, current_cred());
+
+After this vfs_open(), '*opened |= FILE_OPENED;'
+
+
+opened:
+	error = open_check_o_direct(file);
+	if (!error)
+		error = ima_file_check(file, op->acc_mode, *opened);
+	if (!error && will_truncate)
+		error = handle_truncate(file);
+
+I think this branch is corresponding to these code:
+
+	if (dir_inode->i_op->atomic_open) {
+		error = atomic_open(nd, dentry, path, file, op, open_flag,
+				    mode, opened);
+		if (unlikely(error == -ENOENT) && create_error)
+			error = create_error;
+		return error;
+	}
+
+When atomic_open return 0 and reach here:
+
+	error = lookup_open(nd, &path, file, op, got_write, opened);
+	if (open_flag & O_CREAT)
+		inode_unlock(dir->d_inode);
+	else
+		inode_unlock_shared(dir->d_inode);
+
+	if (error <= 0) {
+		if (error)
+			goto out;
+
+		if ((*opened & FILE_CREATED) ||
+		    !S_ISREG(file_inode(file)->i_mode))
+			will_truncate = false;
+
+		audit_inode(nd->name, file->f_path.dentry, 0);
+		goto opened;
+	}
+
+
+=====================
+
+As for OPEN, I haven't touched the synchronization mechanism in this procedure.
+Actually, this is more complicated.
+
+Such as what is the role of unlazy_walk(), unlazy_child(), complete_walk().
+
+This artical is just for the basic flow...
+
+
+
+
+int vfs_open(const struct path *path, struct file *file,
+	     const struct cred *cred)
+{
+	struct dentry *dentry = d_real(path->dentry, NULL, file->f_flags);
+
+	if (IS_ERR(dentry))
+		return PTR_ERR(dentry);
+
+	file->f_path = *path;
+	return do_dentry_open(file, d_backing_inode(dentry), NULL, cred);
+}
+
+static int do_dentry_open(struct file *f,
+			  struct inode *inode,
+			  int (*open)(struct inode *, struct file *),
+			  const struct cred *cred)
+{
+	static const struct file_operations empty_fops = {};
+	int error;
+
+	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+				FMODE_PREAD | FMODE_PWRITE;
+
+	path_get(&f->f_path);
+	f->f_inode = inode;
+	f->f_mapping = inode->i_mapping;
+	...
+	if (S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode))
+		f->f_mode |= FMODE_ATOMIC_POS;
+
+	f->f_op = fops_get(inode->i_fop);
+	...
+	if (!open)
+		open = f->f_op->open;
+	if (open) {
+		error = open(inode, f);
+		if (error)
+			goto cleanup_all;
+	}
+	...
+}
+
+So, the 'struct file' will be setup and the inode->i_fop will be transferred to
+'f->f_op'. Then the relationship between 'struct file' and 'struct inode' had
+been built.
+
+

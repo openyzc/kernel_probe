@@ -1,0 +1,71 @@
+
+在 include/asm-generic/atomic-long.h 中，
+
+#define atomic_long_cmpxchg_relaxed(l, old, new) \
+	(ATOMIC_LONG_PFX(_cmpxchg_relaxed)((ATOMIC_LONG_PFX(_t) *)(l), \
+					   (old), (new)))
+#define atomic_long_cmpxchg_acquire(l, old, new) \
+	(ATOMIC_LONG_PFX(_cmpxchg_acquire)((ATOMIC_LONG_PFX(_t) *)(l), \
+					   (old), (new)))
+
+以上 macroes定义了 atomic64_cmpxchg_acquire 或
+atomic_cmpxchg_acquire的名字，如下：
+
+#ifndef atomic64_cmpxchg_relaxed
+#define  atomic64_cmpxchg_relaxed	atomic64_cmpxchg
+#define  atomic64_cmpxchg_acquire	atomic64_cmpxchg
+#define  atomic64_cmpxchg_release	atomic64_cmpxchg
+
+#else /* atomic64_cmpxchg_relaxed */
+
+#ifndef atomic64_cmpxchg_acquire
+#define  atomic64_cmpxchg_acquire(...)					\
+	__atomic_op_acquire(atomic64_cmpxchg, __VA_ARGS__)
+#endif
+
+和
+
+#ifndef atomic_cmpxchg_relaxed
+#define  atomic_cmpxchg_relaxed		atomic_cmpxchg
+#define  atomic_cmpxchg_acquire		atomic_cmpxchg
+#define  atomic_cmpxchg_release		atomic_cmpxchg
+
+#else /* atomic_cmpxchg_relaxed */
+
+#ifndef atomic_cmpxchg_acquire
+#define  atomic_cmpxchg_acquire(...)					\
+	__atomic_op_acquire(atomic_cmpxchg, __VA_ARGS__)
+#endif
+
+对于x86, atomic_cmpxchg是：
+
+static __always_inline int atomic_cmpxchg(atomic_t *v, int old, int new)
+{
+	return cmpxchg(&v->counter, old, new);
+}
+
+在 arch/x86/include/asm/atomic64_64.h 中，
+
+static inline long atomic64_cmpxchg(atomic64_t *v, long old, long new)
+{
+	return cmpxchg(&v->counter, old, new);
+}
+
+请注意，这里 cmpxchg返回的是
+eax/rax中的值。此值不管cmpxchg指令的结果是什么，都会被更新为原来内存&v->counter中的值。
+
+static __always_inline bool __mutex_trylock_fast(struct mutex *lock)
+{
+	unsigned long curr = (unsigned long)current;
+
+	if (!atomic_long_cmpxchg_acquire(&lock->owner, 0UL, curr))
+		return true;
+
+	return false;
+}
+
+
+因此，如果 &lock->owner在调用此 __mutex_trylock_fast()前为0UL，那么会被更新为
+curr。否则&lock->owner保持原值，返回的也是非0的原值。从而 return false;
+
+

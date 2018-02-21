@@ -1,0 +1,89 @@
+
+For fork()/clone(), 
+
+1. system call entry
+
+entry_SYSCALL_64
+
+
+GLOBAL(entry_SYSCALL_64_after_swapgs)
+
+	movq	%rsp, PER_CPU_VAR(rsp_scratch)
+	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+
+## The above code will save the kernel %rsp to PER_CPU_VAR(rsp_scratch) and
+## adjust the new %rsp as PER_CPU_VAR(cpu_current_top_of_stack), it should be
+## the thread sp0(i.e. stack base). Than the following processings will
+## overwrite the new stack from base to setup a 'struct pt_regs';
+
+	pushq	$__USER_DS			/* pt_regs->ss */
+	pushq	PER_CPU_VAR(rsp_scratch)	/* pt_regs->sp */
+	pushq	%r11				/* pt_regs->flags */
+	pushq	$__USER_CS			/* pt_regs->cs */
+	pushq	%rcx				/* pt_regs->ip */
+	pushq	%rax				/* pt_regs->orig_ax */
+	pushq	%rdi				/* pt_regs->di */
+	pushq	%rsi				/* pt_regs->si */
+	pushq	%rdx				/* pt_regs->dx */
+	pushq	%rcx				/* pt_regs->cx */
+	pushq	$-ENOSYS			/* pt_regs->ax */
+	pushq	%r8				/* pt_regs->r8 */
+	pushq	%r9				/* pt_regs->r9 */
+	pushq	%r10				/* pt_regs->r10 */
+	pushq	%r11				/* pt_regs->r11 */
+	sub	$(6*8), %rsp		/* pt_regs->bp, bx, r12-15 not saved */
+
+We also note this line of 'pushq PER_CPU_VAR(rsp_scratch)', as
+PER_CPU_VAR(rsp_scratch) is the original stack top, so here, the original stack
+top will be saved in 'pt_regs->sp'; If no anyone to update this 'pt_regs->sp',
+the ret processing can recover the original stack top;
+
+	movq	PER_CPU_VAR(current_task), %r11
+	testl	$_TIF_WORK_SYSCALL_ENTRY|_TIF_ALLWORK_MASK, TASK_TI_flags(%r11)
+	jnz	entry_SYSCALL64_slow_path
+
+## The exec() iret should follow this path as _TIF_ALLWORK_MASK was set in
+## start_thread().
+
+
+entry_SYSCALL_64_fastpath:
+	TRACE_IRQS_ON
+	ENABLE_INTERRUPTS(CLBR_NONE)
+	...
+	call	*sys_call_table(, %rax, 8)
+.Lentry_SYSCALL_64_after_fastpath_call:
+
+	movq	%rax, RAX(%rsp)
+	...
+
+	LOCKDEP_SYS_EXIT
+	TRACE_IRQS_ON		/* user mode is traced as IRQs on */
+	movq	RIP(%rsp), %rcx
+	movq	EFLAGS(%rsp), %r11
+	RESTORE_C_REGS_EXCEPT_RCX_R11
+	movq	RSP(%rsp), %rsp
+	USERGS_SYSRET64
+
+## This is the normal path for the systemcall fork/clone iret.
+## As the RSP(%rsp) is from the 'pt_reg->sp' which was probably updated by
+copy_thread_tls() for clone() which has the stack parameter, then after
+returning to the user-space, the new thread can have the new stack.
+
+=====================
+
+After fork/clone return to user-land, the new process/thread will be scheduled
+later. For the first time schedule on those new process/thread, the seting of
+'struct inactive_task_frame' created by copy_thread_tls() during fork/clone will
+work and ret_from_fork() will be entered.
+
+For kernel_thread(), the function entry will be called.
+For non-kernel thread, will recover the excute path same as that of parent
+thread:
+
+	*childregs = *current_pt_regs();
+
+In copy_thread_tls(), the new thread's pt_regs is a copy of parent. So, the 'ip'
+and 'cs' are same as the parent. Which means that when the new forked/cloned
+thread is scheduled, it will continue the work when the parent was blocked.
+
+

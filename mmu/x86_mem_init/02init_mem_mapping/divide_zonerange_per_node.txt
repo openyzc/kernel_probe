@@ -1,0 +1,36 @@
+
+
+This is done before the build_zonelists().
+
+We must know the memory ranges for different zone type in one node.
+That is what we will describe here.
+
+Some memory relevant operations before this calling:
+
+1) init_mem_mapping()
+
+Setup the page tables for [0, max_pfn << PAGE_SHIFT) on X86_64, for [0,
+max_low_pfn << PAGE_SHIFT) on X86_32.
+
+2) initmem_init()
+
+And after initmem_init(), the memory regions of a numa node had been separated
+into memblock.
+
+
+setup_arch --> 	x86_init.paging.pagetable_init()
+
+
+	.paging = {
+		.pagetable_init		= native_pagetable_init,
+	},
+
+So, native_pagetable_init() will be called.
+
+For x86_64,
+	#define native_pagetable_init        paging_init
+
+For x86_32, there is a function 'native_pagetable_init', but both of them will
+call paging_init() in the end.
+
+

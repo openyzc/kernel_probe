@@ -1,0 +1,96 @@
+
+
+这个 __do_fault()函数是 page fault处理的核心之一。
+
+
+static int __do_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	int ret;
+/* 这里是 core processing. 不同的 file mapping 会定义不同的hook. */
+	ret = vma->vm_ops->fault(vmf);
+/* I think, 以下 vm_ops->fault()的返回码 表示page fault处理失败. 可以参考
+ * do_read_fault() 中在__do_fault()返回后的处理.  */
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY |
+			    VM_FAULT_DONE_COW)))
+		return ret;
+/* 对返回的 vmf->page 进行检查... */
+	if (unlikely(PageHWPoison(vmf->page))) {
+		if (ret & VM_FAULT_LOCKED)
+			unlock_page(vmf->page);
+		put_page(vmf->page);
+		vmf->page = NULL;
+		return VM_FAULT_HWPOISON;
+	}
+
+	if (unlikely(!(ret & VM_FAULT_LOCKED)))
+/* 此branch 应该是 normal case... */
+		lock_page(vmf->page);
+	else
+		VM_BUG_ON_PAGE(!PageLocked(vmf->page), vmf->page);
+
+	return ret;
+}
+
+对于 vmf->vm_ops的设置， 主要关注以下情况:
+
+1) ext4
+
+In ext4_file_mmap():
+
+	if (IS_DAX(file_inode(file))) {
+		vma->vm_ops = &ext4_dax_vm_ops;
+		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+	} else {
+		vma->vm_ops = &ext4_file_vm_ops;
+	}
+
+所以, 对应的 fault() hook是 ext4_filemap_fault 或 ext4_dax_fault；
+其实， ext4_filemap_fault的核心还是 filemap_fault().
+
+2) 通过 generic_file_mmap()进行通用设置
+
+int generic_file_mmap(struct file * file, struct vm_area_struct * vma)
+{
+	struct address_space *mapping = file->f_mapping;
+
+	if (!mapping->a_ops->readpage)
+		return -ENOEXEC;
+	file_accessed(file);
+	vma->vm_ops = &generic_file_vm_ops;
+	return 0;
+}
+
+此时, fault()是 filemap_fault().
+
+此generic_file_mmap() 用于 def_blk_fops, ext2等.
+
+3) shm/shmem系统
+
+对于shm, 通过 shm_mmap():
+/* 这里的 file是sfd->file, 由 newseg --> shmem_kernel_file_setup(name, size,
+ * acctflag) 设置指向 shmem_file_operations。 所以 最终shmem_mmap 会被调用.
+ * 而其中有 '	vma->vm_ops = &shmem_vm_ops;' */
+	ret = call_mmap(sfd->file, vma);
+/* 这里需要注意, vma->vm_ops 的原始指针 会被保存到 sfd->vm_ops中，后面的
+ * vma->vm_ops = &shm_vm_ops 会覆盖原值. 而 原来的 vma->vm_ops 是 &shmem_vm_ops.
+ */
+	sfd->vm_ops = vma->vm_ops;
+
+	vma->vm_ops = &shm_vm_ops;
+fault指向 shm_fault; 但跟踪 shm_fault():
+
+	return sfd->vm_ops->fault(vmf);
+实际最终还是调用 shmem_vm_ops的 fault hook.
+
+对于shmem, 通过 shmem_mmap():
+	vma->vm_ops = &shmem_vm_ops;
+
+fault指向 shmem_fault;
+
+
+
+
+
+
+

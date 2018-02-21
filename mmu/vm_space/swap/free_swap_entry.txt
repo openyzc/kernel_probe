@@ -1,0 +1,57 @@
+
+swap entries的使用 在swap系统中比较重要，有必要独立描述。
+
+
+
+
+1.
+
+通用的路径是：
+
+free_swap_slot --> swapcache_free_entries --> swap_entry_free(p, entries[i])
+
+
+1） 其中 free_swap_slot 根据 use_swap_slot_cache 标志(启用 swap slot
+cache?)来决定是否 缓存/cache 本次要free的entries.
+
+2） swap_entry_free() 只是针对 p->swap_map[offset] == SWAP_HAS_CACHE的情形；
+
+3） swap_entry_free中需要完成以下操作:
+	p->swap_map[offset] = 0;
+表示offset对应的 slot page 没有被使用，空闲的；
+
+	dec_cluster_info_page(p, p->cluster_info, offset);
+对于SSD的swap，需要将本次释放的 offset对应的 struct swap_cluster_info
+cluster_info[] 重新linked回 struct swap_info_struct中的'struct swap_cluster_list
+free_clusters;' 链表中：
+		cluster_set_flag(&cluster_info[idx], CLUSTER_FLAG_FREE);
+		cluster_list_add_tail(&p->free_clusters, cluster_info, idx);
+
+更新通用的 lowest_bit 和 highest_bit：
+	if (offset < p->lowest_bit)
+		p->lowest_bit = offset;
+	if (offset > p->highest_bit) {
+		bool was_full = !p->highest_bit;
+
+		p->highest_bit = offset;
+/* 之前 p对应的 struct swap_info_struct 中的所有 swap slots
+ * 都分配出去了。现在free 回来首个 swap slot, 需要重新将 p 挂回到 全局的
+ * swap_avail_list中。*/
+		if (was_full && (p->flags & SWP_WRITEOK)) {
+			spin_lock(&swap_avail_lock);
+			WARN_ON(!plist_node_empty(&p->avail_list));
+			if (plist_node_empty(&p->avail_list))
+				plist_add(&p->avail_list,
+					  &swap_avail_head);
+			spin_unlock(&swap_avail_lock);
+		}
+	}
+
+这里啰嗦一下， PLIST_HEAD(swap_active_head);
+是kernel中所有已经swapon，也就是enalbed的 struct swap_info_struct
+都会挂入到此链中。而在 swapoff是会delink;
+
+
+2. 
+
+

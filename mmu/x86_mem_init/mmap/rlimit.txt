@@ -1,0 +1,53 @@
+
+https://hardenedlinux.github.io/system-security/2016/03/14/mprotect.html
+
+In linux, there is a function which can get the resource limit :
+
+static inline unsigned long task_rlimit(const struct task_struct *tsk,
+		unsigned int limit)
+{
+	return READ_ONCE(tsk->signal->rlim[limit].rlim_cur);
+}
+
+static inline unsigned long rlimit(unsigned int limit)
+{
+	return task_rlimit(current, limit);
+}
+
+So, where to setup the 'tsk->signal->rlim[limit].rlim_cur for different reource
+items?
+
+the syscall will do this:
+
+SYSCALL_DEFINE2(setrlimit, unsigned int, resource, struct rlimit __user *, rlim)
+
+
+But what is the initial value??
+
+We can trace this by INIT_TASK().
+
+
+at last, we get here:
+
+#define INIT_RLIMITS							\
+{									\
+	[RLIMIT_CPU]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_FSIZE]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_DATA]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_STACK]		= {       _STK_LIM,  RLIM_INFINITY },	\
+	[RLIMIT_CORE]		= {              0,  RLIM_INFINITY },	\
+	[RLIMIT_RSS]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_NPROC]		= {              0,              0 },	\
+	[RLIMIT_NOFILE]		= {   INR_OPEN_CUR,   INR_OPEN_MAX },	\
+	[RLIMIT_MEMLOCK]	= {    MLOCK_LIMIT,    MLOCK_LIMIT },	\
+	[RLIMIT_AS]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_LOCKS]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+	[RLIMIT_SIGPENDING]	= { 		0,	       0 },	\
+	[RLIMIT_MSGQUEUE]	= {   MQ_BYTES_MAX,   MQ_BYTES_MAX },	\
+	[RLIMIT_NICE]		= { 0, 0 },				\
+	[RLIMIT_RTPRIO]		= { 0, 0 },				\
+	[RLIMIT_RTTIME]		= {  RLIM_INFINITY,  RLIM_INFINITY },	\
+}
+
+So, for [RLIMIT_AS], its initial value is RLIM_INFINITY which means 'no limit';
+

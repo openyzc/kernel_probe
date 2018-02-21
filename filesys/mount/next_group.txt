@@ -1,0 +1,92 @@
+
+next_group() is a function which is not so easy to understand. It plays
+important role for the mount propagation.
+
+We will provide some notes about this helper function.
+
+in fs/pnode.c :
+
+static struct mount *next_group(struct mount *m, struct mount *origin)
+{
+	while (1) {
+/*
+ * This first while() works just like copy_tree(). All the first nodes of
+ * 'mnt_slave_list' will be returned to propagate_one() to perform the mount
+ * info propagation at first. If a terminal 'struct mount *' with empty
+ * mnt_slave_list, will transfer to the peer 'struct mount' in the 'mnt_share'
+ * list of the same level. So, this process is preorder depth
+ * traverse(先序遍历）.
+ */
+		while (1) {
+			struct mount *next;
+			if (!IS_MNT_NEW(m) && !list_empty(&m->mnt_slave_list))
+				return first_slave(m);
+/* No slave node in 'm->mnt_slave_list'. Check the next_peer(m). */
+			next = next_peer(m);
+			if (m->mnt_group_id == origin->mnt_group_id) {
+				if (next == origin)
+					return NULL;
+			} else if (m->mnt_slave.next != &next->mnt_slave)
+/* I don't understand this. next_peer(m) can return the same 'm' when the
+ * 'm->mnt_share' is empty, then m->mnt_slave.next always == &next->mnt_slave,
+ * it seems a infinitive loop. What I missed?? */
+				break;
+			m = next;
+		}
+		/* m is the last peer */
+		while (1) {
+			struct mount *master = m->mnt_master;
+/*wheather current 'm' is the last node of 'master->mnt_slave_list'? When just
+ * entering this while, this condition should be matched. Mostly, this is for
+ * the slave list of next_peer(master). */
+			if (m->mnt_slave.next != &master->mnt_slave_list)
+				return next_slave(m);
+/* The upstream 'master' reach to the original start 'origin', should end. */
+			m = next_peer(master);
+			if (master->mnt_group_id == origin->mnt_group_id)
+				break;
+/* Why '=='?? I think this is corresponding to the 'if (m->mnt_slave.next !=
+ * &next->mnt_slave)' in the first while loop... */
+			if (master->mnt_slave.next == &m->mnt_slave)
+				break;
+			m = master;
+		}
+		if (m == origin)
+			return NULL;
+	}
+}
+
+
+
+static int attach_recursive_mnt(struct mount *source_mnt,
+			struct mount *dest_mnt,
+			struct mountpoint *dest_mp,
+			struct path *parent_path)
+{
+	HLIST_HEAD(tree_list);
+	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+	...
+
+	/* Preallocate a mountpoint in case the new mounts need
+	 * to be tucked under other mounts.
+	 */
+	smp = get_mountpoint(source_mnt->mnt.mnt_root);
+	if (IS_ERR(smp))
+		return PTR_ERR(smp);
+
+	...
+	hlist_for_each_entry_safe(child, n, &tree_list, mnt_hash) {
+		struct mount *q;
+		hlist_del_init(&child->mnt_hash);
+/* child->mnt_mountpoint is 'dest_mp'. I think '__lookup_mnt()' return all the
+ * originally attached 'struct mount' nodes just under 'child->mnt_parent' that
+ * is 'dest_mnt'; */
+		q = __lookup_mnt(&child->mnt_parent->mnt,
+				 child->mnt_mountpoint);
+/* adjust the mount tree for 'q' and attach it again. But Why???  */
+		if (q)
+			mnt_change_mountpoint(child, smp, q);
+		commit_tree(child);
+	}
+	...
+}

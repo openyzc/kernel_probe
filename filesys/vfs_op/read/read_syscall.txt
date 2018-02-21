@@ -1,0 +1,56 @@
+
+
+In fs/read_write.c :
+
+SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+
+In fs/open.c, some fields of struct file will be setup by do_dentry_open()
+during open() syscall :
+
+	f->f_inode = inode;
+	f->f_mapping = inode->i_mapping;
+
+	f->f_op = fops_get(inode->i_fop);
+
+We trace the 'ext4_file_operations' for ext4 filesystem.
+
+const struct file_operations ext4_file_operations = {
+	.llseek		= ext4_llseek,
+	.read_iter	= ext4_file_read_iter,
+	.write_iter	= ext4_file_write_iter,
+	.unlocked_ioctl = ext4_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ext4_compat_ioctl,
+#endif
+	.mmap		= ext4_file_mmap,
+	.open		= ext4_file_open,
+
+
+So, based on the following code:
+ssize_t __vfs_read(struct file *file, char __user *buf, size_t count,
+		   loff_t *pos)
+{
+	if (file->f_op->read)
+		return file->f_op->read(file, buf, count, pos);
+	else if (file->f_op->read_iter)
+		return new_sync_read(file, buf, count, pos);
+	else
+		return -EINVAL;
+}
+
+
+new_sync_read  -->
+	ext4_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+
+The '*iocb' and '*to' are initialized by new_sync_read() with these local
+variables:
+	struct kiocb kiocb;
+	struct iov_iter iter;
+
+	--> generic_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+		--> do_generic_file_read(file, &iocb->ki_pos, iter, retval)
+
+The later two functions are defined in mm/filemap.c ;
+
+
+

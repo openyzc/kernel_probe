@@ -1,0 +1,50 @@
+
+static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+		int write)
+{
+	struct page *page;
+	int ret;
+	unsigned int gup_flags = FOLL_FORCE;
+
+#ifdef CONFIG_STACK_GROWSUP
+	if (write) {
+		ret = expand_downwards(bprm->vma, pos);
+		if (ret < 0)
+			return NULL;
+	}
+#endif
+
+
+Why this speical handling is needed for CONFIG_STACK_GROWSUP??
+
+
+
+	ret = get_user_pages_remote(current, bprm->mm, pos, 1, gup_flags,
+			&page, NULL, NULL); -->
+		__get_user_pages_locked --> __get_user_pages -->
+			find_extend_vma(mm, start)
+
+struct vm_area_struct *
+find_extend_vma(struct mm_struct *mm, unsigned long addr)
+{
+	struct vm_area_struct *vma, *prev;
+
+	addr &= PAGE_MASK;
+	vma = find_vma_prev(mm, addr, &prev);
+	if (vma && (vma->vm_start <= addr))
+		return vma;
+	if (!prev || expand_stack(prev, addr))
+		return NULL;
+	if (prev->vm_flags & VM_LOCKED)
+		populate_vma_page_range(prev, addr, prev->vm_end, NULL);
+	return prev;
+}
+
+For the requested 'addr', it is less than the stack top. As a top page had been
+inserted to the VMAs space of the current thread, find_vma_prev will return
+valid VMA. But the 'prev' will be NULL without the call of
+'expand_downwards(bprm->vma, pos)' in get_arg_page(). Then there will no chance
+to call expand_stack(prev, addr) to extend the previous VMA to cover the 'addr'.
+
+
+

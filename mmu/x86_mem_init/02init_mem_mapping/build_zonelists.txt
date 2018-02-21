@@ -1,0 +1,101 @@
+
+
+static void build_zonelists(pg_data_t *pgdat)
+
+This function will setup the 'pgdat->node_zonelists[]' for the specific node.
+
+There are several pathes to call this functiion:
+
+1) start_kernel --> build_all_zonelists(NULL, NULL)
+	--> build_all_zonelists_init(void)
+
+2)
+After updating the 'user_zonelist_order' by /proc/sys/vm/numa_zonelist_order,
+we need to call build_all_zonelists(NULL, NULL) to rebuild the zonelists.
+
+3)
+memory hotplug
+
+
+
+static void build_zonelists(pg_data_t *pgdat)
+{
+	...
+
+	local_node = pgdat->node_id;
+	load = nr_online_nodes;
+	prev_node = local_node;
+	nodes_clear(used_mask);
+/*
+ * Get the local node from 'pgdat';
+ */
+
+/*
+ * find_next_best_node() will scan all the nodes with memory to find the best
+ * node based on some criterias. First time of the call will return local_node
+ * directly; next call of find_next_best_node() will prefer to return the node
+ * which is in the same group as 'local_node'; For the nodes in the same group,
+ * the bigger node id or the node with bootup CPU core is preferable; When all
+ * nodes in the same group are finished, will select the node from the next
+ * distance closer group... To round-robin all the nodes of the same group,
+ * kernel applies a node_load[MAX_NUMNODES] to stored a weight value to the
+ * first node of the group, then next build_zonelists --> find_next_best_node()
+ * will not select that node as the first one. This node_load[] only works for
+ * the same 'while ((node = find_next_best_node(local_node, &used_mask))'. When
+ * a new __build_all_zonelists() is called, node_load[] will be initialized as 0
+ */
+	while ((node = find_next_best_node(local_node, &used_mask)) >= 0) {
+		if (node_distance(local_node, node) !=
+		    node_distance(local_node, prev_node))
+			node_load[node] = load;
+
+		prev_node = node;
+		load--;
+		if (order == ZONELIST_ORDER_NODE)
+			build_zonelists_in_node_order(pgdat, node);
+		else
+			node_order[i++] = node;	/* remember order */
+	}
+
+
+2. the building for ZONELIST_ORDER_NODE
+
+In above loop, when a best node is selected, then do this :
+
+                if (order == ZONELIST_ORDER_NODE)
+                        build_zonelists_in_node_order(pgdat, node);
+
+build_zonelists_in_node_order(pgdat, node) will append all valid zones from
+'node' to the pgdat->node_zonelists[ZONELIST_FALLBACK]. Those zones will be
+appended from 'MAX_NR_ZONES' to zone_type '0';
+
+So, ZONELIST_ORDER_NODE will build the node_zonelists[] in the order where
+'zone_type' take the priority.
+
+3. The building for ZONELIST_ORDER_ZONE
+
+	if (order == ZONELIST_ORDER_ZONE) {
+		/* calculate node order -- i.e., DMA last! */
+		build_zonelists_in_zone_order(pgdat, i);
+	}
+
+
+Before these processing, 'node_order[MAX_NUMNODES]' had cached all the
+available nodes in the matchable degree with 'local_node'.
+
+build_zonelists_in_zone_order(pg_data_t *pgdat, int nr_nodes)
+will get the zone with the same zone_type from those nodes in node_order[].
+After all the NODE_DATA(node)->node_zones[] with same index are added, we start
+the processing on the next node of node_order[].
+
+The higher zone_type will be added at first.
+
+4. setup the pgdat->node_zonelists[ZONELIST_NOFALLBACK]
+
+build_thisnode_zonelists(pgdat);
+
+The processing only add the zones from local node.
+
+The zone with HIGH zone_type will be added first.
+
+

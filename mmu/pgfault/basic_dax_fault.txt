@@ -1,0 +1,96 @@
+
+
+static int dev_dax_fault(struct vm_fault *vmf)
+{
+	return dev_dax_huge_fault(vmf, PE_SIZE_PTE);
+}
+
+static const struct vm_operations_struct dax_vm_ops = {
+	.fault = dev_dax_fault,
+	.huge_fault = dev_dax_huge_fault,
+};
+
+
+dev_dax_huge_fault
+	--> __dev_dax_pte_fault
+		--> pfn = phys_to_pfn_t(phys, dax_region->pfn_flags)
+		--> vm_insert_mixed(vmf->vma, vmf->address, pfn)
+			--> insert_pfn /* When HAVE_PTE_SPECIAL */
+			--> insert_page /* !HAVE_PTE_SPECIAL */
+
+In insert_pfn():
+
+	if (pfn_t_devmap(pfn))
+		entry = pte_mkdevmap(pfn_t_pte(pfn, prot));
+	else
+		entry = pte_mkspecial(pfn_t_pte(pfn, prot));
+
+The pte_mkdevmap(pfn_t_pte(pfn, prot)) will set the _PAGE_SPECIAL|_PAGE_DEVMAP
+in PTE.
+
+
+
+2. How this 'dev_dax_huge_fault' is called?
+
+In drivers/dax/device.c :
+
+static const struct file_operations dax_fops = {
+	.llseek = noop_llseek,
+	.owner = THIS_MODULE,
+	.open = dax_open,
+	.release = dax_release,
+	.get_unmapped_area = dax_get_unmapped_area,
+	.mmap = dax_mmap,
+};
+
+
+dax_pmem_probe
+	--> devm_create_dev_dax
+		--> cdev_init(cdev, &dax_fops)
+
+dax_mmap() will initialize the 'vma->vm_ops' as 'dax_vm_ops' :
+
+	vma->vm_ops = &dax_vm_ops;
+	vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+
+So, For dax, VM_MIXEDMAP will be used.
+
+
+The VM_PFNMAP is used by remap_pfn_range().
+
+
+handle_pte_fault
+	--> do_fault(vmf)
+		--> do_read_fault/do_cow_fault/do_shared_fault
+			--> __do_fault(vmf)
+				--> ret = vma->vm_ops->fault(vmf)
+
+
+
+3. Does DAX trigger page-fault?
+
+
+In follow_page_pte():
+	page = vm_normal_page(vma, address, pte);
+	if (!page && pte_devmap(pte) && (flags & FOLL_GET)) {
+		/*
+		 * Only return device mapping pages in the FOLL_GET case since
+		 * they are only valid while holding the pgmap reference.
+		 */
+		pgmap = get_dev_pagemap(pte_pfn(pte), NULL);
+		if (pgmap)
+			page = pte_page(pte);
+		else
+			goto no_page;
+	}
+
+If get_dev_pagemap(pte_pfn(pte), NULL) return NULL, then the follow_page_pte()
+will return NULL too. In this case, the faultin_page() will be triggered.
+
+But I am not so sure what cases will make get_dev_pagemap(pte_pfn(pte), NULL)
+return NULL.
+
+
+
+
+

@@ -1,0 +1,228 @@
+
+This document will discuss the relationship between task/thread and the
+pid-relevant data structure.
+
+in struct task_struct :
+	struct pid_link			pids[PIDTYPE_MAX];
+
+enum pid_type
+{
+	PIDTYPE_PID, /* The pid of level 0 */
+	PIDTYPE_PGID,
+	PIDTYPE_SID,
+	PIDTYPE_MAX
+};
+
+struct pid_link
+{
+	struct hlist_node node; /*linked to the 'struct hlist_head
+				tasks[PIDTYPE_MAX]' of struct pid*/
+	struct pid *pid;
+};
+
+
+And in copy_process():
+
+	p->pid = pid_nr(pid);
+
+	if (likely(p->pid)) {
+		...
+		init_task_pid(p, PIDTYPE_PID, pid);
+
+
+struct task_struct {
+	...
+	int	exit_signal; /* -1 represents (clone_flags & CLONE_THREAD).
+				Non-main thread*/
+	...
+	pid_t	pid;	/*The global pid of initial pid_namespace */
+	pid_t	tgid;	/*When not create a new pthread group, will set as the
+			parent thread's tgid: p->tgid = current->tgid;
+			otherwise, p->tgid = p->pid;*/
+
+	...
+	/* Real parent process: */
+	struct task_struct __rcu	*real_parent;
+
+	/* Recipient of SIGCHLD, wait4() reports: */
+	struct task_struct __rcu	*parent;
+	...
+	struct task_struct	*group_leader;
+
+
+
+1. *real_parent vs *parent
+
+https://lists.kernelnewbies.org/pipermail/kernelnewbies/2012-February/004794.html
+
+1) real_parent will be set in copy_process() during the new thread forking;
+When clone_flags & (CLONE_PARENT|CLONE_THREAD),
+	if (clone_flags & (CLONE_PARENT|CLONE_THREAD)) {
+		p->real_parent = current->real_parent;
+		p->parent_exec_id = current->parent_exec_id;
+	} else {
+		p->real_parent = current;
+		p->parent_exec_id = current->self_exec_id;
+	}
+
+So, the new cloned thread will be the sibling of the calling thread, 'current';
+The same real_parent is shared in 'current' and 'p';
+Otherwise, the 'current' will become the 'real_parent' of 'p';
+
+As for the '*parent', it seems to be used for ptrace as 'Recipient of SIGCHLD'.
+We just leave this in the future.
+
+you can refer to ptrace_link().
+
+
+
+2. struct pid & task_struct
+
+
+struct task_struct {
+	...
+	struct pid_link		pids[PIDTYPE_MAX];
+	struct list_head		thread_group;
+	struct list_head		thread_node;
+	...
+}
+
+struct pid_link pids[] directly tell us what PIDs are used by this task/thread;
+From task/thread, we can know what PIDs.
+
+struct pid_link
+{
+	struct hlist_node node; /* will link to the struct pid through the
+				task[]*/
+	struct pid *pid;
+};
+
+As this 'struct pid_link' is the field member of 'pids[]' of struct
+task_struct, and 'struct hlist_node node' will be linked to the 'struct
+hlist_head tasks[]', So, we can certainly find the corresponding struct
+task_struct through the struct pid, more precisely is the 'struct hlist_head
+tasks[]'
+
+struct pid
+{
+	atomic_t count;
+	unsigned int level;
+	/* lists of tasks that use this pid */
+	struct hlist_head tasks[PIDTYPE_MAX]; /* The first will point to the
+				first hlist_node of the list. refer to
+				hlist_add_head_rcu(). That is why pid_task() can
+				get the struct task_struct from the 'first' of
+				this field*/
+	struct rcu_head rcu;
+	struct upid numbers[1];
+};
+
+1) init_task_pid() will set the 'struct pid_link pids[]' of struct task_struct
+with some struct pid node;
+
+static inline void
+init_task_pid(struct task_struct *task, enum pid_type type, struct pid *pid)
+{
+	 task->pids[type].pid = pid;
+}
+
+2) How to find all tasks who apply the same struct pid?
+
+That's what 'struct hlist_node node;' of struct pid_link can do.
+
+void attach_pid(struct task_struct *task, enum pid_type type)
+{
+	struct pid_link *link = &task->pids[type];
+	hlist_add_head_rcu(&link->node, &link->pid->tasks[type]);
+}
+
+Then struct pid will bind with struct task_struct through struct pid_link.
+
+??? But I don't understand why the below processes are only for
+'thread_group_leader(p)':
+
+		if (thread_group_leader(p)) {
+			init_task_pid(p, PIDTYPE_PGID, task_pgrp(current));
+			init_task_pid(p, PIDTYPE_SID, task_session(current));
+
+
+3) For non main thread forking...
+
+	struct list_head		thread_group;
+	struct list_head		thread_node;
+
+These two fields are used to setup the relation with the 'group_leader' or
+'signal' for this thread :
+
+			list_add_tail_rcu(&p->thread_group,
+					  &p->group_leader->thread_group);
+			list_add_tail_rcu(&p->thread_node,
+					  &p->signal->thread_head);
+
+All these can refer to copy_process().
+
+All threads of same thread group will be in the same list created by the
+'p->thread_group' as the 'p' will be linked into
+'p->group_leader->thread_group';
+
+
+4) What will be returned by do_fork()
+
+		pid = get_task_pid(p, PIDTYPE_PID);
+		nr = pid_vnr(pid);
+
+Here, get_task_pio(p, PIDTYPE_PID) will get the 'struct pid' of the desigrated
+'p';
+
+After introducing pid_namespace, there are probably several pid values from
+different namespace levels. Which one should be returned?
+
+	nr = pid_vnr(pid); 
+
+
+struct pid_namespace *task_active_pid_ns(struct task_struct *tsk)
+{
+	return ns_of_pid(task_pid(tsk));
+}
+
+## task_pid(tsk) will get the 'struct pid' specific to 'tsk);
+	return task->pids[PIDTYPE_PID].pid;
+
+## ns_of_pid(struct pid *pid) will return the pointer to pid_namespace which is
+at lowest level;
+
+## The core is pid_nr_ns():
+
+pid_t pid_nr_ns(struct pid *pid, struct pid_namespace *ns)
+{
+	struct upid *upid;
+	pid_t nr = 0;
+
+	if (pid && ns->level <= pid->level) {
+		upid = &pid->numbers[ns->level];
+		if (upid->ns == ns)
+			nr = upid->nr;
+	}
+	return nr;
+}
+
+'*pid' is a pointer to a struct pid node which is waiting to be found the local
+pid value in the designated pid_namespace 'ns';
+So, we should find the pid->numbers[ns->level] and check the 'ns' there is equal
+to the designated 'ns'.
+
+
+pid_t pid_vnr(struct pid *pid)
+{
+	return pid_nr_ns(pid, task_active_pid_ns(current));
+}
+
+
+Please note that:
+
+		if (clone_flags & CLONE_PARENT_SETTID)
+			put_user(nr, parent_tidptr);
+
+If CLONE_PARENT_SETTID is used in clone_flags, then that local pid value will be
+stored in 'parent_tidptr' too.
+ 

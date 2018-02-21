@@ -95,7 +95,9 @@ the '((last) = __switch_to_asm((prev), (next)));' into the stack frame;
 
 	jmp	__switch_to
 
-All the above are happened in new stack.
+All the above are happened in new stack and all these 'popl' will throw all the
+callee-saved registers which were pushed in the last switch on this new task
+before.
 
 __switch_to is a function defined in arch/x86/kernel/process_32.c; So, when it
 return by 'ret', will pop the EIP saved in the new stack before this

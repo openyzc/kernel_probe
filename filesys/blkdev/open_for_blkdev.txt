@@ -1,0 +1,218 @@
+
+path_openat
+	--> link_path_walk(s, nd)
+	--> do_last
+
+mknodat/mkdirat
+	--> dentry = user_path_create(dfd, filename, &path, lookup_flags);
+	--> filename_create
+	--> dentry = __lookup_hash(&last, path->dentry, lookup_flags);
+
+__lookup_hash
+	--> lookup_real(base->d_inode, dentry, flags)
+		--> old = dir->i_op->lookup(dir, dentry, flags);
+
+而在 ext4_mkdir()中，对block device 文件所在的dir, 有以下设置：
+	} else if (S_ISDIR(inode->i_mode)) {
+		inode->i_op = &ext4_dir_inode_operations;
+		inode->i_fop = &ext4_dir_operations;
+	} 
+
+.lookup		= ext4_lookup
+
+ext4_lookup()会被调用到。
+
+inode = ext4_iget_normal(dir->i_sb, ino);
+	--> ext4_iget(sb, ino)
+
+或者,
+
+path_openat
+	--> link_path_walk(s, nd)
+	--> do_last
+		--> error = lookup_open(nd, &path, file, op, got_write, opened);
+
+
+In ext4_iget():
+
+	} else if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
+	      S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+		inode->i_op = &ext4_special_inode_operations;
+		if (raw_inode->i_block[0])
+			init_special_inode(inode, inode->i_mode,
+			   old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
+		else
+			init_special_inode(inode, inode->i_mode,
+			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
+	}
+
+而在 init_special_inode(),
+
+void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)
+{
+	inode->i_mode = mode;
+	if (S_ISCHR(mode)) {
+		inode->i_fop = &def_chr_fops;
+		inode->i_rdev = rdev;
+	} else if (S_ISBLK(mode)) {
+		inode->i_fop = &def_blk_fops;
+		inode->i_rdev = rdev;
+	} 
+	...
+}
+
+For scsi disk, 在 drivers/scsi/sd.c 中，有
+
+static const struct block_device_operations sd_fops = {
+	.owner			= THIS_MODULE,
+	.open			= sd_open,
+
+sd_probe_async() 中会将此 sd_open赋值给 struct gendisk的 struct
+block_device_operations *fops；
+
+sd_probe --> async_schedule_domain(sd_probe_async, sdkp, &scsi_sd_probe_domain)
+多说一句， sd_probe(struct device *dev) 中的 'error = sd_format_disk_name("sd",
+index, gd->disk_name, DISK_NAME_LEN);' 会生成sda/sdb之类的disk_name,
+具体哪个字母取决于 ‘ida_get_new(&sd_index_ida, &index)' 分配的 index 值。
+
+
+如何open 设备文件？
+
+do_last
+	--> vfs_open
+		--> do_dentry_open
+
+
+
+init_special_inode():
+	会设置 def_blk_fops 作为inode->i_fop
+从而 blkdev_close() 被调用。
+
+static int blkdev_open(struct inode * inode, struct file * filp)
+{
+	struct block_device *bdev;
+	...
+/* 获得与 inode对应的 block设备. */
+	bdev = bd_acquire(inode);
+	if (bdev == NULL)
+		return -ENOMEM;
+
+	filp->f_mapping = bdev->bd_inode->i_mapping;
+/* 这里是关键，会建立 block_device 与 gendisk 之间关系. */
+	return blkdev_get(bdev, filp->f_mode, filp);
+}
+
+
+
+分区的创建：
+
+blkdev_ioctl
+	--> blkpg_ioctl(bdev, argp)； /* for 'BLKPG' ioctl command. */
+		--> add_partition	/* for 'BLKPG_ADD_PARTITION‘； */
+			--> err = blk_alloc_devt(p, &devt);
+			--> err = device_add(pdev);
+
+这里 pdev 是指向struct hd_struct *p中的 p->__dev：
+	pdev = part_to_dev(p);
+
+经过add_partition(), 对应的 hd_struct 设备 会被添加到系统中。
+
+	dname = dev_name(ddev);
+	if (isdigit(dname[strlen(dname) - 1]))
+		dev_set_name(pdev, "%sp%d", dname, partno);
+	else
+		dev_set_name(pdev, "%s%d", dname, partno);
+这里的设备name应该是 sda1/sda2/sda3之类。
+
+而此partition对应的设备文件，个人猜测是 udevd调用 mknod 来创建的。
+	mknod [OPTION]... NAME TYPE [MAJOR MINOR]
+
+
+TYPE应该是'b',对应 S_ISBLK(m) 中的 S_IFBLK.
+
+补充关于 chrdev的open处理。
+
+void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)
+{
+	inode->i_mode = mode;
+	if (S_ISCHR(mode)) {
+		inode->i_fop = &def_chr_fops;
+		inode->i_rdev = rdev;
+	}
+	...
+}
+
+于是，do_last --> vfs_open --> do_dentry_open
+
+	--> f->f_op = fops_get(inode->i_fop);
+	--> 
+	if (!open)
+		open = f->f_op->open;
+	if (open) {
+		error = open(inode, f);
+
+def_chr_fops.open会被调用，也就是 chrdev_open。
+
+在 chrdev_open()中会变更 struct file 中的 f_op->open:
+/* 先以 inode->i_rdev 为key 在 cdev_map中找寻匹配的 struct
+ * kobject，从而得到对应的struct cdev，此cdev是之前注册过的。*/
+		kobj = kobj_lookup(cdev_map, inode->i_rdev, &idx);
+		if (!kobj)
+			return -ENXIO;
+		new = container_of(kobj, struct cdev, kobj);
+
+	fops = fops_get(p->ops);
+	if (!fops)
+		goto out_cdev_put;
+/* 使用 struct cdev 中的 ops 来replace 在filp中原来的  __file->f_op */
+	replace_fops(filp, fops);
+	if (filp->f_op->open) {
+		ret = filp->f_op->open(inode, filp);
+
+
+真正的 file 读取/写入 是通过 struct address_space中的 ‘const struct
+address_space_operations *a_ops‘来进行的。
+
+例如 mm/filemap.c 中的 generic_file_read_iter。
+
+ext4_file_read_iter --> generic_file_read_iter --> do_generic_file_read -->
+page_cache_sync_readahead --> ondemand_readahead --> ra_submit -->
+__do_page_cache_readahead --> read_pages --> mapping->a_ops->readpages or
+mapping->a_ops->readpage
+
+	ext4_mpage_readpages --> submit_bio --> generic_make_request
+
+因为 struct block_device *bdev = inode->i_sb->s_bdev; 所以会关联到struct
+block_device, 从而使用到 struct request_queue *q = bdev_get_queue(bio->bi_bdev);
+
+
+对于ext4, mapping->a_ops 是诸如 ext4_da_aops等，参考 ext4_set_aops；
+对于shmem, mapping->a_ops是 shmem_get_inode --> inode->i_mapping->a_ops =
+&shmem_aops;
+
+
+
+struct gendisk 这个是描述整个 disk的，
+struct block_device 是描述 partition的。
+
+
+struct gendisk  -- struct disk_part_tbl __rcu *part_tbl --> struct hd_struct
+__rcu *part[] --关联到---> struct hd_struct 
+
+
+且 struct gendisk 中有 ‘struct block_device_operations *fops‘，
+用于定义访问具体disk的 methods。
+
+
+
+blkdev_open
+	--> blkdev_get(bdev, filp->f_mode, filp) --> __blkdev_get
+
+__blkdev_get() 会设置 struct block_device, struct hd_struct, struct gendisk
+之间的关系。
+
+因此， open是必须的。通过open才能 将 block_device 与具体的
+物理设备关联起来，从而能使用到 struct gendisk 中的 '*fops'.
+最后这点是个人猜测。暂时没有时间跟踪确认。
+
+

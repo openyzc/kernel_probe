@@ -1,0 +1,47 @@
+
+
+In copy_thread_tls(), the p->thread.sp0, p->thread.sp will be set to setup the
+kernel stack. Here, the 'p' is the pointer to struct task_struct;
+
+The kernel stack is in the area where is pointed by 'void *stack' of struct
+task_struct.
+
+In X86_64, the kernel stack is :
+
+
+  |	-------------------   p->thread.sp0			-------
+  |	|		  |
+  V	|  struct pt_regs |
+  |	|		  |
+  |	-------------------					THREAD_SIZE
+  |	|		  |
+  |	|		  | struct inactive_task_frame
+  V	------------------- 	p->thread.sp
+  |	|		  |
+  |	|		  |
+	------------------------	task_stack_page(p)	-----
+
+
+In X86_32, the kernel stack is :
+
+
+
+	------------------------------				---------
+	|TOP_OF_KERNEL_STACK_PADDING |
+	------------------------------ 	p->thread.sp0
+	|	struct pt_regs	     |
+	|			     |
+	-------------------------------  struct pt_regs *	THREAD_SIZE
+	|struct inactive_task_frame  |
+	|			     |
+	------------------------------   p->thread.sp
+	|			     |
+	|			     |
+	------------------------------	 task_stack_page(p)	---------
+
+
+
+
+these stack structures are very important to understand the switch_to() macro.
+
+

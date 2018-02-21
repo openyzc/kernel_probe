@@ -1,0 +1,119 @@
+
+
+In struct task_struct, there are these fields relevant to fd allocation.
+
+	/* Filesystem information: */
+	struct fs_struct		*fs;
+
+	/* Open file information: */
+	struct files_struct		*files;
+
+
+The task0 is initialized statically:
+
+	.comm		= INIT_TASK_COMM,				\
+	.thread		= INIT_THREAD,					\
+	.fs		= &init_fs,					\
+	.files		= &init_files,					\
+	.signal		= &init_signals,				\
+	.sighand	= &init_sighand,				\
+	.nsproxy	= &init_nsproxy,
+
+
+
+struct files_struct {
+  /*
+   * read mostly part
+   */
+	atomic_t count;
+	bool resize_in_progress;
+	wait_queue_head_t resize_wait;
+
+	struct fdtable __rcu *fdt;
+	struct fdtable fdtab;
+  /*
+   * written part on a separate cache line in SMP
+   */
+	spinlock_t file_lock ____cacheline_aligned_in_smp;
+	unsigned int next_fd;
+	unsigned long close_on_exec_init[1];
+	unsigned long open_fds_init[1];
+	unsigned long full_fds_bits_init[1];
+	struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+};
+
+struct files_struct init_files = {
+	.count		= ATOMIC_INIT(1),
+	.fdt		= &init_files.fdtab,
+	.fdtab		= {
+		.max_fds	= NR_OPEN_DEFAULT,
+		.fd		= &init_files.fd_array[0],
+		.close_on_exec	= init_files.close_on_exec_init,
+		.open_fds	= init_files.open_fds_init,
+		.full_fds_bits	= init_files.full_fds_bits_init,
+	},
+	.file_lock	= __SPIN_LOCK_UNLOCKED(init_files.file_lock),
+};
+
+So, these two fields are core:
+        struct fdtable __rcu *fdt;
+        struct fdtable fdtab;
+
+
+/* Initially, '*fdt' points to the 'fdtab' locally. The '**fd' points to the
+ * '&init_files.fd_array[0]. These are the initial value. As more file
+ * descriptors are needed, kernel will extend the 'fd_array[]'. */
+struct fdtable {
+	unsigned int max_fds;
+	struct file __rcu **fd;      /* current fd array */
+	unsigned long *close_on_exec;
+	unsigned long *open_fds;
+	unsigned long *full_fds_bits;
+	struct rcu_head rcu;
+};
+
+
+When a new task is creating, the 'struct fs_struct *fs' and 'struct files_struct
+*files' are setup by copy_fs() and copy_files() accordingly when CLONE_FS and
+CLONE_FILES are disabled.
+
+
+
+How to expand the fdtable?
+
+We had known the 'struct fdtable __rcu *fdt' points to 'struct fdtable fdtab'
+and the pointers of struct fdtable fdtab also point to the corresponding array
+fields of 'struct files_struct' locally.
+
+When a more large amount FDs are needed, we have to expand the fdtable.
+
+The new table is setup by:
+expand_files() --> expand_fdtable()
+
+When the reqested fd is '>= fdt->max_fds', the fdtable need to be expanded.
+
+For this code line, when 'start > files->next_fd', which means the allocated new
+'fd' must be bigger than files->next_fd, that is to say, it is possible that
+there is margin in [files->next_fd, start) although [start, fd] are
+full(as the new 'fd' is the smallest bit index where is ZERO).
+When start < files->next_fd, the new 'fd' must be selected from the region above
+files->next_fd as [start, files->next_fd) are full, so we need to adjust
+files->next_fd to the next idle bit index.
+	if (start <= files->next_fd)
+		files->next_fd = fd + 1;
+
+So, if we want to allocate a bigger FD index, we can call __alloc_fd() with a
+'start' who is bigger than current 'files->next_fd'.
+
+The last operations set the corresponding bits :
+
+	__set_open_fd(fd, fdt);
+	if (flags & O_CLOEXEC)
+		__set_close_on_exec(fd, fdt);
+	else
+		__clear_close_on_exec(fd, fdt);
+
+For close_on_exec bits setting, depends on the O_CLOEXEC.
+
+
+

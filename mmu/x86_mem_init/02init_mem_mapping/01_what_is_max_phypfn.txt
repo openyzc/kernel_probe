@@ -1,0 +1,19 @@
+
+The maximum physical PFN will be stored into 'max_pfn'.
+
+This variable will be set in start_arch() :
+
+
+	max_pfn = e820__end_of_ram_pfn();
+
+	/* update e820 for memory not covered by WB MTRRs */
+	mtrr_bp_init();
+	if (mtrr_trim_uncached_memory(max_pfn))
+		max_pfn = e820__end_of_ram_pfn();
+
+	max_possible_pfn = max_pfn;
+
+Of-course, if kernel support HOTPLUG memory, this max_pfn probably will be
+updated to a bigger one.
+
+

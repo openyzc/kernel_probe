@@ -1,0 +1,27 @@
+
+NAPI是一种收发包机制，在每次软中断处理过程中，连续的收发一定数量（budget)的报文，避免过多的中断切换而影响系统的性能。对于长报文的收发，在介质中传送的时间可能足够中断例程完成上一个报文的处理，可能NAPI的作用不是那么明显。对于频密的短报文，一次中断处理更多的报文，对性能提升有作用。
+
+基本的函数有几个：
+
+在poll的hook中会调用到 napi_schedule；
+
+
+对于 Broadcom的bnx2 :
+bnx2_init_napi --> netif_napi_add
+
+对于e1000 :
+e1000_probe --> neteif_napi_add
+
+对于 igb：
+igb_alloc_q_vector --> netif_napi_add
+
+对于 ixgbe：
+ixgb_probe --> netif_napi_add
+
+对于hns_enet:
+
+hns_nic_init_ring_data --> netif_napi_add
+
+
+
+

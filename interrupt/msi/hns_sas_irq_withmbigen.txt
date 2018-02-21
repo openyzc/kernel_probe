@@ -1,0 +1,385 @@
+
+
+                sas0: sas@c3000000 {
+                        compatible = "hisilicon,hip06-sas-v2";
+                        reg = <0 0xc3000000 0 0x10000>;
+                        sas-addr = [50 01 88 20 16 00 00 00];
+                        hisilicon,sas-syscon = <&dsa_subctrl>;
+                        ctrl-reset-reg = <0xa60>;
+                        ctrl-reset-sts-reg = <0x5a30>;
+                        ctrl-clock-ena-reg = <0x338>;
+                        clocks = <&refclk 0>;
+                        queue-count = <16>;
+                        phy-count = <8>;
+                        dma-coherent;
+                        interrupt-parent = <&mbigen_sas0>;
+                        interrupts = <64 4>,<65 4>,<66 4>,<67 4>,<68 4>,
+
+可以看到， interrupt-parent = <&mbigen_sas0> 和 interrupts = <64 4>, 是描述
+mbigne_sas0 这个 platform msi IRQ domain下的设备使用的中断。
+
+对于ACPI, 使用的是 Interrupts 的method来描述的。
+
+
+对于 SAS, 以上的中断处理使用这个 path（暂时只是跟踪 OF的实现）:
+
+interrupt_init_v2_hw --> platform_get_irq(pdev, i) -->
+of_irq_get(dev->dev.of_node, num) --> of_irq_parse_one(dev, index, &oirq)
+
+这里的 pdev 就是SAS controller设备， i/num 是 interrupts 中第几个 entry的 ID,
+表示取interrupts 中第i个entry进行解析。在解析的过程中会根据'interrupt-parent'
+找寻parent IRQ 设备，使用在这些parent设备中配置的
+"#address-cells"，"interrupt-map"，"interrupt-map-mask" 对下游设备的
+interrupts数据进行可能的转换，直到上溯到 "interrupt-controller"的设备。
+此时的设备认为是 最终的 parent IRQ domain,保存在
+‘oirq.np‘中待irq_create_of_mapping(struct of_phandle_args *irq_data)处理时使用。
+
+irq_create_of_mapping --> irq_create_fwspec_mapping(struct irq_fwspec *fwspec)。
+
+对于SAS， mbigen_sas0 是 interrupt-parent中配置的phandle,且mbigen_sas0 具有
+'interrupt-controller'属性，所以 在进入
+irq_create_fwspec_mapping()时，fwspec->fwnode是指向 mbigen_sas0的。而
+mbigen_sas0的IRQ domain是通过 mbigen_of_create_domain --> 	
+domain = platform_msi_create_device_domain(&child->dev, num_pins,
+						   mbigen_write_msg,
+						   &mbigen_domain_ops,
+						   mgn_chip);
+创建的， mbigen_domain_ops 是对应的 struct irq_domain_ops。
+
+因此 irq_create_fwspec_mapping()中调用到的 domain->ops hooks是来自
+mbigen_domain_ops的。
+
+1） 首先找到对应 fwnode的IRQ domain
+
+	if (fwspec->fwnode) {
+		domain = irq_find_matching_fwspec(fwspec, DOMAIN_BUS_WIRED);
+		if (!domain)
+		domain = irq_find_matching_fwspec(fwspec, DOMAIN_BUS_ANY);
+
+2） 调用domain->ops->translate()完成必要的解析和转换
+	if (irq_domain_translate(domain, fwspec, &hwirq, &type))
+		return 0;
+
+对于mbigen，最终调用的是mbigen_domain_translate().
+
+3） 查看 hwirq对应的 irq mapping是否 ok
+
+	virq = irq_find_mapping(domain, hwirq);
+	if (virq) {
+
+
+4） 如果3）中没有找到 hwirq的virq，那么将allocate
+一个idle的virq并创建对应的struct irq_data等结构
+
+	if (irq_domain_is_hierarchy(domain)) {
+		virq = irq_domain_alloc_irqs(domain, 1, NUMA_NO_NODE, fwspec);
+		if (virq <= 0)
+			return 0;
+	} 
+
+static inline int irq_domain_alloc_irqs(struct irq_domain *domain,
+			unsigned int nr_irqs, int node, void *arg)
+{
+	return __irq_domain_alloc_irqs(domain, -1, nr_irqs, node, arg, false,
+				       NULL);
+}
+
+因此， __irq_domain_alloc_irqs()调用是传入的 'realloc' 为 FALSE，'irq_base'
+为-1； 从 __irq_domain_alloc_irqs()的实现来看， 只有在realloc为TRUE且irq_base >=
+0时，才可能直接使用传入参数'irq_base'作为virq,不进行allocation。
+否则会进行virq的allocation：
+	if (realloc && irq_base >= 0) {
+		virq = irq_base;
+	} else {
+		virq = irq_domain_alloc_descs(irq_base, nr_irqs, 0, node,
+					      affinity);
+
+这里需要说明一下，在 'irq_base' >= 0的输入下，irq_domain_alloc_descs -->
+__irq_alloc_descs会强制要求分配指定的 irq_base，否则-EEXIST；
+在 irq_base < 0的输入下，优先从 hwirq %
+nr_irqs开始选择，失败的话从1开始选择idle的virq.
+
+在 irq_domain_alloc_descs()中，除了allocate一个idle的irq外，还会调用
+alloc_descs(start, cnt, node, affinity, owner)
+来分配并初始化对应所分配的virq的struct irq_desc。这些
+irq_desc的节点会link到一个radix tree, static RADIX_TREE(irq_desc_tree,
+GFP_KERNEL), 以 virq作为key alue。
+请注意，在此 过程中， desc->irq_data.irq 会被设置为对应的 virq。
+
+5） 构建 更上游各级 parent 的struct irq_data
+
+	if (irq_domain_alloc_irq_data(domain, virq, nr_irqs)) {
+
+这里需要特别关注一点， 上游各级parent domain的 struct irq_data不象mbigen
+对应的domain中的struct irq_data一样是作为 struct irq_desc 中的
+irq_data成员存在的。 这些上游 parent的struct
+irq_data都是动态独立分配的，只是在irq_domain_alloc_irq_data() -->
+irq_domain_insert_irq_data(parent, irq_data) 通过 child struct
+irq_data的parent_data指向上一级parent的struct irq_data:
+
+		child->parent_data = irq_data;
+/*parent的 struct irq_data的irq维持 分配给child domain的 virq。只是domain
+ * 指向自己。
+ */
+		irq_data->irq = child->irq;
+		irq_data->common = child->common;
+		irq_data->domain = domain;
+
+由此可见， 分配的 virq是全局的，对应一个 struct irq_desc。只是在此 底下的 irq
+domain可能还有多个层次的 domain，似乎不会再分配不同的 domain依赖的virq了。
+
+不过还是有点奇怪，virq分配时最大可用irq是由系统变量
+nr_irqs限制的
+而在ARM64中此nr_irqs似乎不大，不能超过 IRQ_BITMAP_BITS。
+#ifdef CONFIG_SPARSE_IRQ
+# define IRQ_BITMAP_BITS	(NR_IRQS + 8196)
+#else
+# define IRQ_BITMAP_BITS	NR_IRQS
+#endif
+
+怎么支持那么大的 LPI？？
+
+
+6） 调用 irq_domain_ops中的 alloc钩子
+ret = irq_domain_alloc_irqs_recursive(domain, virq, nr_irqs, arg);
+对于mbigen是mbigen_irq_domain_alloc；
+
+/* 此函数应该比较关键。因此将在下面独立分析。 */
+	err = platform_msi_domain_alloc(domain, virq, nr_irqs);
+	if (err)
+		return err;
+/* 设置各个 virq对应的 struct irq_data中的某些fields:
+ *	irq_data->hwirq = hwirq;
+ *	irq_data->chip = chip ? chip : &no_irq_chip;
+ *	irq_data->chip_data = chip_data;
+ */
+	mgn_chip = platform_msi_get_host_data(domain);
+
+	for (i = 0; i < nr_irqs; i++)
+		irq_domain_set_hwirq_and_chip(domain, virq + i, hwirq + i,
+				      &mbigen_irq_chip, mgn_chip->base);
+
+
+
+int platform_msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+			      unsigned int nr_irqs)
+{
+	struct platform_msi_priv_data *data = domain->host_data;
+	int err;
+/* 构建 mbigen 设备的 virq对应的 dev_to_msi_list(dev) 链. 其中节点是 struct
+ * msi_desc. 对于 MSI来说，每个 virq对应一个 msi_desc节点。 */
+	err = platform_msi_alloc_descs_with_irq(data->dev, virq, nr_irqs, data);
+	if (err)
+		return err;
+/* 上溯到 parent domain进行 struct msi_domain_ops 中 set_desc(arg, desc)的处理。
+ * 对于mbigen，parent domain是 its_pmsi_init_one 中创建的。struct
+ * msi_domain_info下的 ops->set_desc是指向 platform_msi_set_desc. */
+	err = msi_domain_populate_irqs(domain->parent, data->dev,
+				       virq, nr_irqs, &data->arg);
+/* 失败后的回退处理 ... */
+	if (err)
+		platform_msi_domain_free(domain, virq, nr_irqs);
+
+	return err;
+}
+
+
+int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+			     int virq, int nvec, msi_alloc_info_t *arg)
+{
+	struct msi_domain_info *info = domain->host_data;
+	struct msi_domain_ops *ops = info->ops;
+	struct msi_desc *desc;
+
+	for_each_msi_entry(desc, dev) {
+		/* Don't even try the multi-MSI brain damage. */
+		if (WARN_ON(!desc->irq || desc->nvec_used != 1)) {
+			ret = -EINVAL;
+			break;
+		}
+
+		if (!(desc->irq >= virq && desc->irq < (virq + nvec)))
+			continue;
+/* 调用 platform_msi_set_desc. 主要 是设置 msi_alloc_info_t 中与 struct
+ * msi_desc的关系。这里有点奇怪，因为 arg 是来自 struct
+ * platform_msi_priv_data中的，该结构是 domain级别的。而 struct msi_desc是
+ * virq对应的。 也就是一个 arg可能对应有不同的 desc来调用 ops->set_desc,
+ * 修改arg中的 desc 指向 传入的 'desc' 好像没有意义。毕竟下一个 struct
+ * msi_desc又会更新 arg中的fields. 除非 后面的
+ * irq_domain_alloc_irqs_recursive的处理会使用到 arg中相应的 fields. */
+		ops->set_desc(arg, desc);
+/* 继续upstream 到 parent domain 去，调用 ops->alloc. 这里的 'domain'是 platform
+ * msi 的domain。请注意，这里的 arg是来自 struct platform_msi_priv_data 中的
+ * msi_alloc_info_t	arg； 根据 mbigen的domain层次关系，
+ * 这里irq_domain_alloc_irqs_recursive()会调用到 platform_msi_create_irq_domain
+ * --> msi_create_irq_domain 中挂入的 msi_domain_ops 中的 msi_domain_alloc。
+ * 而此domain中的 host_data是指向 its_pmsi_domain_info，对应的 msi_domain_ops
+ * 是指向 its_pmsi_ops。
+ * its_init_domain 中创建的 IRQ domain，其struct
+ * irq_domain_ops是its_domain_ops，因此 ops是指向
+ * its_irq_domain_alloc。猜测这个hook是 PCI MSI设备alloc irq时会被调用。*/
+		ret = irq_domain_alloc_irqs_recursive(domain, virq, 1, arg);
+		if (ret)
+			break;
+/* 将 struct msi_desc 关联到 virq 对应的 struct irq_desc 中。
+ * desc->irq_common_data.msi_desc = entry;
+ */
+		irq_set_msi_desc_off(virq, 0, desc);
+	}
+...
+}
+
+6.1） set_desc
+
+static void platform_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+{
+	arg->desc = desc;
+	arg->hwirq = platform_msi_calc_hwirq(desc);
+}
+
+typedef struct msi_alloc_info {
+	struct msi_desc			*desc;
+	irq_hw_number_t			hwirq;
+	union {
+		unsigned long		ul;
+		void			*ptr;
+	} scratchpad[NUM_MSI_ALLOC_SCRATCHPAD_REGS];
+} msi_alloc_info_t;
+
+经过 platform_msi_calc_hwirq(desc)后， platform msi domain的
+msi_alloc_info_t中的hwirq 会在高 21以上保存devid， 其它低位bits是msi ID.
+该msi ID是 platform_msi_alloc_descs_with_irq中对每个 msi_desc生成的。
+
+6.2) 通过 irq_domain_alloc_irqs_recursive 循环调用各个domain的 ops->alloc
+
+platform msi domain的 alloc是：
+
+static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+			    unsigned int nr_irqs, void *arg)
+{
+/* host_data是指向 its_pmsi_domain_info，对应的 msi_domain_ops
+ * 是指向 its_pmsi_ops。 */
+	struct msi_domain_info *info = domain->host_data;
+	struct msi_domain_ops *ops = info->ops;
+/* 这里应该是 msi_domain_ops_get_hwirq, 直接返回 msi_alloc_info_t 中的 hwirq.
+ * 请注意，这里的 hwirq是 platform msi domain的，不是mbigen domain的了。*/
+	irq_hw_number_t hwirq = ops->get_hwirq(info, arg);
+
+/* 检查hwirq是否已经在当前 domain中注册过/mapped过了. */
+	if (irq_find_mapping(domain, hwirq) > 0)
+		return -EEXIST;
+/* 继续 upstream到 parent domain去调用 ops->alloc... 应该是
+ * its_irq_domain_alloc(). 注意的是，这里传给 ops->alloc的arg是来自 platform
+ * msi中的 msi_alloc_info_t.  */
+	if (domain->parent) {
+		ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
+		if (ret < 0)
+			return ret;
+	}
+
+
+	for (i = 0; i < nr_irqs; i++) {
+/* 这里的 msi_init应该是 platform_msi_init。实际是
+ * irq_domain_set_hwirq_and_chip(domain, virq, hwirq,
+ * info->chip, info->chip_data)。info应该是 its_pmsi_domain_info，因此platform
+ * msi domain对应的 struct irq_data中的chip是指向 its_pmsi_irq_chip。
+ */
+		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
+
+
+上溯调用 各个 domain 的alloc:
+
+6.2.1) its_irq_domain_alloc
+
+这个是 GICv3 ITS domain的 alloc钩子。
+
+static int its_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
+				unsigned int nr_irqs, void *args)
+{
+	msi_alloc_info_t *info = args;
+	struct its_device *its_dev = info->scratchpad[0].ptr;
+	irq_hw_number_t hwirq;
+	int err;
+	int i;
+
+	for (i = 0; i < nr_irqs; i++) {
+/* 从 its_dev 对应的 event_map.lpi_map 中选择idle 的 LPI. 这里的 its_dev
+ * 包含了一段连续的 LPI space，每个idle LPI对应 event_map.lpi_map中一个bit. 而
+ * event_map.lpi_base是该段 LPI space的起始 LPI ID。 因此,
+ * its_alloc_device_irq实际是从 its_dev 中分配了一个可用的 LPI, 在 hwirq中返回。 */
+		err = its_alloc_device_irq(its_dev, &hwirq);
+		if (err)
+			return err;
+/* 使用新生成的 hwirq, 继续调用parent domain的 GIC 的
+ * ops->alloc。只是这里会构建一个 struct irq_fwspec fwspec 作为 alloc的'void
+ * *arg' 参数。 gic_irq_domain_alloc 会被调用。 */
+		err = its_irq_gic_domain_alloc(domain, virq + i, hwirq);
+		if (err)
+			return err;
+/* 初始化 its msi domain对应的 struct irq_data中的 chip等关键fields。
+ * 其中chip是指向 its_irq_chip... */
+		irq_domain_set_hwirq_and_chip(domain, virq + i,
+					      hwirq, &its_irq_chip, its_dev);
+		pr_debug("ID:%d pID:%d vID:%d\n",
+			 (int)(hwirq - its_dev->event_map.lpi_base),
+			 (int) hwirq, virq + i);
+	}
+
+	return 0;
+}
+
+6.2.2） gic_irq_domain_alloc
+这里传入的 'void *arg' 是指向 its_irq_domain_alloc -->
+its_irq_gic_domain_alloc中初始化的 struct irq_fwspec 结构变量。
+
+static int gic_irq_domain_alloc(struct irq_domain *domain, unsigned int virq,
+				unsigned int nr_irqs, void *arg)
+{
+	int i, ret;
+	irq_hw_number_t hwirq;
+	unsigned int type = IRQ_TYPE_NONE;
+	struct irq_fwspec *fwspec = arg;
+/* 实际上此函数只是解析 struct irq_fwspec中的数据，没有translate. */
+	ret = gic_irq_domain_translate(domain, fwspec, &hwirq, &type);
+	if (ret)
+		return ret;
+/* 完成 gic 中对应 virq的 struct irq_data, struct irq_desc
+ * 中某些关键fields的设置。参见 irq_domain_set_info。 */
+	for (i = 0; i < nr_irqs; i++)
+		gic_irq_domain_map(domain, virq + i, hwirq + i);
+
+	return 0;
+}
+
+
+
+
+6.2.3 ） platform_msi_init
+
+msi_domain_alloc的最后会调用 ops->msi_init， 从而进入 platform_msi_init.
+
+
+总结来说，
+
+mbigen domain ：
+	hwirq 来自 DTS 的interrupts 配置；
+	struct irq_data 中的chip 是 mbigen_irq_chip；
+	这里的 domain是通过 platform_msi.c 中的接口
+	platform_msi_create_device_domain创建的。
+
+its domain:
+	hwirq是从info->scratchpad[0].ptr 指向的 struct its_device的 LPI
+	space中选择的idle LPI。
+	struct irq_data 中的 chip是 its_irq_chip，chip_data是 struct
+	its_device；
+	
+gic-v3 domain：
+	hwirq与 its domain一致；
+	struct irq_data中的chip是 gic_chip， chip_data是 struct
+	irq_domain中的host_data，指向 gic_data；
+
+
+irq_create_fwspec_mapping()完成virq以及相关 irq结构的初始化，包括
+ops->alloc的调用。
+
+

@@ -1,0 +1,82 @@
+You can also refer to this LWN article:
+
+https://old.lwn.net/Articles/688130/
+
+
+We can take the pagecache radix tree as an example to analyse the radix tree
+mechanism.
+
+ondemand_readahead
+	--> __do_page_cache_readahead
+		/* allocate pages requested by this operation. */
+		--> __page_cache_alloc(gfp_mask)
+		/* start the pagecache building and necessary readahead. */
+		--> read_pages
+			/* setup the pagecache in radix tree of 'struct file'*/
+			--> add_to_page_cache_lru
+				--> __add_to_page_cache_locked
+					--> page_cache_tree_insert
+						--> __radix_tree_create
+						--> __radix_tree_replace
+			/* trigger readahead... */
+			--> mapping->a_ops->readpage(filp, page)
+
+
+Actually, this flow is not so suitble for multiple order radixtree, as this
+processing inserts radix-tree node per-page :
+
+	error = __radix_tree_create(&mapping->page_tree, page->index, 0,
+				    &node, &slot);
+
+
+But we can pay more attentions on these functions:
+
+static unsigned int radix_tree_descend(const struct radix_tree_node *parent,
+			struct radix_tree_node **nodep, unsigned long index)
+{
+	unsigned int offset = (index >> parent->shift) & RADIX_TREE_MAP_MASK;
+	void __rcu **entry = rcu_dereference_raw(parent->slots[offset]);
+
+#ifdef CONFIG_RADIX_TREE_MULTIORDER
+	if (radix_tree_is_internal_node(entry)) {
+		if (is_sibling_entry(parent, entry)) {
+			void __rcu **sibentry;
+			sibentry = (void __rcu **) entry_to_node(entry);
+			offset = get_slot_offset(parent, sibentry);
+			entry = rcu_dereference_raw(*sibentry);
+		}
+	}
+#endif
+
+	*nodep = (void *)entry;
+	return offset;
+}
+
+
+and this call flow:
+
+__radix_tree_insert
+	--> insert_entries
+
+
+The insert_entries() will support the multiple order node insertion.
+
+1) The base multiple order slot stores the real page address;
+2) The sibling slots of multiple order store a pointer to the base slot:
+
+That is what was done in insert_entries():
+
+	if (n > 1) {
+		offset = offset & ~(n - 1);
+		slot = &node->slots[offset];
+	}
+	child = node_to_entry(slot);
+
+And this rule is the rationale of is_sibling_entry(node, old) too.
+
+
+
+BTW, __radix_tree_create() will return the node and slot where should be
+inserted/replaced. 'node' is the 'struct radix_tree_root' where 'slot' is under.
+
+

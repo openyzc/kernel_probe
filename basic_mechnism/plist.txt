@@ -1,0 +1,67 @@
+
+
+In lib/plist.c, a new list is defined.
+
+此类list会基于一个priority值来对节点进行从低到高的排序。
+
+一般以下面的结构为header节点：
+
+此结构中的 'struct list_head node_list;' 会linked 到list中 作为 起始header.
+struct plist_head {
+	struct list_head node_list;
+};
+
+在此plist中的节点是采用以下结构定义的：
+
+
+struct plist_node {
+	int			prio;
+	struct list_head	prio_list;
+	struct list_head	node_list;
+};
+
+此结构中的 'struct list_head node_list;' 用于linked到 header为起始的链表中。
+
+以swapfile为例，定义了这么一个 plist：
+	struct plist_head swap_active_head;
+
+有点意思的是 'struct list_head prio_list;' 这个field。通过此
+field将构造一个新的list, 其中的节点是 struct plist_head 对应的
+plist中的某些节点。 实际上是 往plist中 添加第一个具有不同 prio的 'struct
+plist_node'节点时会添加到 prio_list构成的list中。具体可以参考 plist_add.
+
+需要注意的几点：
+1） plist的第一个struct plist_node节点，只能通过 'head->node_list.next'
+取得，参见 plist_first；
+2） 'prio_list'构成的 list，在当前plist只有一种
+priority的节点时，是不存在的。也就是只有多余一种
+priorities的节点是才会生成。该list也是排序的。
+3） plist中属于同一priority的节点在plist中是挨着的。这是排序后的结果。
+4） 如果 node->prio_list 已经挂入到 list中，也就是
+!list_empty(&node->prio_list)， 那么意味着此node是 该 priority的首个
+node。如果node->node_list.next所指向的 struct plist_node
+不在'prio_list'构成的list中，那此'node->node_list.next'必然是同一个priority的其它节点。
+这也是plist_del中以下处理的原因：
+
+	if (!list_empty(&node->prio_list)) {
+		if (node->node_list.next != &head->node_list) {
+			struct plist_node *next;
+
+			next = list_entry(node->node_list.next,
+					struct plist_node, node_list);
+
+			/* add the next plist_node into prio_list */
+			if (list_empty(&next->prio_list))
+				list_add(&next->prio_list, &node->prio_list);
+		}
+		list_del_init(&node->prio_list);
+	}
+
+这些lines 是使用同一个priority下的后续节点来替代
+'prio_list'构成的list中的被删除首节点，而形成新的 首节点。
+			if (list_empty(&next->prio_list))
+				list_add(&next->prio_list, &node->prio_list);
+
+
+
+

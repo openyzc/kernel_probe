@@ -1,0 +1,135 @@
+
+
+In mm/mprotect.c :
+
+SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+		unsigned long, prot)
+{
+	return do_mprotect_pkey(start, len, prot, -1);
+}
+
+
+The core path flow for mprotect() is:
+
+do_mprotect_pkey()
+	--> mprotect_fixup
+		--> vma_merge
+		--> split_vma
+		--> change_protection
+
+
+1. As for PROT_GROWSDOWN/VM_GROWSUP
+
+These two flags are exclusive, that is to say, can't request both.
+
+When PROT_GROWSDOWN is requested, the input 'start' will be set as :
+		if (vma->vm_start >= end)
+			goto out;
+		start = vma->vm_start;
+
+Which means if [start, end) is overlapping with the found 'vma', we will set
+'start' as vma->vm_start, no matter which is bigger among 'start' and
+'vma->vm_start'. If start > vma->vm_start, then an expanding [vma->vm_start,
+end) will be set with the new protection flags. If start < vma->vm_start, then
+the requested [start, end) will be shrunk.
+
+
+When PROT_GROWSUP is requested, the input 'end' will be set as:
+		if (unlikely(grows & PROT_GROWSUP)) {
+			end = vma->vm_end;
+
+So the upper limit will be updated to match 'vma->vm_end'. It probably is
+expanded or shrunk.
+
+BTW, this code seems to force the start > 'vma->vm_start' when !PROT_GROWSDOWN :
+
+	if (unlikely(grows & PROT_GROWSDOWN)) {
+		if (vma->vm_start >= end)
+			goto out;
+		start = vma->vm_start;
+		error = -EINVAL;
+		if (!(vma->vm_flags & VM_GROWSDOWN))
+			goto out;
+	} else {
+		if (vma->vm_start > start)
+			goto out;
+/* So, When !PROT_GROWSDOWN, the caller must input a 'start' which is not less
+ * than 'vma->vm_start'. */
+
+/* And if PROT_GROWUP is configured, then 'end' will be limited as: */
+
+		if (unlikely(grows & PROT_GROWSUP)) {
+			end = vma->vm_end;
+			error = -EINVAL;
+			if (!(vma->vm_flags & VM_GROWSUP))
+				goto out;
+		}
+
+
+Then kernel start the scan on [start, end) to modify the RWX attributes in PTEs.
+
+1) convert the input 'prot' into 'newflags' of VM flags
+
+The lowest 4 bits of newflags is from 'prot' and must be consistent with the
+VM_MAY% of the original 'vma->vm_flags'. Otherwise, will return 'error =
+-EACCES':
+
+	newflags = calc_vm_prot_bits(prot, new_vma_pkey);
+	newflags |= (vma->vm_flags & ~mask_off_old_flag);
+
+	/* newflags >> 4 shift VM_MAY% in place of VM_% */
+	if ((newflags & ~(newflags >> 4)) & (VM_READ | VM_WRITE | VM_EXEC)) {
+		error = -EACCES;
+		goto out;
+	}
+
+2) call mprotect_fixup() to update the VMA's prot per-vma which is covered by
+[start, end)
+
+/* set tmp = min(end, vma->vm_end), then use this 'tmp' as the VMA end to
+ * mprotect_fixup(). */
+		tmp = vma->vm_end;
+		if (tmp > end)
+			tmp = end;
+		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags);
+		if (error)
+			goto out;
+		nstart = tmp;
+/* After mprotect_fixup(), the 'prev' is probably updated to point to the VMA
+ * which just had been updated the RWX and probably been expanded the 'end'. So
+ * the prev->vm_end is probably > nstart. */
+		if (nstart < prev->vm_end)
+			nstart = prev->vm_end;
+		if (nstart >= end)
+			goto out;
+/* The next VMA must be adjacent with the 'nstart'. Which means in the [start,
+ * end) there are no idle VMAs. */
+		vma = prev->vm_next;
+		if (!vma || vma->vm_start != nstart) {
+			error = -ENOMEM;
+			goto out;
+		}
+
+
+As for mprotect_fixup():
+
+1) try to vma_merge()
+
+Probably the new VMA can satisfy the merge condition, should kernel try to merge
+as the first step.
+
+Call split_vma() to separate the non-matchable VMAs.
+
+2) update the vma->vm_page_prot
+
+If at this moment, there are no valid PTEs for the [start, end), only update
+vma->vm_page_prot in change_protection(). The PTEs modification will be
+performed by handle_mm_fault --> __handle_mm_fault --> handle_pte_fault
+
+	vma_set_page_prot(vma);
+
+	change_protection(vma, start, end, vma->vm_page_prot,
+			  dirty_accountable, 0);
+
+
+

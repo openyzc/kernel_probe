@@ -1,0 +1,78 @@
+
+We will depict the copy_strings() to copy the arguments to user-space stack
+here.
+
+
+tatic int copy_strings(int argc, struct user_arg_ptr argv,
+			struct linux_binprm *bprm)
+{
+	...
+
+	while (argc-- > 0) {
+		const char __user *str;
+## We found that traverse 'argc' elements of the 'argv' array.
+
+		str = get_user_arg_ptr(argv, argc);
+		if (IS_ERR(str))
+			goto out;
+
+		len = strnlen_user(str, MAX_ARG_STRLEN);
+
+## Calculate the length of argument string of argv[argc]
+	...
+		pos = bprm->p;
+		str += len;
+		bprm->p -= len;
+## The string value will be stored in user-space stack from low addr to high
+## addr.
+
+## Start the copy for argv[argc]. It probably will be divided into several
+## segment copy depended on the 'len';
+		while (len > 0) {
+			int offset, bytes_to_copy;
+	...
+
+## As the stack is downside. The 'offset' should be 'offset -= bytes_to_copy';
+			offset = pos % PAGE_SIZE;
+			if (offset == 0)
+				offset = PAGE_SIZE;
+
+			bytes_to_copy = offset;
+			if (bytes_to_copy > len)
+				bytes_to_copy = len;
+
+			offset -= bytes_to_copy;
+			pos -= bytes_to_copy;
+			str -= bytes_to_copy;
+			len -= bytes_to_copy;
+## The user-space stack is only the virtual address. Probably haven't setup the
+## mapping with the physical page. So, 'page = get_arg_page(bprm, pos, 1)' will
+## extend the user-space stack to cover the current 'pos' which is the low start
+## address for the copy and allocate the physical page for the mapping by
+## 'get_arg_page(bprm, pos, 1)';
+## The copy of one argument string will probably perform several times. For
+## example, when 'pos % PAGE_SIZE' > len, then whole argument string will be
+## copied to the range of [kaddr + offset, kaddr + offset + len). For the next
+## argument string whose length is still less than 'pos % PAGE_SIZE', then it
+## will be copied to the same page. That is why 'kpos != (pos & PAGE_MASK)' do
+## when the 'pos' is in the same page as 'kpos'.
+			if (!kmapped_page || kpos != (pos & PAGE_MASK)) {
+				struct page *page;
+
+				page = get_arg_page(bprm, pos, 1);
+		...
+			if (copy_from_user(kaddr+offset, str, bytes_to_copy)) {
+				ret = -EFAULT;
+				goto out;
+			}
+
+
+In summary, all the argument strings are copied to stack in order.
+
+After the copy_strings(), bprm->p points to the stack top which is lowest
+address.
+
+
+
+
+

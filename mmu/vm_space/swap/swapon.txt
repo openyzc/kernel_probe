@@ -1,0 +1,53 @@
+In mm/swapfile.c :
+
+SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+
+
+each calling on swapon() will setup a 'struct swap_info_struct' node.
+
+/* Here, a struct swap_info_struct will be allocated. p->type will be decided
+ * here. */
+	p = alloc_swap_info();
+
+1. open the device file where the swap file is resides
+
+
+	swap_file = file_open_name(name, O_RDWR|O_LARGEFILE, 0);
+	if (IS_ERR(swap_file)) {
+		error = PTR_ERR(swap_file);
+		swap_file = NULL;
+		goto bad_swap;
+	}
+
+	p->swap_file = swap_file;
+	mapping = swap_file->f_mapping;
+
+2. Initialise some fields of 'struct swap_info_struct' relevant to block device
+	error = claim_swapfile(p, inode);
+
+3. read the first swap page where the management data of swap is located
+
+	page = read_mapping_page(mapping, 0, swap_file);
+	if (IS_ERR(page)) {
+		error = PTR_ERR(page);
+		goto bad_swap;
+	}
+	swap_header = kmap(page);
+
+	maxpages = read_swap_header(p, swap_header, inode);
+
+/* The 'swap_map' is the memory where the swap page slots mapping counts are
+ * located. */
+	swap_map = vzalloc(maxpages);
+	if (!swap_map) {
+		error = -ENOMEM;
+		goto bad_swap;
+	}
+
+
+4. create the swap specific address space
+
+	error = init_swap_address_space(p->type, maxpages);
+
+/* link the new 'struct swap_info_struct' into the swap_avail_head */
+	enable_swap_info(p, prio, swap_map, cluster_info, frontswap_map);

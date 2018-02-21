@@ -1,0 +1,210 @@
+
+static int
+create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
+		unsigned long load_addr, unsigned long interp_load_addr)
+
+## 'load_addr' is the offset between the mapped base address for binary file and
+## the internal 'elf_ppnt->p_offset' of binary file;
+## 'interp_load_addr' is for the 'interpreter' file. It is the offset between
+## the mapped base address for 'interpreter' and the internal
+## 'elf_ppnt->p_vaddr' of 'interpreter';
+
+
+Now, let's start the issue.
+
+
+static int
+create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
+		unsigned long load_addr, unsigned long interp_load_addr)
+{
+	unsigned long p = bprm->p;
+	...
+	p = arch_align_stack(p);
+
+## align the stack pointer to the right boundary; It is possibly an idle slice;
+	...
+	if (k_platform) {
+		size_t len = strlen(k_platform) + 1;
+
+		u_platform = (elf_addr_t __user *)STACK_ALLOC(p, len);
+		if (__copy_to_user(u_platform, k_platform, len))
+			return -EFAULT;
+	}
+
+	if (k_base_platform) {
+		size_t len = strlen(k_base_platform) + 1;
+
+		u_base_platform = (elf_addr_t __user *)STACK_ALLOC(p, len);
+		if (__copy_to_user(u_base_platform, k_base_platform, len))
+			return -EFAULT;
+	}
+## some strings about platform info;
+
+	get_random_bytes(k_rand_bytes, sizeof(k_rand_bytes));
+	u_rand_bytes = (elf_addr_t __user *)
+		       STACK_ALLOC(p, sizeof(k_rand_bytes));
+	if (__copy_to_user(u_rand_bytes, k_rand_bytes, sizeof(k_rand_bytes)))
+		return -EFAULT;
+## An randomized seed value will be created and stored at the stack;
+	...
+	NEW_AUX_ENT(AT_PHDR, load_addr + exec->e_phoff);
+	NEW_AUX_ENT(AT_PHENT, sizeof(struct elf_phdr));
+	NEW_AUX_ENT(AT_PHNUM, exec->e_phnum);
+	NEW_AUX_ENT(AT_BASE, interp_load_addr);
+	...
+## initialize 'current->mm->saved_auxv[]' with NEW_AUX_ENT();
+
+	...
+	memset(&elf_info[ei_index], 0,
+	       sizeof current->mm->saved_auxv - ei_index * sizeof elf_info[0]);
+
+	/* And advance past the AT_NULL entry.  */
+	ei_index += 2;
+## Here, ei_index is the element counter of 'elf_info[]' where valid data is
+## stored. Two extra elements is reserved for NULL entry;
+
+	sp = STACK_ADD(p, ei_index);
+
+	items = (argc + 1) + (envc + 1) + 1;
+	bprm->p = STACK_ROUND(sp, items);
+
+## Adjust the stack pointer to pass the ELF_INFO data, arg data, env data.
+## For GROWSUP, bprm->p points to the HIGH ADDRESS, for non-GROWSUP, bprm->p
+## points to the LOW ADDR;
+
+#ifdef CONFIG_STACK_GROWSUP
+	sp = (elf_addr_t __user *)bprm->p - items - ei_index;
+	bprm->exec = (unsigned long)sp; /* XXX: PARISC HACK */
+#else
+	sp = (elf_addr_t __user *)bprm->p;
+#endif
+
+## Because the memory copy below apply the LOW address as the destinaton, we
+## need to make 'sp' point to the LOW ADDR. But for PARISC GROWSUP, it is
+## strange to modify 'bprm->exec'. Anyway, I don't care PARISC now.
+
+	vma = find_extend_vma(current->mm, bprm->p);
+	if (!vma)
+		return -EFAULT;
+
+## As we need more space to stored the ELF_INFO, ARGs, ENVs, here try to extend
+## stack VMA;
+
+	if (__put_user(argc, sp++))
+		return -EFAULT;
+
+## save the counter of arguments into stack. That is why 'items = (argc + 1) +
+## (envc + 1) + 1;' need the last '1'. But I don't know why the 'envc' isn't
+## saved in stack too.
+
+## Before start the arg, env data handling, it is better to recall where those
+## data were saved. In do_execveat_common(), those data were stored into the TOP
+## of stack. And in setup_arg_pages(), 'current->mm->arg_start' will point to
+## the address where the last parameter is in stack;
+
+	argv = sp;
+	envp = argv + argc + 1;
+
+	/* Populate argv and envp */
+	p = current->mm->arg_end = current->mm->arg_start;
+	while (argc-- > 0) {
+		size_t len;
+		if (__put_user((elf_addr_t)p, argv++))
+			return -EFAULT;
+		len = strnlen_user((void __user *)p, MAX_ARG_STRLEN);
+		if (!len || len > MAX_ARG_STRLEN)
+			return -EINVAL;
+		p += len;
+	}
+	if (__put_user(0, argv))
+		return -EFAULT;
+
+## 'sp' is the destination in stack, 'p' is the LOWest pointer to the last ENV.
+## So, the above processes will save all the argument pointers to the stack.
+## A NULL pointer will be appended at the end.
+
+	current->mm->arg_end = current->mm->env_start = p;
+## update the 'current->mm->arg_end' which is adjacent to ENV pointer area.
+
+## similar processes for ENV
+	...
+
+
+## The below will copy all the valid 'elf_info' data into stack.
+## after 'sp = (elf_addr_t __user *)envp + 1', the 'sp' points to the LOW
+## address of the reserved area before.
+
+	sp = (elf_addr_t __user *)envp + 1;
+	if (copy_to_user(sp, elf_info, ei_index * sizeof(elf_addr_t)))
+		return -EFAULT;
+
+
+
+For non-GROWSUP,
+
+STACK_TOP	-----------------
+		| random offset	|
+		|		|
+		-----------------  <-- vma->vm_end
+		| file name	|
+		-----------------  <-- current->mm->arg_start
+		| argv para	|
+		----------------- <-current->mm->arg_end/current->mm->env_start
+		| env para	|
+		----------------- <-- current->mm->env_end
+		|align offset(*)| <---- possible, refer to arch_align_stack()
+		------------------
+		| platform info |
+		-----------------
+		| random seed	|
+		----------------- <-- align to 16, refer to STACK_ROUOND()
+		| align off(*)	|  <-- possible
+		-----------------
+		| ELF_INFO data	|
+		|		|
+		-----------------
+		|	argc	|
+		----------------- <--
+		| arg pointer[] |
+		-----------------
+		| NULL pointer	|
+		----------------- <--
+		| env pointer[]	|
+		-----------------
+		| NULL pointer	|
+		----------------- <-- bprm->p
+		| idle		|
+		-----------------------------------------------
+
+For GROWSUP statck,
+
+
+STACK_TOP	-----------------	--------------------------------
+		| idle		|
+		----------------- <-- bprm->p
+		| NULL pointer	|
+		-----------------
+		| env pointer[]	|
+		-----------------
+		| NULL pointer	|
+		-----------------
+		| arg pointer[]	|
+		-----------------
+		| argc		|
+		-----------------
+		| ELF_INFO data	| min(STACK_SIZE_MAX, rlimit_max(RLIMIT_STACK))
+		-----------------
+		| ...		|
+		-----------------
+		| env para	|
+		-----------------
+		| argv para	|
+		-----------------
+		| filename	|
+		-----------------
+		| random offset	|
+		-----------------  --------------------------------------
+
+
+
+

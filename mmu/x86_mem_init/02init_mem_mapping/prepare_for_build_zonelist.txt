@@ -1,0 +1,33 @@
+
+
+To describe what are done in build_zonelists(pg_data_t *pgdat), I think some
+technical preparations are needed.
+
+
+1. nodemask_t node_states[NR_NODE_STATES]
+
+This array is defined in mm/page_alloc.c;
+
+The index of array is from enum node_states;
+
+each element is 'nodemask_t' to represent the nodes have one attribute of enum
+node_states, such as N_MEMORY;
+
+
+early_calculate_totalpages() will setup the node_states[N_MEMORY] with
+node_set_state(nid, N_MEMORY) when there are available pages in 'nid' in
+'memblock';
+
+2. node_to_cpumask_map[node]
+
+The macro of cpumask_of_node(node) can get 'node_to_cpumask_map[node]';
+
+node_to_cpumask_map[node] should be setup by numa_add_cpu(int cpu).
+
+But it seems 'numa_add_cpu()' only called by identify_cpu() when some CPU is
+bootup. It is later than build_zonelists(), so, I wonder for early bootup, this
+node_to_cpumask_map[] will not make sense.
+
+
+
+

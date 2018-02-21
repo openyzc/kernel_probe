@@ -1,0 +1,33 @@
+
+SYSCALL_DEFINE0(fork)
+{
+#ifdef CONFIG_MMU
+	return _do_fork(SIGCHLD, 0, 0, NULL, NULL, 0);
+#else
+...
+}
+
+SYSCALL_DEFINE0(vfork)
+{
+	return _do_fork(CLONE_VFORK | CLONE_VM | SIGCHLD, 0,
+			0, NULL, NULL, 0);
+}
+
+SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,
+		 int __user *, parent_tidptr,
+		 int __user *, child_tidptr,
+		 unsigned long, tls)
+{
+	return _do_fork(clone_flags, newsp, 0, parent_tidptr, child_tidptr,
+tls);
+}
+
+So, the differences are:
+1) only clone() probably apply 'tls' parameter;
+2) only clone() has the input 'clone_flags' parameter; the others are using
+fixable 'flags';
+3) clone() has the new stack parameter;
+
+As for how to support these difference in kernel, we will describe below.
+
+

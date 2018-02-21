@@ -1,0 +1,54 @@
+
+
+In mm/swapfile.c,
+
+SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+
+
+1. struct swap_info_struct
+
+分配并部分初始化此结构。
+
+	p = alloc_swap_info();
+
+此alloc_swap_info() 将遍历
+swap_info[MAX_SWAPFILES]，从中找出flags没有SWP_USED的entry作为本次新的
+swap_info_struct节点pointer存放的位置。需要注意的是，因为swap_info[]一旦分配将
+不会释放。且此处的scan算法是找寻第一个idle的entry来保存新的节点。因此在最后一个
+swap_info[]之前的任何non-SWP_USED的entry都是之前已经分配过节点的。
+
+	if (type >= nr_swapfiles) {
+		p->type = type;
+		swap_info[type] = p;
+		smp_wmb();
+		nr_swapfiles++;
+	} else {
+		kfree(p);
+		p = swap_info[type];
+	}
+这也是上面else分支中kfree(p)的原因。此时实际上是直接使用之前使用过后又free过的
+节点。
+
+2. 初始化struct swap_info_struct中的 'struct block_device *bdev'
+
+claim_swapfile() 会完成此设置
+
+	name = getname(specialfile);
+	...
+	swap_file = file_open_name(name, O_RDWR|O_LARGEFILE, 0);
+	error = claim_swapfile(p, inode);
+	...
+	p->swap_file = swap_file;
+
+
+3. 读取swap 分区中的 第0 slot的数据
+
+
+
+
+
+
+
+
+
+

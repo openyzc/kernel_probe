@@ -1,0 +1,245 @@
+
+Actually, this is a complicated issue.
+
+I will take some notes about it when I am investigate the build_zonelists().
+
+In build_zonelists(), we need to know what CPUs are in a specific node.
+That is what node_to_cpumask_map[] play a role.
+
+But when this node_to_cpumask_map[] are set?
+
+
+1. setup_arch() --> reserve_real_mode()
+
+Each cpu core should start from realmode. So, something need to be done before
+bootup the secondary CPUs.
+
+void __init reserve_real_mode(void)
+{
+	phys_addr_t mem;
+	size_t size = real_mode_size_needed();
+
+	if (!size)
+		return;
+
+	WARN_ON(slab_is_available());
+
+	/* Has to be under 1M so we can execute real-mode AP code. */
+	mem = memblock_find_in_range(0, 1<<20, size, PAGE_SIZE);
+	if (!mem) {
+		pr_info("No sub-1M memory is available for the trampoline\n");
+		return;
+	}
+
+	memblock_reserve(mem, size);
+	set_real_mode_mem(mem, size);
+}
+
+1) allocate the memory for the realmode binary
+
+Probably we need to support relocatable kernel, Linux don't run the realmode
+binary directly from the addresses where that binary locate in kernel image.
+
+In contrary, the boot CPU will call real_mode_size_needed() to get the size of
+'arch/x86/realmode/rm/realmode.bin' :
+
+GLOBAL(real_mode_blob)
+	.incbin	"arch/x86/realmode/rm/realmode.bin"
+END(real_mode_blob)
+
+GLOBAL(real_mode_blob_end);
+
+The above are in arch/x86/realmode/rmpiggy.S;
+
+So, 'size_t size = real_mode_size_needed();' can get the size 'realmode.bin'
+populates.
+
+
+Then,
+	mem = memblock_find_in_range(0, 1<<20, size, PAGE_SIZE);
+	...
+	memblock_reserve(mem, size);
+
+Will allocate the memory belown 1MB for the realmode binary.
+
+At last,
+	set_real_mode_mem(mem, size);
+
+Will set the gobal variable of 'struct real_mode_header *real_mode_header;' :
+
+	void *base = __va(mem);
+
+	real_mode_header = (struct real_mode_header *) base;
+
+Now, we said 'real_mode_header' points to the real virtual address for the real
+mode binary.
+
+But at this moment, there is no any data in this newly memory area.
+
+
+2. setup the realmode binary
+
+
+We find this calling will do this work:
+
+early_initcall(init_real_mode);
+
+
+We know 'early_initcall' entries are called in this path:
+
+#define INIT_CALLS							\
+		VMLINUX_SYMBOL(__initcall_start) = .;			\
+		KEEP(*(.initcallearly.init))				\
+		INIT_CALLS_LEVEL(0)					\
+		INIT_CALLS_LEVEL(1)					\
+
+kernel_init --> kernel_init_freeable  --> do_pre_smp_initcalls
+
+So, early_initcall(init_real_mode) is called in the late bootup phrase which is
+later than build_zonelists().
+
+init_real_mode --> setup_real_mode
+
+This setup_real_mode() is very important as it will setup the realmode for
+bootup secondary CPUs.
+
+1) copy the original realmode.bin to new memory segment
+
+	size_t size = PAGE_ALIGN(real_mode_blob_end - real_mode_blob);
+	...
+
+	base = (unsigned char *)real_mode_header;
+
+	memcpy(base, real_mode_blob, size);
+
+So, the code/instructions of realmode.bin will be copied to the new 'base';
+
+2) update the data for some important relocatable variables in new realmode area
+
+We had said the original realmode binary had been copied to the new memory
+area. And the bootup processing will run on that new memory area rather than the
+original one.
+
+So, we have to update all the global data variables of new realmode binary to
+the right addresses. That is setup_real_mode() will do.
+
+	phys_base = __pa(base);
+	real_mode_seg = phys_base >> 4;
+
+## These two lines convert the 'base' to physical address and set real_mode_seg
+
+	rel = (u32 *) real_mode_relocs;
+/*
+ * GLOBAL(real_mode_relocs)
+ *	.incbin	"arch/x86/realmode/rm/realmode.relocs"
+ * END(real_mode_relocs)
+ * So, 'rel' is the base address of the relocs segment. All the relocatable
+ * variables' offset addresses are stored from this address.
+ */
+
+	/* 16-bit segment relocations. */
+	count = *rel++;
+	while (count--) {
+		u16 *seg = (u16 *) (base + *rel++);
+		*seg = real_mode_seg;
+	}
+/*
+ * All the relocatable segments in new realmode area are updated.
+ * including all the global variables defined in arch/x86/realmode/rm/header.s
+ * by GLOBAL(real_mode_header);
+ */
+	/* 32-bit linear relocations. */
+	count = *rel++;
+	while (count--) {
+		u32 *ptr = (u32 *) (base + *rel++);
+		*ptr += phys_base;
+	}
+/*
+ * update all the other global variables to the new physical addresses.
+ * please note that, '*ptr' is virtual, the value in '*ptr' is physical.
+ */
+
+
+3) setup the 'struct trampoline_header' in the new realmode binary
+
+	trampoline_header = (struct trampoline_header *)
+		__va(real_mode_header->trampoline_header);
+
+/*
+ * This 'trampoline_header' should points to the new realmode binary as
+ * 'real_mode_header' points to the base of new area.
+ */
+
+So, all the following are updating the corresponding variables of new binary :
+
+	trampoline_header->start = (u64) secondary_startup_64;
+	trampoline_cr4_features = &trampoline_header->cr4;
+	*trampoline_cr4_features = mmu_cr4_features;
+
+
+
+3. How the realmode binary are triggered?
+
+3.1 First step
+
+start_kernel --> smp_prepare_boot_cpu();
+
+This is done after setup_arch();
+
+3.2 smp_ops.smp_prepare_cpus
+kernel_init_freeable --> smp_prepare_cpus(setup_max_cpus)
+
+3.3 smp_init()
+
+This is called after do_pre_smp_initcalls();
+
+The calling path will be :
+
+smp_init()
+	--> cpu_up(cpu)
+		--> do_cpu_up(cpu, CPUHP_ONLINE)
+			--> _cpu_up(cpu, 0, target)
+				target = min((int)target, CPUHP_BRINGUP_CPU);
+				ret = cpuhp_up_callbacks(cpu, st, target);
+
+			cpuhp_invoke_callback(cpu, st->state, true, NULL)
+
+		cb = bringup ? step->startup.single : step->teardown.single;
+		if (!cb)
+			return 0;
+		...
+		ret = cb(cpu);
+
+
+Here, setup->startup.single is :
+
+	[CPUHP_BRINGUP_CPU] = {
+		.name			= "cpu:bringup",
+		.startup.single		= bringup_cpu,
+		.teardown.single	= NULL,
+		.cant_stop		= true,
+	},
+
+So, bringup_cpu(unsigned int cpu)  --> __cpu_up(cpu, idle) -->
+smp_ops.cpu_up(cpu, tidle)
+	--> native_cpu_up --> do_boot_cpu(apicid, cpu, tidle) 
+
+
+In do_boot_cpu():
+
+	...
+	unsigned long start_ip = real_mode_header->trampoline_start;
+	...
+
+
+	if (apic->wakeup_secondary_cpu)
+		boot_error = apic->wakeup_secondary_cpu(apicid, start_ip);
+	else
+		boot_error = wakeup_cpu_via_init_nmi(cpu, start_ip, apicid,
+						     &cpu0_nmi_registered);
+
+So, 'real_mode_header->trampoline_start' will be called.
+
+ENTRY(trampoline_start) is defined in trampoline_63.S/trampoline_32.S;
+
+

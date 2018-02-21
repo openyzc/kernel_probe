@@ -1,0 +1,56 @@
+
+static void __init mm_init(void)
+{
+	/*
+	 * page_ext requires contiguous pages,
+	 * bigger than MAX_ORDER unless SPARSEMEM.
+	 */
+	page_ext_init_flatmem();
+	mem_init();
+	kmem_cache_init();
+	percpu_init_late();
+	pgtable_init();
+	vmalloc_init();
+	ioremap_huge_init();
+}
+
+
+This mm_init is called by start_kernel(), but is after the
+build_all_zonelists(NULL, NULL).
+
+The core is mem_init().
+
+Although there are two implementations of mem_init(). One is for X86_64, another
+is for X86_32.
+They basically do the same work :
+	Passed all free memblock ranges to buddy allocator;
+	Reserved all memblock.reserved ranges;
+	Free all memblock data info;
+
+-- call reserve_bootmem_region() to 'SetPageReserved(page)' all pages that are
+from memblock.reserved;
+-- we only discuss based on memblock. free_all_bootmem() is in mm/nobootmem.c;
+-- reset_all_zones_managed_pages() will clear all zone->managed_pages as ZERO;
+-- I don't understand why the memblock freeing should divide into two steps on
+X86_32. One is for HIGHMEM, another is for 'lown_max_pfn'. It seems if the
+memory ranges are free, should be passed to buddy allocator, no any special
+handlings dependent on the memory type.
+
+But we should keep in mind that, we can not use the memblock again after
+free_all_bootmem(). There is an bug-fix you can refer to this commit:
+
+	855c743a27bb58a9a521bdc485ef5acfdb69badc
+
+
+After mm_init(), the new page allocation mechanism is nearly ready. We had setup
+the direct mapping for range belown 'max_low_pfn', we had setup the vmemmap,
+zone, buddy allocator...
+
+Then the following processes should be performed in order :
+
+kmem_cache_init_late()
+setup_per_cpu_pageset()
+...
+
+
+rest_init();

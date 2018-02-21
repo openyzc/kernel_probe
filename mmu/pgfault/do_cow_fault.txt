@@ -1,0 +1,45 @@
+
+写 VM_PRIVATE的 VMA时发生 page fault, 会进入此函数。
+
+函数比较简单，主要还是依赖于 __do_fault(vmf)。
+
+
+static int do_cow_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	int ret;
+
+	if (unlikely(anon_vma_prepare(vma)))
+		return VM_FAULT_OOM;
+/* 分配新page作为此次 需要的 COW page. */
+	vmf->cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, vmf->address);
+	if (!vmf->cow_page)
+		return VM_FAULT_OOM;
+
+	...
+/* 此函数会确保 page-cache中有对应的页被read进来了。 通过 vmf->page返回此page.*/
+	ret = __do_fault(vmf);
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+		goto uncharge_out;
+	if (ret & VM_FAULT_DONE_COW)
+		return ret;
+/* 主要是通过 kmap_atomic(from)将物理page 映射到 HIGHMEM的VA地址，然后进行copy.
+ * 这种方式是针对32位架构的。
+ * 这里的copy_user_highpage取名为'user'，我猜想是触发此do_cow_fault()的VM是在
+ * task的user-space空间, 不是内核使用的VM. 此外，这里copy的目的
+ * 'vmf->cow_page'在此时还没有设置到VM对应的
+ * PTE中。只能使用kmap_atomic()了。对于64位架构，具有足够的kernel-space的
+ * VM空间能完全覆盖了所有内存PA且在初始化时建立了kernel VA 与
+ * PA的directly一对一映射，因此不需要基于 FIX_KMAP的HIGHMEM映射。
+ */
+	copy_user_highpage(vmf->cow_page, vmf->page, vmf->address, vma);
+	__SetPageUptodate(vmf->cow_page);
+
+	ret |= finish_fault(vmf);
+	unlock_page(vmf->page);
+	put_page(vmf->page);
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+		goto uncharge_out;
+	return ret;
+	...
+}

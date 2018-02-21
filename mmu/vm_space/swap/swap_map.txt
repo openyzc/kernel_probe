@@ -1,0 +1,107 @@
+
+
+In struct swap_info_struct,有:
+	unsigned char *swap_map;
+
+这个指针指向一个 size为 maxpages的unsigned char 数组。
+
+
+read_swap_cache_async -->
+__read_swap_cache_async --> swapcache_prepare --> __swap_duplicate(entry,
+SWAP_HAS_CACHE)
+
+这里的 SWAP_HAS_CACHE 标志可能通过 swapcache_free 清除。
+
+shmem_writepage --> swap_shmem_alloc --> __swap_duplicate(entry, SWAP_MAP_SHMEM)
+以上的 __swap_duplicagte()只是在 add_to_swap_cache(page, swap,
+GFP_ATOMIC)成功的将 page添加到swap cache后才会触发。
+
+
+swap_duplicate --> __swap_duplicate(entry, 1)
+
+
+
+在 try_to_unmap_one()释放某个page时，如果此page是anonymous
+space对应的，那么此page对应的 PTE会被替换为 swap entry index.
+个人感觉应该是将原来page的数据sync到swap后才会调用
+try_to_unmap_one()完成页表的更新和页的释放。这个需要跟踪分析确认，可能会在后面的
+page reclaiming分析中描述。
+
+shrink_page_list --> try_to_unmap --> try_to_unmap_one
+
+			if (swap_duplicate(entry) < 0) {
+				set_pte_at(mm, address, pvmw.pte, pteval);
+				ret = false;
+				page_vma_mapped_walk_done(&pvmw);
+				break;
+			}
+
+这里的 swap_duplicate()就会incr 选定的 swap
+entry的count。因为此swap被映射到 swap 分区/文件了。
+此外，在 copy_one_pte的时候也会incr.
+ swap entry的count是保存在 struct page结构的 private中， 如下方式获取：
+		swp_entry_t entry = { .val = page_private(subpage) };
+
+struct page中的 private 应该是 __add_to_swap_cache() 中设置的：
+	SetPageSwapCache(page);
+	set_page_private(page, entry.val);
+
+
+2. 首次设置 swap_map[] 中保存的counter 值
+
+
+get_swap_pages --> n_ret = scan_swap_map_slots(si, SWAP_HAS_CACHE,
+			    n_goal, swp_entries);
+
+or
+
+get_swap_page_of_type --> offset = scan_swap_map(si, 1)
+
+
+两条路径最终还是会 调用到
+static int scan_swap_map_slots(struct swap_info_struct *si,
+			       unsigned char usage, int nr,
+			       swp_entry_t slots[])
+
+而在 scan_swap_map_slots()中，会有以下处理：
+
+	si->swap_map[offset] = usage;
+	inc_cluster_info_page(si, si->cluster_info, offset);
+
+这里的 si->swap_map[offset] 会被设置为 传入的 'usage'，一般初次分配 swap
+slot时，该usage是 SWAP_HAS_CACHE.
+
+
+2.1
+
+add_to_swap --> entry = get_swap_page() --> refill_swap_slots_cache(cache)
+	或 --> get_swap_pages(1, &entry)
+
+对于 refill_swap_slots_cache(cache)， 这是在 swap_slot_cache_active 为
+TRUE时使用的。 会将分配到的 swap entries 都cache到 struct swap_slots_cache
+结构的percpu变量 swp_slots 的 swp_entry_t	*slots 中，以便提升 swap
+的效率。
+struct swap_slots_cache {
+	bool		lock_initialized;
+	struct mutex	alloc_lock; /* protects slots, nr, cur */
+	swp_entry_t	*slots;
+	int		nr;
+	int		cur;
+	spinlock_t	free_lock;  /* protects slots_ret, n_ret */
+	swp_entry_t	*slots_ret;
+	int		n_ret;
+};
+
+而 在 struct swap_slots_cache 中的 'sw_entry_t *slots_ret;' 是用于
+free_swap_slot()时cache待返还到swap系统 sw_entry_t 池的sw_entry_t。
+
+
+因此，swap entry只要经过此路径， 其对应的 si->swap_map[offset] 就会被设置为
+SWAP_HAS_CACHE.
+
+2.2
+
+对于 get_swap_page_of_type 的调用路径，目前只是用于 kernel/power/swap.c；
+这不是主流的路径。暂时skip这部分。
+
+

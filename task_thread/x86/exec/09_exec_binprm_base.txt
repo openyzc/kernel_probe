@@ -1,0 +1,29 @@
+
+
+exec_binprm() is the core of execve().
+
+Here only provide some generic analysis without touch the stack initialization,
+the mapping between ELF file and VMAs including stack, heap, text.
+
+	-----------------
+	| random area	|
+	----------------
+	| stack		|
+	|		|
+	-----------------
+	|		|
+	|		| unMAPped area
+	|		|
+	|		|
+	----------------- mm->mmap_legacy_base / mm->mmap_base
+	|
+
+
+
+In exec_binprm(), the processing will be transferred to binfmt_elf.c ;
+
+This is the core for ELF binary file.
+
+Please refer to load_elf_binary().
+
+

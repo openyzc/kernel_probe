@@ -1,0 +1,84 @@
+
+static const struct pid_entry tgid_base_stuff[] = {
+	...
+	REG("mem",        S_IRUSR|S_IWUSR, proc_mem_operations),
+	...
+};
+
+
+The call path will create the dentry in /proc :
+
+proc_tgid_base_lookup
+	--> proc_pident_lookup
+
+
+proc_mem_operations is the corresponding 'struct file_operations'.
+
+
+
+When /proc/self/mem is open, mem_open() will be called.
+When calling the write() based on the 'fd' of '/proc/self/mem', then mem_rw will
+be invoked.
+
+This mem_rw() is workable for both read and write.
+
+
+mem_rw()
+	--> flags = FOLL_FORCE | (write ? FOLL_WRITE : 0);
+	--> access_remote_vm(mm, addr, page, this_len, flags)
+		--> __access_remote_vm(NULL, mm, addr, buf, len, gup_flags)
+
+/* parameter 'addr' is the offset to the start of 'fd'. What operation will be
+ * performed is decided by the 'gup_flags'. */
+
+
+====================
+
+
+int __access_remote_vm(struct task_struct *tsk, struct mm_struct *mm,
+		unsigned long addr, void *buf, int len, unsigned int gup_flags)
+{
+	...
+	while (len) {
+		int bytes, ret, offset;
+		void *maddr;
+		struct page *page = NULL;
+
+		ret = get_user_pages_remote(tsk, mm, addr, 1,
+				gup_flags, &page, &vma, NULL);
+		...
+			bytes = len;
+			offset = addr & (PAGE_SIZE-1);
+			if (bytes > PAGE_SIZE-offset)
+				bytes = PAGE_SIZE-offset;
+			...
+		} else {
+			...
+			maddr = kmap(page);
+			if (write) {
+				copy_to_user_page(vma, page, addr,
+						  maddr + offset, buf, bytes);
+				set_page_dirty_lock(page);
+			} else {
+				copy_from_user_page(vma, page, addr,
+						    buf, maddr + offset, bytes);
+			}
+			kunmap(page);
+			...
+		}
+	...
+}
+
+
+ret = get_user_pages_remote(tsk, mm, addr, 1,
+		gup_flags, &page, &vma, NULL);
+	--> return __get_user_pages_locked(tsk, mm, start, nr_pages, pages,
+			vmas, locked, true,
+			gup_flags | FOLL_TOUCH | FOLL_REMOTE);
+		--> ret = __get_user_pages(tsk, mm, start, nr_pages,
+			flags, pages, vmas, locked);
+
+/* 'locked' is NULL here. 'gup_flags' is FOLL_FORCE | FOLL_WRITE | FOLL_TOUCH |
+ * FOLL_REMOTE | FOLL_GET; 'vmas' is 'struct vm_area_struct **'; */
+
+

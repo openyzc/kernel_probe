@@ -1,0 +1,30 @@
+
+
+static int do_fault(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	int ret;
+/* 此函数 是针对 file mapping的。vma->vm_ops 必然非NULL. */
+	/* The VMA was not fully populated on mmap() or missing VM_DONTEXPAND */
+	if (!vma->vm_ops->fault)
+		ret = VM_FAULT_SIGBUS;
+/* 只读 VMA 访问触发的 page fault. 会将page数据读取到 file对应的 page-cache中。
+ * 这里有点疑问， shmem的普通文件没有 aops->readpage 或
+ * readpages的hook，是否shemem 普通文件不用于只读. */
+	else if (!(vmf->flags & FAULT_FLAG_WRITE))
+		ret = do_read_fault(vmf);
+/* 写VMA, 但是VM_PRIVATE... COW 触发*/
+	else if (!(vma->vm_flags & VM_SHARED))
+		ret = do_cow_fault(vmf);
+/* 写VMA + VM_SHARED.... */
+	else
+		ret = do_shared_fault(vmf);
+
+	/* preallocated pagetable is unused: free it */
+	if (vmf->prealloc_pte) {
+		pte_free(vma->vm_mm, vmf->prealloc_pte);
+		vmf->prealloc_pte = NULL;
+	}
+	return ret;
+}
+

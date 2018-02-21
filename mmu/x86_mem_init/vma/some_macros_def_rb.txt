@@ -1,0 +1,66 @@
+
+
+vma_gap_callbacks_propagate(&vma->vm_rb, NULL)
+
+
+**Where is the definition of this vma_gap_callbacks_propagate()?
+
+
+in mm/map.c :
+
+RB_DECLARE_CALLBACKS(static, vma_gap_callbacks, struct vm_area_struct, vm_rb,
+		     unsigned long, rb_subtree_gap, vma_compute_subtree_gap)
+
+in include/linux/rbtree_augmented.h :
+
+#define RB_DECLARE_CALLBACKS(rbstatic, rbname, rbstruct, rbfield,	\
+			     rbtype, rbaugmented, rbcompute)		\
+static inline void							\
+rbname ## _propagate(struct rb_node *rb, struct rb_node *stop)		\
+{									\
+	while (rb != stop) {						\
+		rbstruct *node = rb_entry(rb, rbstruct, rbfield);	\
+		rbtype augmented = rbcompute(node);			\
+		if (node->rbaugmented == augmented)			\
+			break;						\
+		node->rbaugmented = augmented;				\
+		rb = rb_parent(&node->rbfield);				\
+	}								\
+}									\
+static inline void							\
+rbname ## _copy(struct rb_node *rb_old, struct rb_node *rb_new)		\
+{									\
+	rbstruct *old = rb_entry(rb_old, rbstruct, rbfield);		\
+	rbstruct *new = rb_entry(rb_new, rbstruct, rbfield);		\
+	new->rbaugmented = old->rbaugmented;				\
+}									\
+static void								\
+rbname ## _rotate(struct rb_node *rb_old, struct rb_node *rb_new)	\
+{									\
+	rbstruct *old = rb_entry(rb_old, rbstruct, rbfield);		\
+	rbstruct *new = rb_entry(rb_new, rbstruct, rbfield);		\
+	new->rbaugmented = old->rbaugmented;				\
+	old->rbaugmented = rbcompute(old);				\
+}									\
+rbstatic const struct rb_augment_callbacks rbname = {			\
+	.propagate = rbname ## _propagate,				\
+	.copy = rbname ## _copy,					\
+	.rotate = rbname ## _rotate					\
+};
+
+
+
+static inline void
+vma_gap_callbacks_propagate(struct rb_node *rb, struct rb_node *stop)
+{
+	while ( rb != stop) {
+		struct vm_area_struct *node = rb_entry(rb,
+			struct vm_area_struct, vm_rb);
+		unsigned long augmented = vma_compute_subtree_gap(node);
+		if (node->rb_subtree_gap == augmented)
+			break;
+		node->rb_subtree_gap = augmented;
+		rb = rb_parent(&node->vm_rb);
+	}
+}
+

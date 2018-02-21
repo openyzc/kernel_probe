@@ -1,0 +1,69 @@
+
+
+In include/linux/mmzone.h :
+
+#ifdef CONFIG_HAVE_MEMORY_PRESENT
+void memory_present(int nid, unsigned long start, unsigned long end);
+#else
+static inline void memory_present(int nid, unsigned long start, unsigned long
+end) {}
+#endif
+...
+void memory_present(int nid, unsigned long start, unsigned long end);
+
+
+
+in arch/x86/Kconfig
+config ARCH_HAVE_MEMORY_PRESENT
+        def_bool y
+        depends on X86_32 && DISCONTIGMEM
+
+in mm/Kconfig:
+config SELECT_MEMORY_MODEL
+        def_bool y
+        depends on ARCH_SELECT_MEMORY_MODEL
+
+config HAVE_MEMORY_PRESENT
+        def_bool y
+        depends on ARCH_HAVE_MEMORY_PRESENT || SPARSEMEM
+
+
+config SPARSEMEM
+        def_bool y
+        depends on (!SELECT_MEMORY_MODEL && ARCH_SPARSEMEM_ENABLE) || SPARSEMEM_MANUAL
+
+
+config DISCONTIGMEM
+        def_bool y
+        depends on (!SELECT_MEMORY_MODEL && ARCH_DISCONTIGMEM_ENABLE) || DISCONTIGMEM_MANUAL
+
+in arch/x86/Kconfig:
+
+config ARCH_SPARSEMEM_ENABLE
+        def_bool y
+        depends on X86_64 || NUMA || X86_32 || X86_32_NON_STANDARD
+        select SPARSEMEM_STATIC if X86_32
+        select SPARSEMEM_VMEMMAP_ENABLE if X86_64
+
+config ARCH_SELECT_MEMORY_MODEL
+        def_bool y
+        depends on ARCH_SPARSEMEM_ENABLE
+
+
+It seems the memory_present() in mm/sparse.c is for SPARSEMEM_MANUAL -->
+SPARSEMEM; (when SPARSEMEM )
+
+	obj-$(CONFIG_SPARSEMEM) += sparse.o
+
+memory_present() in arch/x86/mm/numa_32.c is for NUMA && X86_32 &&
+DISCONTINGMEM;
+	obj-$(CONFIG_NUMA)              += numa.o numa_$(BITS).o
+and
+	#ifdef CONFIG_DISCONTIGMEM
+	...
+	void memory_present(int nid, unsigned long start, unsigned long end)
+	{
+
+
+
+

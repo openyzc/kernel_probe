@@ -1,0 +1,115 @@
+
+1. spinlock 结构定义
+
+typedef struct spinlock {
+	union {
+		struct raw_spinlock rlock;
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+# define LOCK_PADSIZE (offsetof(struct raw_spinlock, dep_map))
+		struct {
+			u8 __padding[LOCK_PADSIZE];
+			struct lockdep_map dep_map;
+		};
+#endif
+	};
+} spinlock_t;
+
+
+注意，这是一个union结构。
+
+核心是 struct raw_spinlock。
+
+typedef struct raw_spinlock {
+	arch_spinlock_t raw_lock;
+#ifdef CONFIG_GENERIC_LOCKBREAK
+	unsigned int break_lock;
+#endif
+#ifdef CONFIG_DEBUG_SPINLOCK
+	unsigned int magic, owner_cpu;
+	void *owner;
+#endif
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	struct lockdep_map dep_map;
+#endif
+} raw_spinlock_t;
+
+arch_spinlock_t raw_lock是架构相关的。
+
+在 arch/x86/include/asm/spinlock_types.h 中：
+
+	#include <asm-generic/qspinlock_types.h>
+
+因此，对于x86采用的是 qspinlock_types.h 中的定义如下：
+typedef struct qspinlock {
+	atomic_t	val;
+} arch_spinlock_t;
+
+而在arm64中，定义为 arch/arm64/include/asm/spinlock_types.h ：
+
+typedef struct {
+#ifdef __AARCH64EB__
+	u16 next;
+	u16 owner;
+#else
+	u16 owner;
+	u16 next;
+#endif
+} __aligned(4) arch_spinlock_t;
+
+arm中为：
+
+typedef struct {
+	union {
+		u32 slock;
+		struct __raw_tickets {
+#ifdef __ARMEB__
+			u16 next;
+			u16 owner;
+#else
+			u16 owner;
+			u16 next;
+#endif
+		} tickets;
+	};
+} arch_spinlock_t;
+
+2. 初始化
+在 include/asm-generic/qspinlock_types.h :
+
+#define	__ARCH_SPIN_LOCK_UNLOCKED	{ ATOMIC_INIT(0) }
+
+通过 raw_spin_lock_init(lock)，
+void __raw_spin_lock_init(raw_spinlock_t *lock, const char *name,
+			  struct lock_class_key *key)
+{
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	/*
+	 * Make sure we are not reinitializing a held lock:
+	 */
+	debug_check_no_locks_freed((void *)lock, sizeof(*lock));
+	lockdep_init_map(&lock->dep_map, name, key, 0);
+#endif
+	lock->raw_lock = (arch_spinlock_t)__ARCH_SPIN_LOCK_UNLOCKED;
+	lock->magic = SPINLOCK_MAGIC;
+	lock->owner = SPINLOCK_OWNER_INIT;
+	lock->owner_cpu = -1;
+}
+
+
+通过 #define DEFINE_RAW_SPINLOCK(x)
+	raw_spinlock_t x = __RAW_SPIN_LOCK_UNLOCKED(x)
+来定义spinlock变量：
+
+#define __RAW_SPIN_LOCK_INITIALIZER(lockname)	\
+	{					\
+	.raw_lock = __ARCH_SPIN_LOCK_UNLOCKED,	\
+	SPIN_DEBUG_INIT(lockname)		\
+	SPIN_DEP_MAP_INIT(lockname) }
+
+#define __RAW_SPIN_LOCK_UNLOCKED(lockname)	\
+	(raw_spinlock_t) __RAW_SPIN_LOCK_INITIALIZER(lockname)
+
+#define DEFINE_RAW_SPINLOCK(x)	raw_spinlock_t x = __RAW_SPIN_LOCK_UNLOCKED(x)
+
+

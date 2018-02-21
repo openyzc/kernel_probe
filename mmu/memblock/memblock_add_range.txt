@@ -1,0 +1,126 @@
+
+
+int __init_memblock memblock_add_range(struct memblock_type *type,
+				phys_addr_t base, phys_addr_t size,
+				int nid, unsigned long flags)
+
+
+The major role of this function are adding the new range of [base, base + size)
+into the 'struct memblock_type' where '*type' points to.
+There are INIT_MEMBLOCK_REGIONS 'struct memblock_region' node slots in a static
+array by default.
+
+
+1. struct memblock_type 
+
+struct memblock_type {
+	unsigned long cnt;	/* number of regions */
+	unsigned long max;	/* size of the allocated array */
+	phys_addr_t total_size;	/* size of all regions */
+	struct memblock_region *regions;
+	char *name;
+};
+
+'unsigned long cnt' is the number of regions populated. The initial value is 1.
+It is a bit strange. So there is a special handling at the beginning of
+memblock_add_range();
+
+'unsigned long max' is the maximum entries in the arrray where 'struct
+memblock_region *regions' points to. The initial size is INIT_MEMBLOCK_REGIONS,
+but when all the static elements are exhauted, we can extend the array.
+
+'phys_addr_t total_size' is the sum of all regions inserted to the array.
+
+'struct memblock_region *regions' is a pointer to an array of struct
+memblock_region. It is where the 'struct memblock_region' nodes are stored.
+
+
+
+2. The detail analysis about the implementation
+
+int __init_memblock memblock_add_range(struct memblock_type *type,
+				phys_addr_t base, phys_addr_t size,
+				int nid, unsigned long flags)
+{
+	...
+	if (type->regions[0].size == 0) {
+		WARN_ON(type->cnt != 1 || type->total_size);
+		type->regions[0].base = base;
+		type->regions[0].size = size;
+		type->regions[0].flags = flags;
+		memblock_set_region_node(&type->regions[0], nid);
+		type->total_size = size;
+		return 0;
+	}
+
+## Here, we check whether the current 'type->regions[0].size == 0' which means
+## the memblock is empty. If yes, the new region node will be directly inserte
+## to the type->regions[0]; Please be attention that the 'type->cnt' hadn't
+## been increased for this insertion.
+
+	for_each_memblock_type(type, rgn) {
+		phys_addr_t rbase = rgn->base;
+		phys_addr_t rend = rbase + rgn->size;
+
+		if (rbase >= end)
+			break;
+		if (rend <= base)
+			continue;
+		/*
+		 * @rgn overlaps.  If it separates the lower part of new
+		 * area, insert that portion.
+		 */
+		if (rbase > base) {
+#ifdef CONFIG_HAVE_MEMBLOCK_NODE_MAP
+			WARN_ON(nid != memblock_get_region_node(rgn));
+#endif
+			WARN_ON(flags != rgn->flags);
+			nr_new++;
+			if (insert)
+				memblock_insert_region(type, idx++, base,
+						       rbase - base, nid,
+						       flags);
+		}
+		/* area below @rend is dealt with, forget about it */
+		base = min(rend, end);
+	}
+
+
+## The above is the core of this function. The major algorithm is to find how
+## many new regions in [base, base + size) should be added to the array.
+
+			base 				end = base + size
+			|				|
+			----------------------------------
+
+case 1: The existed node is on the left: if (rend <= base)
+	rbase  rend
+	|------|
+
+case 2: One existed node overlaps on the left: (rbase <= base && rend > base)
+		  rbase	    rend
+		   |----------|
+
+	only adjust the base as "base = min(rend, end);" for next loop;
+	as [base, rend) is in the [rbase, rend), don't need to insert.
+
+case 3: The existed node overlap has a bigger 'rbase': (rbase > base)
+				rbase	 rend
+				|----------|
+	insert the [base, rbase) to the array;
+
+case 4:
+	the new 'base = min(read, end)' is the start address of the gap. If this
+	base is smaller than the 'rbase' of next existed node, and 'base < end',
+	then the last region node should be inserted.
+
+
+There are two sanning on the array. The first is just get the counter of the
+nodes to be inserted, then we can know whether extension on the array is needed.
+
+In the 2nd scanning, all the new nodes are inserted and try to merge some
+adjacent regions:
+
+	memblock_merge_regions(type);
+
+

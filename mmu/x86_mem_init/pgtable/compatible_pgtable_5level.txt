@@ -1,0 +1,216 @@
+
+
+We only discuss the page tables hierarchy on x86;
+
+arch/x86/include/asm/pgtable_types.h is the common header file for both x86_32
+and x86_64;
+
+
+#ifdef CONFIG_X86_32
+# include <asm/pgtable_32_types.h>
+#else
+# include <asm/pgtable_64_types.h>
+#endif
+
+1. x86 32
+
+In arch/x86/include/asm/pgtable_32_types.h :
+
+#ifdef CONFIG_X86_PAE
+# include <asm/pgtable-3level_types.h>
+# define PMD_SIZE	(1UL << PMD_SHIFT)
+# define PMD_MASK	(~(PMD_SIZE - 1))
+#else
+# include <asm/pgtable-2level_types.h>
+#endif
+
+So, when X86_PAE is enabled, the page hierarchy will has three levels:
+PGD  ---> PMD ---> PTE		page		virtual space
+
+9bits	9 bits	   9 bits	12 bits		512G(39bits for X86_64)
+2bits	9 bits	   9 bits	12 bits		3GB(from zero for x86)
+
+As x86 address is 32bits, maximum space is 4G. So, the PGD only has four
+entries.
+
+
+The delimit of user-land and kernel space is defined by:
+
+#define __PAGE_OFFSET_BASE	_AC(CONFIG_PAGE_OFFSET, UL)
+#define __PAGE_OFFSET		__PAGE_OFFSET_BASE
+
+in arch/x86/include/asm/page_32_types.h; Default value is 0xC0000000;
+
+
+
+As the entry length of PAE page is 8bytes, so 4k page can hold 512 entries.
+And the pfn can populate 32bits, the maximum physical space is 44bit(16GB)
+although the intel SDM says the maximum physical address is at most 52.
+
+You can refer to the arch/x86/include/asm/page_32_types.h :
+#ifdef CONFIG_X86_PAE
+/* 44=32+12, the limit we can fit into an unsigned long pfn */
+#define __PHYSICAL_MASK_SHIFT	44
+#define __VIRTUAL_MASK_SHIFT	32
+
+#else  /* !CONFIG_X86_PAE */
+#define __PHYSICAL_MASK_SHIFT	32
+#define __VIRTUAL_MASK_SHIFT	32
+#endif	/* CONFIG_X86_PAE */
+
+When X86_PAE is disabled, the page hierarchy has two levels:
+
+PGD -----> PTE		page
+10bits	  10bits	12bits		total 32bits
+
+2. X86_64
+
+It is wise to support 4 levels page table.
+
+asm/pgtable_64_types.h will be included in pgtable_types.h;
+
+Now, the page table hierarchy is :
+
+PGD ----> PUD	----> PMD -----> PTE	page	virtual space
+
+9 bits	9 bits	     9 bits	9bits	12bits	0 ~00007fffffffffff(47bits)
+
+You can find the virtual space delimit definition in
+arch/x86/iniclude/asm/processor.h :
+
+#define TASK_SIZE_MAX	((1UL << 47) - PAGE_SIZE)
+
+
+The space segement of ffff880000000000 - ffffc7ffffffffff (=64 TB) is for
+physical address. Which is corresponding to the '#define __PHYSICAL_MASK_SHIFT
+46'.
+
+As for the address space division, you can refer to the help doc, mm.txt;
+
+3. 5 levels page table
+
+PGD ----> P4D ----> PUD ------> PMD ----> PTE	page	virtual space
+9 bits	 9 bits	    9 bits	9 bits	 9bits	12 bits	
+
+
+in page_64_types.h :
+
+#ifdef CONFIG_X86_5LEVEL
+#define __PHYSICAL_MASK_SHIFT	52
+#define __VIRTUAL_MASK_SHIFT	56
+#else
+#define __PHYSICAL_MASK_SHIFT	46
+#define __VIRTUAL_MASK_SHIFT	47
+#endif
+
+So, 0x00FFFFFFFFFFFFFF is the maximum user-land virtual address.
+It is similar to the definition of TASK_SIZE_MAX;
+
+#ifdef CONFIG_X86_5LEVEL
+#define __PAGE_OFFSET_BASE      _AC(0xff10000000000000, UL)
+#else
+#define __PAGE_OFFSET_BASE      _AC(0xffff880000000000, UL)
+#endif
+
+This is for the starting physical address.
+0xff10000000000000.
+
+It match the canonical address rule.
+
+
+
+4. How to keep the consistence with the existing page levels
+
+in arch/x86/include/asm/pgtable_types.h, different header files will be included
+depending on the CONFIG_PGTABLE_LEVELS.
+
+4.1 CONFIG_PGTABLE_LEVELS is less than 5
+
+When CONFIG_PGTABLE_LEVELS > 4 which means 5 level at this moment:
+there is p4d value definition as this,
+typedef struct { p4dval_t p4d; } p4d_t;
+
+otherwise, will include this:
+#include <asm-generic/pgtable-nop4d.h>
+
+then, there is no real p4d definition, p4d apply the upper PGD definition at
+last in pgtable-nop4d.h for compatibility:
+typedef struct { pgd_t pgd; } p4d_t;
+
+So, pgtable-nop4d.h is for the case when CONFIG_PGTABLE_LEVELS is not for 5
+levels;
+
+4.2 CONFIG_PGTABLE_LEVELS > 3
+Which means that:
+1) PGTABLE_LEVELS is equal to 5;
+For this case, it also fit the above case of 'CONFIG_PGTABLE_LEVELS > 4';
+2) PGTABLE_LEVELS is equal to 4;
+For this case, pgtable-nop4d.h will play a role and those definitions are
+applied:
+typedef struct { pudval_t pud; } pud_t;
+
+4.3 CONFIG_PGTABLE_LEVELS <= 3
+No PUD, so:
+#include <asm-generic/pgtable-nopud.h>  &&
+
+#include <asm-generic/pgtable-nop4d.h>
+
+4.4 CONFIG_PGTABLE_LEVELS > 2
+typedef struct { pmdval_t pmd; } pmd_t;
+
+else means <= 2, so,
+#include <asm-generic/pgtable-nopmd.h>
+
+&&
+#include <asm-generic/pgtable-nopud.h>
+
+&&
+#include <asm-generic/pgtable-nop4d.h>
+
+5. The relationship between pgtable-nop*d.h
+
+
+1) 5level-fixup.h : p4d ----fold----> PGD &&
+	#define __ARCH_HAS_5LEVEL_HACK
+	#define __PAGETABLE_P4D_FOLDED
+
+2) pgtable-nop4d-hack.h :
+	#include <asm-generic/5level-fixup.h>
+	#define __PAGETABLE_PUD_FOLDED
+
+So, p4d will be folded by the including of 5level-fixup.h;
+PUD will be folded by this header file locally.
+This header file is only included by pgtable-nopud.h when __ARCH_USE_5LEVEL_HACK
+is defined.
+
+I think this header file is suitble for some architecture where no page levels
+over 3 exist. Just as what had done in arch/arm64/include/asm/pgtable-types.h :
+#elif CONFIG_PGTABLE_LEVELS == 3
+#define __ARCH_USE_5LEVEL_HACK
+#include <asm-generic/pgtable-nopud.h>
+#elif CONFIG_PGTABLE_LEVELS == 4
+#include <asm-generic/5level-fixup.h>
+#endif
+
+or arch/arm/include/asm/pgtable.h :
+#define __ARCH_USE_5LEVEL_HACK
+#include <asm-generic/pgtable-nopud.h>
+
+3) include/asm-generic/pgtable-nopud.h
+This header file will fold PUD.
+Whether PUD is folded into PGD or P4D depends on the definition of
+__ARCH_USE_5LEVEL_HACK :
+
+#ifdef __ARCH_USE_5LEVEL_HACK
+#include <asm-generic/pgtable-nop4d-hack.h>
+#else
+#include <asm-generic/pgtable-nop4d.h>
+
+#define __PAGETABLE_PUD_FOLDED
+
+
+
+
+
+
+

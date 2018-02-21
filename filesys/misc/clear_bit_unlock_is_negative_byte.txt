@@ -1,0 +1,97 @@
+
+
+On x86, there is an inline function to manipulate the BIT fields.
+
+
+in arch/x86/include/asm/bitops.h :
+
+
+static __always_inline bool clear_bit_unlock_is_negative_byte(long nr, volatile
+unsigned long *addr)
+{
+	bool negative;
+	asm volatile(LOCK_PREFIX "andb %2,%1\n\t"
+		CC_SET(s)
+		: CC_OUT(s) (negative), ADDR
+		: "ir" ((char) ~(1 << nr)) : "memory");
+	return negative;
+}
+
+
+In asm.h, the 'CC_SET' and 'CC_OUT' are defined as:
+
+#ifdef __GCC_ASM_FLAG_OUTPUTS__
+# define CC_SET(c) "\n\t/* output condition code " #c "*/\n"
+# define CC_OUT(c) "=@cc" #c
+#else
+# define CC_SET(c) "\n\tset" #c " %[_cc_" #c "]\n"
+# define CC_OUT(c) [_cc_ ## c] "=qm"
+#endif
+
+
+When __GCC_ASM_FLAG_OUTPUTS__ is disabled, supposed the 'c' is 's', will have :
+
+asm volatile(LOCK_PREFIX "andb  %2, %1\n\t"
+		"\n\tsets %[_cc_s]\n"
+		: [_cc_s] "=qm"(negative), addr
+		: "ir" ((char) !(1 << nr)) : "memory");
+
+We know 'sets %[_cc_s]' will set the 'negative' as '1' or '0'. The following is
+from intel manual on the 'SETcc' entry:
+
+Sets the destination operand to 0 or 1 depending on the settings of the status
+flags (CF, SF, OF, ZF, and PF) in the EFLAGS register. The destination operand
+points to a byte register or a byte in memory.
+
+
+But when another branch will work?
+
+In Gcc manual, '6.44.2.4 Flag Output Operands' :
+
+
+x86 family The flag output constraints for the x86 family are of the form
+‘=@cccond’ where
+cond is one of the standard conditions defined in the ISA manual for jcc or
+setcc.
+a “above” or unsigned greater than
+ae “above or equal” or unsigned greater than or equal
+
+So, we know '# define CC_OUT(c) "=@cc" #c' can set the output 'negative' too.
+
+
+BTW, this function will do these works:
+
+1) clear the bit of 'nr' in '*addr';
+2) return the MSB of '*addr'. If it is set, return 1, otherwise, return 0;
+
+in the below function, the MSB of destination byte will be 'SETS'. That bit is
+'PG_waiters', you can refer to this defintion in include/linux/page-flags.h :
+
+enum pageflags {
+	PG_locked,		/* Page is locked. Don't touch. */
+	PG_error,
+	PG_referenced,
+	PG_uptodate,
+	PG_dirty,
+	PG_lru,
+	PG_active,
+	PG_waiters,		/* Page has waiters, check its waitqueue. Must
+			be bit #7 and in the same byte as "PG_locked" */
+
+
+So, the following function will clear the PG_locked, and return the current
+PG_waiters. I think PG_waiters represents there are some sleepers awaiting to
+wakeup for the unlock on 'PG_locked'.
+
+
+void unlock_page(struct page *page)
+{
+	BUILD_BUG_ON(PG_waiters != 7);
+	page = compound_head(page);
+	VM_BUG_ON_PAGE(!PageLocked(page), page);
+	if (clear_bit_unlock_is_negative_byte(PG_locked, &page->flags))
+		wake_up_page_bit(page, PG_locked);
+}
+
+
+

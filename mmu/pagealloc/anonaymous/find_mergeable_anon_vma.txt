@@ -1,0 +1,67 @@
+
+mmap: avoid merging cloned VMAs
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/mmap.c?id=965f55dea0e331152fa53941a51e4e16f9f06fae
+
+and this commit:
+
+
+Simplify and comment on anon_vma re-use for anon_vma_prepare()
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm/mmap.c?id=d0e9fe1758f222f13ec893f856552d81a10d266d
+
+In int __anon_vma_prepare(struct vm_area_struct *vma), will call :
+
+	anon_vma = find_mergeable_anon_vma(vma);
+	allocated = NULL;
+	if (!anon_vma) {
+		anon_vma = anon_vma_alloc();
+		if (unlikely(!anon_vma))
+			goto out_enomem_free_avc;
+		allocated = anon_vma;
+	}
+
+
+This find_mergeable_anon_vma() tries to search a mergable anon_vma node for the
+new 'sruct vm_area_struct *vma' as the 'vma->anon_vma'.
+
+
+struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma)
+{
+	struct anon_vma *anon_vma;
+	struct vm_area_struct *near;
+
+	near = vma->vm_next;
+	if (!near)
+		goto try_prev;
+
+	anon_vma = reusable_anon_vma(near, vma, near);
+	...
+}
+
+
+static struct anon_vma *reusable_anon_vma(struct vm_area_struct *old, struct
+vm_area_struct *a, struct vm_area_struct *b)
+{
+	if (anon_vma_compatible(a, b)) {
+		struct anon_vma *anon_vma = READ_ONCE(old->anon_vma);
+
+		if (anon_vma && list_is_singular(&old->anon_vma_chain))
+			return anon_vma;
+	}
+	return NULL;
+}
+
+1) The return 'anon_vma' is from the parameter of '*old';
+2) 'old' is smae as the parameter of 'a' or 'b', one of them;
+3) The input 'vma' of find_mergeable_anon_vma() is also either 'a' or 'b' which
+is the one excepts that one of 'old';
+4) The 'old' is the VMA which had been bound with 'anon_vma' node. And more
+important is that, it must satisfy 'list_is_singular(&old->anon_vma_chain)',
+that is only one AVC in old->anon_vma_chain. which means this 'old' is just
+attached to a 'struct anon_vma' node, without any forkings. Otherwise, it is not
+suitable to reuse this anon_vma as we can't use the same 'anon_vma' between the
+'struct vma_area_struct *old' with several avc linkings and the new 'struct
+vma_area_struct' with only the first avc linking. You certainly can't clone all
+those avc in '*old' to new 'vma'. 
+

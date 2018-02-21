@@ -1,0 +1,327 @@
+
+
+prepare_namespace() --> mount_root() -->
+		int err = create_dev("/dev/root", ROOT_DEV);
+
+		if (err < 0)
+			pr_emerg("Failed to create /dev/root: %d\n", err);
+		mount_block_root("/dev/root", root_mountflags);
+
+1. creation of '/dev/root'
+
+static inline int create_dev(char *name, dev_t dev)
+{
+	sys_unlink(name);
+	return sys_mknod(name, S_IFBLK|0600, new_encode_dev(dev));
+}
+
+--> SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode,
+unsigned, dev)
+	--> SYSCALL_DEFINE4(mknodat, int, dfd, const char __user *, filename,
+		umode_t, mode, unsigned, dev)
+
+		--> 	dentry = user_path_create(dfd, filename, &path,
+					lookup_flags);
+			if (IS_ERR(dentry))
+				return PTR_ERR(dentry);
+		--> 	case S_IFCHR: case S_IFBLK:
+			error = vfs_mknod(path.dentry->d_inode,dentry,mode,
+					new_decode_dev(dev));
+
+The '/dev/root' is created in the rootfs by this flow:
+
+user_path_create() -->
+	filename_create(dfd, getname(pathname), path, lookup_flags)
+	--> /* lookup the parent of the last component of 'pathname' */
+	name = filename_parentat(dfd, name, lookup_flags, path, &last, &type);
+	--> /* create the dentry and insert it into the dhash */
+	dentry = __lookup_hash(&last, path->dentry, lookup_flags);
+		--> lookup_real(base->d_inode, dentry, flags)
+			--> old = dir->i_op->lookup(dir, dentry, flags)
+
+For rootfs, dir->i_op->lookup is 'simple_lookup' :
+	simple_lookup -->
+		d_add(dentry, NULL)
+		--> __d_add(entry, inode)
+		--> __d_rehash(dentry);
+As 'd_add(dentry, NULL)', the '__d_set_inode_and_type(dentry, inode, add_flags)'
+will not be called. So 'dentry->d_inode = NULL' for '/dev/root' in rootfs at
+that moment. But '__d_rehash(dentry)' will link the 'dentry' into dhash.
+
+vfs_mknod()
+	--> error = dir->i_op->mknod(dir, dentry, mode, dev)
+	--> ramfs_mknod(dir, dentry, mode, dev)
+		--> inode = ramfs_get_inode(dir->i_sb, dir, mode, dev)
+		--> d_instantiate(dentry, inode);
+			--> __d_instantiate(entry, inode)
+				--> __d_set_inode_and_type(dentry, inode,
+					add_flags)
+Now, the 'dentry->d_inode' will be setup as:
+	dentry->d_inode = inode;
+Please note '/dev/root' here is S_IFBLK rather than S_IFDIR.
+
+
+2. The mount of blk root partition
+
+mount_block_root("/dev/root", root_mountflags)
+	--> do_mount_root(name, p, flags, root_mount_data)
+		--> sys_mount(name, "/root", fs, flags, data)
+
+In fs/namespace.c :
+
+SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
+		char __user *, type, unsigned long, flags, void __user *, data)
+
+	--> ret = do_mount(kernel_dev, dir_name, kernel_type, flags, options);
+Her, the 'kernel_dev' is '/dev/root', 'dir_name' is '/root', kernel_type is
+'ext4';
+		--> retval = user_path(dir_name, &path);
+		--> do_new_mount(&path, type_page, flags, mnt_flags,
+				      dev_name, data_page);
+
+2.1 the mount directory lookup
+
+For the mount directory creation, the call flow will be:
+
+user_path()
+	--> user_path_at_empty()
+		--> filename_lookup()
+			--> path_lookupat
+				--> lookup_last(nd)
+					--> walk_component(nd, 0)
+
+Then these calls will be continued when the 'dir_name' hadn't been created
+before:
+	--> lookup_slow
+		--> dentry = d_alloc_parallel(dir, name, &wq);
+		--> old = inode->i_op->lookup(inode, dentry, flags);
+
+For rootfs, 'inode->i_op->loopkup' is 'simple_lookup':
+			--> d_add(dentry, NULL)
+				--> __d_add(entry, inode)
+					--> __d_rehash(dentry)
+
+In this flow, there isn't 'struct inode' is bound with 'dentry'.
+But I wonder the '/root' had been made before the calling of mount_block_root().
+Otherwise, these code during the root mounting will meet some errors:
+
+struct block_device *lookup_bdev(const char *pathname)
+{
+	struct block_device *bdev;
+	struct inode *inode;
+	struct path path;
+	int error;
+
+	if (!pathname || !*pathname)
+		return ERR_PTR(-EINVAL);
+
+	error = kern_path(pathname, LOOKUP_FOLLOW, &path);
+	if (error)
+		return ERR_PTR(error);
+/* The d_backing_inode() will return NULL when '/root' hadn't been created
+ * before the mount_block_root(). */
+	inode = d_backing_inode(path.dentry);
+
+
+==================
+
+2.2 mount processing
+
+We will focus on 'do_new_mount()' below.
+
+
+	type = get_fs_type(fstype);
+	if (!type)
+		return -ENODEV;
+
+	mnt = vfs_kern_mount(type, flags, name, data);
+
+In vfs_kern_mount(),
+	root = mount_fs(type, flags, name, data);
+		--> root = type->mount(type, flags, name, data);
+
+For ext4, 'type->mount' is:
+
+static struct dentry *ext4_mount(struct file_system_type *fs_type, int flags,
+		       const char *dev_name, void *data)
+{
+	return mount_bdev(fs_type, flags, dev_name, data, ext4_fill_super);
+}
+
+
+struct dentry *mount_bdev(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data,
+	int (*fill_super)(struct super_block *, void *, int))
+{
+	...
+	/* Get the struct block_device node which corresponds to 'dev_name',
+	 * that is '/dev/root' here. Actually, the key field is the 'dev_t'.*/
+	bdev = blkdev_get_by_path(dev_name, mode, fs_type);
+	...
+	/* setup the 'struct super_block' for this bdev. */
+	s = sget(fs_type, test_bdev_super, set_bdev_super, flags | MS_NOSEC,
+		 bdev);
+	...
+		error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+		if (error) {
+			deactivate_locked_super(s);
+			goto error;
+		}
+
+		s->s_flags |= MS_ACTIVE;
+		bdev->bd_super = s;
+	...
+}
+
+2.2.1 creation of block device
+
+The input parameter of 'path' below is '/dev/root'.
+
+blkdev_get_by_path
+	--> bdev = lookup_bdev(path)
+
+	--> err = blkdev_get(bdev, mode, holder);
+
+struct block_device *lookup_bdev(const char *pathname)
+{
+	struct block_device *bdev;
+	struct inode *inode;
+	struct path path;
+	int error;
+
+	if (!pathname || !*pathname)
+		return ERR_PTR(-EINVAL);
+/* lookup the entry corresponds to 'pathname', here it is '/dev/root'. */
+	error = kern_path(pathname, LOOKUP_FOLLOW, &path);
+	if (error)
+		return ERR_PTR(error);
+
+	inode = d_backing_inode(path.dentry);
+	error = -ENOTBLK;
+	if (!S_ISBLK(inode->i_mode))
+		goto fail;
+	error = -EACCES;
+	if (!may_open_dev(&path))
+		goto fail;
+	error = -ENOMEM;
+/* this bd_acquire() is the core... */
+	bdev = bd_acquire(inode);
+	...
+}
+
+Here, 'inode' is corresponding to the '/dev/root' where the corresponding
+'dev_t' value for '/dev/root' is stored.
+
+bd_acquire(struct inode *inode)
+	--> bdev = bdget(inode->i_rdev)
+		--> 	inode = iget5_locked(blockdev_superblock, hash(dev),
+				bdev_test, bdev_set, &dev)
+		--> /* bind the 'inode' above to 'struct block_device'. As the
+		'inode' actually is a member of 'struct bdev_inode', so, this
+		binding setup the relationship between 'struct bdev_inode' and
+		'struct block_device' through 'struct inode'. */
+
+		bdev->bd_inode = inode; /* point to the 'struct inode' */
+		...
+		inode->i_mode = S_IFBLK;
+		inode->i_rdev = dev; /* the key dev_t value */
+		inode->i_bdev = bdev; /* point to 'struct block_device'; */
+		inode->i_data.a_ops = &def_blk_aops;
+		...
+		mapping_set_gfp_mask(&inode->i_data, GFP_USER);
+		list_add(&bdev->bd_list, &all_bdevs);
+
+	--> /* initialize some key fields in 'struct inode' to build the binding
+	with 'struct block_device' which corresponds to the block partition. */
+			inode->i_bdev = bdev;
+			inode->i_mapping = bdev->bd_inode->i_mapping;
+	/* Please keep in mind there, inode->i_mapping will be set to the
+	 * i_mapping of internal block 'struct inode'. */
+
+
+We need to add some comments about this :
+
+	inode = iget5_locked(blockdev_superblock, hash(dev),
+			bdev_test, bdev_set, &dev);
+
+The 'blockdev_superblock' is a 'struct super_block' specific for 'static struct
+file_system_type bd_type'. You can refer to bdev_cache_init().
+
+The above 'struct inode' is allocated by:
+
+static const struct super_operations bdev_sops = {
+	.statfs = simple_statfs,
+	.alloc_inode = bdev_alloc_inode,
+
+struct bdev_inode {
+	struct block_device bdev;
+	struct inode vfs_inode;
+};
+
+So, the 'struct inode' actully points to 'struct inode vfs_inode' of struct
+bdev_inode, and 'struct block_device' points to 'struct block_device bdev;' too.
+
+2.2.2 setup 'struct super_block'
+
+	s = sget(fs_type, test_bdev_super, set_bdev_super, flags | MS_NOSEC,
+		 bdev);
+
+sget()
+	--> sget_userns(type, test, set, flags, user_ns, data)
+		--> s = alloc_super(type, (flags & ~MS_SUBMOUNT), user_ns)
+		--> set_bdev_super(s, data);
+
+		--> /* other initialization of 'struct super_block' */
+	s->s_type = type;
+	strlcpy(s->s_id, type->name, sizeof(s->s_id));
+	list_add_tail(&s->s_list, &super_blocks);
+	hlist_add_head(&s->s_instances, &type->fs_supers);
+
+static int set_bdev_super(struct super_block *s, void *data)
+{
+	s->s_bdev = data;
+	s->s_dev = s->s_bdev->bd_dev;
+	s->s_bdi = bdi_get(s->s_bdev->bd_bdi);
+
+	return 0;
+}
+
+
+/* The last step in mount_bdev(). Will call ext4_fill_super() */
+
+		sb_set_blocksize(s, block_size(bdev));
+		error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+		if (error) {
+			deactivate_locked_super(s);
+			goto error;
+		}
+
+		s->s_flags |= MS_ACTIVE;
+		bdev->bd_super = s;
+/* setup the relation between 'struct super_block' and 'struct block_device'. */
+
+static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+{
+	...
+
+	root = ext4_iget(sb, EXT4_ROOT_INO);
+	if (IS_ERR(root)) {
+		ext4_msg(sb, KERN_ERR, "get root inode failed");
+		ret = PTR_ERR(root);
+		root = NULL;
+		goto failed_mount4;
+	}
+	if (!S_ISDIR(root->i_mode) || !root->i_blocks || !root->i_size) {
+		ext4_msg(sb, KERN_ERR, "corrupt root inode, run e2fsck");
+		iput(root);
+		goto failed_mount4;
+	}
+	sb->s_root = d_make_root(root);
+	...
+}
+
+So, here, a 'struct inode' and 'struct dentry' for this ext4 block device will
+be setup. All these are block relevant. The 'struct inode' is a new one
+different from the struct inode of '/dev/root';
+
+

@@ -1,0 +1,103 @@
+
+static int count(struct user_arg_ptr argv, int max)
+{
+	int i = 0;
+
+	if (argv.ptr.native != NULL) {
+		for (;;) {
+			const char __user *p = get_user_arg_ptr(argv, i);
+
+			if (!p)
+				break;
+
+			if (IS_ERR(p))
+				return -EFAULT;
+
+			if (i >= max)
+				return -E2BIG;
+			++i;
+
+			if (fatal_signal_pending(current))
+				return -ERESTARTNOHAND;
+			cond_resched();
+		}
+	}
+	return i;
+}
+
+This count() will get the user arguments from the array pointed by 'struct
+user_arg_ptr argv', and return the valid argument count. If there are any
+invalid argument, will return negative value, such as -EFAULT.
+
+
+1. static const char __user *get_user_arg_ptr(struct user_arg_ptr argv, int nr)
+
+The calling chain is :
+
+--> get_user(native, argv.ptr.native + nr)
+
+The get_user is a inline assembly sentence defined in
+arch/x86/include/asm/uaccess.h :
+
+#define get_user(x, ptr)						\
+({									\
+	int __ret_gu;							\
+	register __inttype(*(ptr)) __val_gu asm("%"_ASM_DX);		\
+	register void *__sp asm(_ASM_SP);				\
+	__chk_user_ptr(ptr);						\
+	might_fault();							\
+	asm volatile("call __get_user_%P4"				\
+		     : "=a" (__ret_gu), "=r" (__val_gu), "+r" (__sp)	\
+		     : "0" (ptr), "i" (sizeof(*(ptr))));		\
+	(x) = (__force __typeof__(*(ptr))) __val_gu;			\
+	__builtin_expect(__ret_gu, 0);					\
+})
+
+
+In this compound line, will call __get_user_1() or __get_user_4().
+Those functions are defined in arch/x86/lib/getuser.S;
+
+As for why '"+r" (__sp) is needed?
+
+Please refer to this patch:
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/arch/x86/include/asm/uaccess.h?id=f05058c4d652b619adfda6c78d8f5b341169c264
+
+x86/uaccess: Add stack frame output operand in get_user() inline asm
+Numerous 'call without frame pointer save/setup' warnings are introduced
+by stacktool because of functions using the get_user() macro. Bad stack
+traces could occur due to lack of or misplacement of stack frame setup
+code.
+
+This patch forces a stack frame to be created before the inline asm code
+if CONFIG_FRAME_POINTER is enabled by listing the stack pointer as an
+output operand for the get_user() inline assembly statement.
+
+
+
+How to check the user address is valid?
+
+ENTRY(__get_user_2)
+	add $1,%_ASM_AX
+	jc bad_get_user
+	mov PER_CPU_VAR(current_task), %_ASM_DX
+	cmp TASK_addr_limit(%_ASM_DX),%_ASM_AX
+	jae bad_get_user
+	ASM_STAC
+2:	movzwl -1(%_ASM_AX),%edx
+	xor %eax,%eax
+	ASM_CLAC
+	ret
+
+
+
+_CPU_VAR(current_task), %_ASM_DX
+cmp TASK_addr_limit(%_ASM_DX),%_ASM_AX
+
+will perform this check.
+
+
+As for 'register void *__sp asm(_ASM_SP)', you can refer to the '6.44.1 Defining
+Global Register Variables' in GCC manual. It makes sense to specify the register
+in which an ordinary register variable should be allocated.
+

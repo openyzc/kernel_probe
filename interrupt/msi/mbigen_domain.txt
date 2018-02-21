@@ -1,0 +1,432 @@
+
+
+1. 驱动文件层次
+
+drivers/irqchip/irq-gic-v3.c;
+	drivers/irqchip/irq-gic-v3-its.c;
+
+		irq-gic-v3-its-platform-msi.c;
+			drivers/base/platform-msi.c;
+				drivers/irqchip/irq-mbigen.c;
+
+
+
+2. domain创建
+
+对于DTS，
+
+IRQCHIP_DECLARE(gic_v3, "arm,gic-v3", gic_of_init);
+
+
+
+
+对于 ACPI，
+IRQCHIP_ACPI_DECLARE(gic_v3, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR,
+		     acpi_validate_gic_table, ACPI_MADT_GIC_VERSION_V3,
+		     gic_acpi_init);
+
+
+这个是总入口：
+
+void __init irqchip_init(void)
+{
+	of_irq_init(__irqchip_of_table);
+	acpi_probe_device_table(irqchip);
+}
+
+会遍历使用以上宏定义的 irq entry。
+
+
+下面跟踪 OF的处理过程，
+
+static int __init gic_of_init(struct device_node *node, struct device_node
+*parent)
+	--> gic_init_bases
+		--> its_init(handle, &gic_data.rdists, gic_data.domain)
+			--> its_of_probe(of_node)
+				--> its_probe_one(&res, &np->fwnode,
+						of_node_to_nid(np));
+					--> its_init_domain(handle, its)
+这里传入的 its是 ‘struct its_node *its‘；
+
+	gic_data.domain = irq_domain_create_tree(handle, &gic_irq_domain_ops,
+						 &gic_data);
+
+因此，top domain的struct irq_domain_ops是 gic_irq_domain_ops，host_data 是
+static struct gic_chip_data gic_data __read_mostly，在
+gic_init_bases()中初始化。
+
+
+2.1 irqchip_init --> of_irq_init(__irqchip_of_table)
+
+因此，这里从 of_irq_init(__irqchip_of_table)开始。
+
+
+2.1.1 符号 __irqchip_of_table
+
+__irqchip_of_table 是 指向 struct of_device_id __irqchip_of_table[]；
+这里的 符号 __irqchip_of_table在 vmlinux.lds.h中采用宏定义：
+
+	#define IRQCHIP_OF_MATCH_TABLE() OF_TABLE(CONFIG_IRQCHIP, irqchip)
+在 CONFIG_IRQCHIP配置的情况下， _OF_TABLE_1(irqchip)会被调用而定义
+__irqchip_of_table的符号。
+
+
+通过 #define IRQCHIP_DECLARE(name, compat, fn) OF_DECLARE_2(irqchip, name,
+compat, fn) 来定义的。如下：
+	IRQCHIP_DECLARE(gic_v3, "arm,gic-v3", gic_of_init);
+
+2.1.2 of_irq_init(const struct of_device_id *matches)
+
+这里的 *matches 一般是指向 全局符号 __irqchip_of_table[].
+
+对于ARM64, gic-v3的典型定义为：
+	IRQCHIP_DECLARE(gic_v3, "arm,gic-v3", gic_of_init);
+
+因此，在DTS中compatible
+属性匹配"arm,gic-v3"且具有"interrupt-controller"的节点在of_irq_init()中首先会被添加到本地intc_desc_list链表中，且根据配置设置了desc->interrupt_parent
+指向具有 "#interrupt-cells" 的parent节点。
+
+然后 会遍历 intc_desc_list链表，将具有相同
+parent节点的扫描出来后按序挂入到intc_parent_list表中。按照算法，interrupt_parent为NULL的会作为top节点先挂入，之后将interrupt_parent为NULL的节点的child
+intc节点挂入 intc_parent_list。这样的结果是
+top节点在最前面，之后是child。从而会实现从 top到child这两个层次来触发
+desc->irq_init_cb()的调用。
+
+
+
+2.2 GIC-V3 top domain的创建
+
+在 of_irq_init()中，会调用到 gic-v3的初始化函数 gic_of_init：
+			ret = desc->irq_init_cb(desc->dev,
+						desc->interrupt_parent);
+
+这里的 desc->dev是指向 "arm,gic-v3"的节点， desc->interrupt_parent应该是 NULL。
+因为
+		desc->interrupt_parent = of_irq_find_parent(np);
+		if (desc->interrupt_parent == np)
+在 gic_of_init()中会通过以下处理创建 top domain:
+
+	err = gic_init_bases(dist_base, rdist_regs, nr_redist_regions,
+		     redist_stride, &node->fwnode);
+		--> gic_data.domain = irq_domain_create_tree(handle,
+			&gic_irq_domain_ops, &gic_data);
+
+因此 gic-v3控制器对应的 domain的相关数据结构是：
+	gic_irq_domain_ops, static struct gic_chip_data gic_data __read_mostly;
+
+static const struct irq_domain_ops gic_irq_domain_ops = {
+	.translate = gic_irq_domain_translate,
+	.alloc = gic_irq_domain_alloc,
+	.free = gic_irq_domain_free,
+	.select = gic_irq_domain_select,
+};
+
+2.3 gic its的domain创建
+
+在 gic_init_bases()中，以下处理会初始化ITS:
+
+	if (IS_ENABLED(CONFIG_ARM_GIC_V3_ITS) && gic_dist_supports_lpis())
+		its_init(handle, &gic_data.rdists, gic_data.domain);
+
+这里的 'handle'指向 gic-v3对应的设备， gic_data.domain是top domain;
+
+对于 OF模式， ITS domain的创建在 its_init()中通过以下处理完成：
+	if (of_node)
+		its_of_probe(of_node);
+
+请注意，这里的 'of_node'是指向 gic-v3控制器设备的。
+
+	for (np = of_find_matching_node(node, its_device_id); np;
+	     np = of_find_matching_node(np, its_device_id)) {
+		if (!of_property_read_bool(np, "msi-controller")) {
+			pr_warn("%s: no msi-controller property, ITS ignored\n",
+				np->full_name);
+			continue;
+		}
+
+		if (of_address_to_resource(np, 0, &res)) {
+			pr_warn("%s: no regs?\n", np->full_name);
+			continue;
+		}
+
+		its_probe_one(&res, &np->fwnode, of_node_to_nid(np));
+	}
+
+因此上面的
+for循环是遍历gic-v3控制器下的具有msi-controller且compatible匹配"arm,gic-v3-its"的后裔。
+对匹配的调用：
+	its_probe_one(&res, &np->fwnode, of_node_to_nid(np));
+		--> err = its_init_domain(handle, its);
+
+其中的'its'是指向一个 动态分配的 struct its_node 变量。
+static int its_init_domain(struct fwnode_handle *handle, struct its_node *its)
+{
+	struct irq_domain *inner_domain;
+	struct msi_domain_info *info;
+
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+
+	inner_domain = irq_domain_create_tree(handle, &its_domain_ops, its);
+	if (!inner_domain) {
+		kfree(info);
+		return -ENOMEM;
+	}
+
+	inner_domain->parent = its_parent;
+	inner_domain->bus_token = DOMAIN_BUS_NEXUS;
+	inner_domain->flags |= IRQ_DOMAIN_FLAG_MSI_REMAP;
+	info->ops = &its_msi_domain_ops;
+	info->data = its;
+	inner_domain->host_data = info;
+
+	return 0;
+}
+
+来真正完成domain的initialization. 其中 handle是 gic-v3-its的设备，
+its_domain_ops是对应的 struct irq_domain_ops， its_node是此domain的 host_data.
+
+static const struct irq_domain_ops its_domain_ops = {
+	.alloc			= its_irq_domain_alloc,
+	.free			= its_irq_domain_free,
+	.activate		= its_irq_domain_activate,
+	.deactivate		= its_irq_domain_deactivate,
+};
+但是经过 its_init_domain()后， host_data被改变设置为：
+	inner_domain->parent = its_parent;
+	inner_domain->bus_token = DOMAIN_BUS_NEXUS;
+	inner_domain->flags |= IRQ_DOMAIN_FLAG_MSI_REMAP;
+	info->ops = &its_msi_domain_ops;
+	info->data = its;
+	inner_domain->host_data = info;
+对应的是一个 struct msi_domain_info节点。只是struct its_node 作为了
+info->data而保存。
+
+
+2.4 its platform 的domain创建
+
+static int __init its_pmsi_init(void)
+{
+	its_pmsi_of_init();
+	its_pmsi_acpi_init();
+	return 0;
+}
+early_initcall(its_pmsi_init);
+
+
+static void __init its_pmsi_of_init(void)
+{
+	struct device_node *np;
+
+	for (np = of_find_matching_node(NULL, its_device_id); np;
+	     np = of_find_matching_node(np, its_device_id)) {
+		if (!of_property_read_bool(np, "msi-controller"))
+			continue;
+
+		its_pmsi_init_one(of_node_to_fwnode(np), np->full_name);
+	}
+}
+请注意，这里的 its_device_id 是：
+static struct of_device_id its_device_id[] = {
+	{	.compatible	= "arm,gic-v3-its",	},
+	{},
+};
+因此，对于 “arm,gic-v3-its"的设备，会多初始化一个 its platform 的domain:
+	its_pmsi_init_one(of_node_to_fwnode(np), np->full_name);
+
+只是此 its platform domain的parent domain不是 gic-v3对应的  top
+domain，而是irq-gic-v3-its.c中创建的 ITS domain（具有
+DOMAIN_BUS_NEXUS的bus_token).
+
+static int __init its_pmsi_init_one(struct fwnode_handle *fwnode,
+				const char *name)
+{
+	struct irq_domain *parent;
+
+	parent = irq_find_matching_fwnode(fwnode, DOMAIN_BUS_NEXUS);
+	if (!parent || !msi_get_domain_info(parent)) {
+		pr_err("%s: unable to locate ITS domain\n", name);
+		return -ENXIO;
+	}
+
+	if (!platform_msi_create_irq_domain(fwnode, &its_pmsi_domain_info,
+					    parent)) {
+		pr_err("%s: unable to create platform domain\n", name);
+		return -ENXIO;
+	}
+
+	pr_info("Platform MSI: %s domain created\n", name);
+	return 0;
+}
+
+在 platform_msi_create_irq_domain()中， 'fwnode' 指向 gic-v3-its的设备，struct
+msi_domain_info *info指向的是全局 its_pmsi_domain_info, parent是
+gic-v3-its.c中的 ITS domain；
+
+platform_msi_create_irq_domain()会调用：
+struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+					 struct msi_domain_info *info,
+					 struct irq_domain *parent)
+{
+	if (info->flags & MSI_FLAG_USE_DEF_DOM_OPS)
+		msi_domain_update_dom_ops(info);
+	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
+		msi_domain_update_chip_ops(info);
+
+	return irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					   fwnode, &msi_domain_ops, info);
+}
+
+因此， 全局 struct irq_domain_ops 的msi_domain_ops 和 its_pmsi_domain_info
+会作为its platform domain的关键数据。
+需特别注意的是， 此 its platform domain的 bus_token是：
+	domain->bus_token = DOMAIN_BUS_PLATFORM_MSI；
+
+此its platform domain会被 irq-mbigen.c的 mbigen_of_create_domain() -->
+platform_msi_create_device_domain --> platform_msi_alloc_priv_data 中作为
+dev->msi_domain指向的domain 对象，而成为 mbigen domain的 parent domain。
+请参考 platform_msi_create_device_domain --> irq_domain_create_hierarchy 。
+
+请注意，这里创建的 mbigen domain是 linear的，且 struct irq_domain_ops 是
+mbigen_domain_ops； mbigen_of_create_domain()传入的host_data是指向
+struct mbigen_device的。参考 irq-mbigen.c中的：
+
+static int mbigen_of_create_domain(struct platform_device *pdev,
+				   struct mbigen_device *mgn_chip)
+{
+	struct device *parent;
+	struct platform_device *child;
+	struct irq_domain *domain;
+	struct device_node *np;
+	u32 num_pins;
+
+	for_each_child_of_node(pdev->dev.of_node, np) {
+		if (!of_property_read_bool(np, "interrupt-controller"))
+			continue;
+
+		parent = platform_bus_type.dev_root;
+		child = of_platform_device_create(np, NULL, parent);
+		if (!child)
+			return -ENOMEM;
+
+		if (of_property_read_u32(child->dev.of_node, "num-pins",
+					 &num_pins) < 0) {
+			dev_err(&pdev->dev, "No num-pins property\n");
+			return -EINVAL;
+		}
+
+		domain = platform_msi_create_device_domain(&child->dev,
+					num_pins, mbigen_write_msg,
+					&mbigen_domain_ops,
+					mgn_chip);
+		if (!domain)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
+但是在 platform_msi_create_device_domain()真正创建domain时， struct
+mbigen_device *mgn_chip 被作为 动态分配struct platform_msi_priv_data *data的
+host_data而保存。真正的 mbigen domain的host_data是struct
+platform_msi_priv_data：
+
+struct irq_domain *
+platform_msi_create_device_domain(struct device *dev,
+				  unsigned int nvec,
+				  irq_write_msi_msg_t write_msi_msg,
+				  const struct irq_domain_ops *ops,
+				  void *host_data)
+{
+	struct platform_msi_priv_data *data;
+	struct irq_domain *domain;
+	int err;
+
+	data = platform_msi_alloc_priv_data(dev, nvec, write_msi_msg);
+	if (IS_ERR(data))
+		return NULL;
+
+	data->host_data = host_data;
+	domain = irq_domain_create_hierarchy(dev->msi_domain, 0, nvec,
+					     dev->fwnode, ops, data);
+	if (!domain)
+		goto free_priv;
+
+	err = msi_domain_prepare_irqs(domain->parent, dev, nvec, &data->arg);
+	if (err)
+		goto free_domain;
+
+	return domain;
+	...
+}
+
+struct platform_msi_priv_data的节点在
+platform_msi_alloc_priv_data()中动态分配并适度初始化。
+
+在下面的调用中会使用 its platform domain的 domain->host_data,也就是 struct
+msi_domain_info中的 struct msi_domain_ops，也就是 its_pmsi_domain_info中定义的
+its_pmsi_ops：
+	err = msi_domain_prepare_irqs(domain->parent, dev, nvec, &data->arg);
+
+		--> ops->msi_check()
+		--> ops->msi_prepare()
+分别为 msi_domain_ops_default.msi_check， its_pmsi_prepare；
+这里 msi_domain_prepare_irqs()的 domain->parent是its platform domain.
+
+请注意， 这里的 ops是 struct msi_domain_info中的 struct msi_domain_ops， 不是irq
+domain中的struct irq_domain_ops。该 struct msi_domain_ops是通过
+msi_domain_prepare_irqs()使用 domain->host_data 指向的 struct
+msi_domain_info来触发调用的。这是适用于 platform msi设备的：
+platform-msi.c ：
+
+	platform_msi_create_device_domain --> msi_domain_prepare_irqs
+
+请注意， platform_msi_create_device_domain是创建的 platform msi device的
+domain，不是 its platform domain！ 后者是调用
+platform_msi_create_irq_domain()来创建 domain的！
+
+msi_domain_prepare_irqs()通过 ops->msi_prepare最终调用its_pmsi_prepare()：
+	ret = ops->msi_prepare(domain, dev, nvec, arg);
+请注意，这里的 arg是 指向 struct platform_msi_priv_data 中的 msi_alloc_info_t
+arg，也就是 its_pmsi_prepare()中的第四个参数。'domain'是指向 msi platform
+domain的。'dev' 是msi platform device，也就是mbigen 下的intc device，例如
+mbigen_usb，'nvec'来自 "num-pins"的配置；
+在 its_pmsi_prepare()中主要两件事情，一个是 解析“msi-parent = <&its_dsa
+0x40080>;"配置的第二个参数作为dev_id,保存到
+传入的msi_alloc_info_t结构中，也就是info->scratchpad[0].ul = dev_id;
+另外一个是 上溯调用 msi platform domain的parent domain的 struct
+msi_domain_info中的 struct msi_domain_ops的 ops->msi_prepare钩子，如下：
+
+	return msi_info->ops->msi_prepare(domain->parent,
+					  dev, nvec, info);
+
+也就是 its_msi_domain_ops 中的 its_msi_prepare。
+
+
+static int its_msi_prepare(struct irq_domain *domain, struct device *dev,
+			   int nvec, msi_alloc_info_t *info)
+
+请注意， 'domain'是指向 ITS domain,但是'*dev'指向的是 mbigen的设备， '*info'
+也是来自 struct platform_msi_priv_data中的 msi_alloc_info_t 成员。
+
+its_msi_prepare()的关键处理是：
+	its_dev = its_create_device(its, dev_id, nvec);
+会动态分配并初始化一个 struct its_device结构，用于构建对应
+mbigen的intc设备的DTE。 此过程是会调用到 its_create_device -->
+its_send_mapd(dev, 1)；
+而生成的 struct its_device 会保存到 调用its_msi_prepare是传入的
+msi_alloc_info_t 中：
+	info->scratchpad[0].ptr = its_dev;
+
+请注意，这里的 its_msi_prepare()处理是对 PCI MSI和 MSI platform 通用的。 MSI
+platform的特定处理 是在 its_pmsi_prepare()中完成的。
+
+
+
+
+
+
+
+

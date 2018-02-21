@@ -1,0 +1,75 @@
+
+After mnt_init(), a memory root filesystem had been setup. But this is an empty
+file system. Kernel needs to load a valid filesystem from some device, such as
+the boot partition of hard-disk.
+
+That is what the kernel parameter of 'root=xxx' will do.
+The corresponding handling function is prepare_namespace().
+
+saved_root_name[] is from the parsing of 'root=xxx';
+And 'ROOT_DEV = name_to_dev_t(root_device_name);';
+
+	--> mount_root();
+	devtmpfs_mount("dev");
+	sys_mount(".", "/", NULL, MS_MOVE, NULL);
+	sys_chroot(".");
+
+
+void __init mount_root(void)
+{
+	...
+#ifdef CONFIG_BLOCK
+	{
+		int err = create_dev("/dev/root", ROOT_DEV);
+
+		if (err < 0)
+			pr_emerg("Failed to create /dev/root: %d\n", err);
+		mount_block_root("/dev/root", root_mountflags);
+	}
+#endif
+}
+
+static inline int create_dev(char *name, dev_t dev)
+{
+	sys_unlink(name);
+	return sys_mknod(name, S_IFBLK|0600, new_encode_dev(dev));
+}
+
+sys_mknod is defined in fs/namei.c :
+
+SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned,
+dev)
+{
+	return sys_mknodat(AT_FDCWD, filename, mode, dev);
+}
+
+SYSCALL_DEFINE4(mknodat, int, dfd, const char __user *, filename, umode_t, mode,
+		unsigned, dev)
+
+
+in init/do_mounts.c :
+void __init mount_block_root(char *name, int flags)
+	---> do_mount_root(char *name, char *fs, int flags, void *data)
+		--> sys_mount(name, "/root", fs, flags, data);
+
+in fs/namespace.c :
+
+SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
+		char __user *, type, unsigned long, flags, void __user *, data)
+
+1. mknod
+
+1.1 user_path_create
+
+dentry = user_path_create(dfd, filename, &path, lookup_flags);
+	--> filename_create(dfd, getname(pathname), path, lookup_flags)
+
+
+
+1.2 vfs_mknod
+		case S_IFCHR: case S_IFBLK:
+			error = vfs_mknod(path.dentry->d_inode,dentry,mode,
+					new_decode_dev(dev));
+
+
+

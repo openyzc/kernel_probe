@@ -1,0 +1,15 @@
+
+for x86_32, in arch/x86/entry/entry_32.S :
+
+ENTRY(page_fault)
+	ASM_CLAC
+	pushl	$do_page_fault
+	ALIGN
+	jmp common_exception
+END(page_fault)
+
+而对于X86_64, 在 arch/x86/entry/entry.S ,有：
+
+trace_idtentry page_fault	do_page_fault		has_error_code=1
+
+

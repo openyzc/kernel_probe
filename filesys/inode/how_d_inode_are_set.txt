@@ -1,0 +1,28 @@
+
+
+In struct dentry, there is a field of 'struct inode *d_inode'. It will be
+applied to the 'struct file_operations	*f_op' of struct file in
+do_dentry_open() :
+	f->f_op = fops_get(inode->i_fop);
+
+Then the 'f->f_op->open()' will be called in this way:
+	if (!open)
+		open = f->f_op->open;
+	if (open) {
+		error = open(inode, f);
+		if (error)
+			goto cleanup_all;
+	}
+
+*****So, this struct inode *d_inode is very important. How to setup this?
+We describe the ext4 filesystem.
+
+
+d_instantiate(struct dentry *entry, struct inode * inode) -->
+__d_instantiate(struct dentry *dentry, struct inode *inode)  -->
+__d_set_inode_and_type()
+
+
+Normally, the inode->i_fop will point to 'ext4_file_operations';
+
+

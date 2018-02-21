@@ -1,0 +1,94 @@
+
+1. pte_t to swp_entry_t
+
+static inline swp_entry_t pte_to_swp_entry(pte_t pte)
+{
+	swp_entry_t arch_entry;
+
+	if (pte_swp_soft_dirty(pte))
+		pte = pte_swp_clear_soft_dirty(pte);
+	arch_entry = __pte_to_swp_entry(pte);
+	return swp_entry(__swp_type(arch_entry), __swp_offset(arch_entry));
+}
+
+---The structure of swap pte ----------
+
+The pte value encode 'offset' and 'type' like that on X86_64:
+bit idx    ...        14 | 13 | 12 | 11| 10|  9|8|7|6|5| 4| 3|2|1|0| 
+bit val    ...    offset |SW5 |SW4 |SW3|SW2|SW1|G|L|D|A|CD|WT|U|W|P|
+
+So, these two can decode the pte_t to get the 'offset' and 'type'
+
+#define __swp_type(x)			(((x).val >> (SWP_TYPE_FIRST_BIT)) \
+					 & ((1U << SWP_TYPE_BITS) - 1))
+#define __swp_offset(x)			((x).val >> SWP_OFFSET_FIRST_BIT)
+
+
+This __swp_entry(type, offset) will encode the pte_t :
+
+#define __swp_entry(type, offset)	((swp_entry_t) { \
+					 ((type) << (SWP_TYPE_FIRST_BIT)) \
+					 | ((offset) << SWP_OFFSET_FIRST_BIT) })
+
+On x86_32, it seems pte_t will not include the 9 LSB as x86_64:
+#define __swp_type(x)			(((x).val) & 0x1f)
+#define __swp_offset(x)			((x).val >> 5)
+#define __swp_entry(type, offset)	((swp_entry_t){(type) | (offset) << 5})
+
+#define __swp_entry(type, offset)	((swp_entry_t){(type) | (offset) << 5})
+
+That swap pte is x86-specific, that is to say, architecture-dependent.
+
+
+The struct of 'swp_entry_t' is defined like that:
+
+0 ~ (sizeof(e.val) * 8) - (MAX_SWAPFILES_SHIFT + RADIX_TREE_EXCEPTIONAL_SHIFT)
+is the swap offset;
+
+The highest (MAX_SWAPFILES_SHIFT + RADIX_TREE_EXCEPTIONAL_SHIFT) is the swap
+type;
+
+These are defined in public header, include/linux/swapops.h;
+
+swp_entry(unsigned long type, pgoff_t offset) is to construct the 'swp_entry_t';
+swp_type(swp_entry_t entry) is to parse the swap type from 'swp_entry_t';
+swp_offset(swp_entry_t entry) is to fetch the swap offset from 'swp_entry_t';
+
+
+
+static inline pte_t swp_entry_to_pte(swp_entry_t entry)
+{
+	swp_entry_t arch_entry;
+
+	arch_entry = __swp_entry(swp_type(entry), swp_offset(entry));
+	return __swp_entry_to_pte(arch_entry);
+}
+
+This function will convert the swp_entry_t to pte_t;
+
+
+2. How to use the swp type value?
+
+
+#define MAX_SWAPFILES \
+	((1 << MAX_SWAPFILES_SHIFT) - SWP_MIGRATION_NUM - SWP_HWPOISON_NUM)
+
+
+So, the top (SWP_MIGRATION_NUM + SWP_HWPOISON_NUM) value of the swap type is
+assigned to SWP_HWPOISON and SWP_MIGRATION: 
+
+This range is for SWP_HWPOISION:
+|MAX_SWAPFILES| ...| MAX_SWAPFILES + SWP_HWPOISON_NUM - 1|
+
+This range is for SWP_MIGRATION:
+|MAX_SWAPFILES + SWP_HWPOISON_NUM|...|(MAX_SWAPFILES + SWP_HWPOISON_NUM)
++ SWP_MIGRATION_NUM - 1|
+
+And the value below MAX_SWAPFILES are for swap_entry, you can refer to:
+
+static inline int non_swap_entry(swp_entry_t entry)
+{
+	return swp_type(entry) >= MAX_SWAPFILES;
+}
+
+

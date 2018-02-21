@@ -1,0 +1,28 @@
+
+
+The call path is :
+
+setup_arch --> x86_init.paging.pagetable_init() --> native_pagetable_init
+
+	.paging = {
+		.pagetable_init		= native_pagetable_init,
+	},
+
+
+On X86_64,
+	#define native_pagetable_init        paging_init
+
+On x86_32, in arch/x86/kernel/init_32.c :
+void __init native_pagetable_init(void)
+{
+	...
+}
+
+These two will both call paging_init() in the end. But for X86_32, it will first
+clean the page tables for memory range over max_low_pfn. I have some doubts
+about that, where these page tables are setup for the range over max_low_pfn??
+
+We know init_mem_mapping() only build the mapping below max_low_pfn.
+
+
+

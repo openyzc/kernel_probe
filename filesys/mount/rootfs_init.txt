@@ -1,0 +1,377 @@
+
+The call path is :
+
+start_kernel --> vfs_caches_init --> mnt_init
+	init_rootfs();
+	init_mount_tree();
+
+
+I want to give some notes on :
+void *__init alloc_large_system_hash(const char *tablename,
+				     unsigned long bucketsize,
+				     unsigned long numentries,
+				     int scale,
+				     int flags,
+				     unsigned int *_hash_shift,
+				     unsigned int *_hash_mask,
+				     unsigned long low_limit,
+				     unsigned long high_limit)
+
+Here, 'scale' makes sense only when the 'numentries' is 0.
+The value of 'scale' represents the entry memory proportion of
+'1 entry per 2^scale bytes';
+
+'*_hash_shift' and '*_hash_mask' are the entry index bit size and the bitmask.
+
+
+1. void __init mnt_init(void)
+
+This is the entry where kernel rootfs is setup.
+
+	--> init_rootfs();
+	--> init_mount_tree();
+
+2. init_rootfs
+
+register some filesystems:
+
+static struct file_system_type rootfs_fs_type = {
+	.name		= "rootfs",
+	.mount		= rootfs_mount,
+	.kill_sb	= kill_litter_super,
+};
+
+For CONFIG_TMPFS is disabled, which is the normal case:
+
+static struct file_system_type ramfs_fs_type = {
+	.name		= "ramfs",
+	.mount		= ramfs_mount,
+	.kill_sb	= ramfs_kill_sb,
+	.fs_flags	= FS_USERNS_MOUNT,
+};
+
+
+3. static void __init init_mount_tree(void)
+
+This is the core:
+	type = get_fs_type("rootfs");
+	if (!type)
+		panic("Can't find rootfs type");
+	mnt = vfs_kern_mount(type, 0, "rootfs", NULL);
+
+create the struct mnt_namespace and bind it with the root mount point newly :
+
+	ns = create_mnt_ns(mnt);
+	if (IS_ERR(ns))
+		panic("Can't allocate initial namespace");
+
+	init_task.nsproxy->mnt_ns = ns;
+	get_mnt_ns(ns);
+
+setup the current->fs->pwd, current->fs->root to the newly struct path which
+points to the root mount point:
+
+	root.mnt = mnt;
+	root.dentry = mnt->mnt_root;
+	mnt->mnt_flags |= MNT_LOCKED;
+
+	set_fs_pwd(current->fs, &root);
+	set_fs_root(current->fs, &root);
+
+4. mount rootfs filesystem
+
+init_mount_tree() --> mnt = vfs_kern_mount(type, 0, "rootfs", NULL)
+	--> root = mount_fs(type, flags, name, data)
+		--> rootfs_mount(type, flags, name, data)
+
+
+static struct dentry *rootfs_mount(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data)
+{
+	static unsigned long once;
+	void *fill = ramfs_fill_super;
+
+	if (test_and_set_bit(0, &once))
+		return ERR_PTR(-ENODEV);
+
+	if (IS_ENABLED(CONFIG_TMPFS) && is_tmpfs)
+		fill = shmem_fill_super;
+
+	return mount_nodev(fs_type, flags, data, fill);
+}
+
+
+so, ramfs_fill_super() and mount_nodev() should work.
+
+struct dentry *mount_nodev(struct file_system_type *fs_type,
+	int flags, void *data,
+	int (*fill_super)(struct super_block *, void *, int))
+{
+	int error;
+	struct super_block *s = sget(fs_type, NULL, set_anon_super, flags,
+NULL);
+
+	if (IS_ERR(s))
+		return ERR_CAST(s);
+
+/*here, ramfs_fill_super() will be called...*/
+	error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+	if (error) {
+		deactivate_locked_super(s);
+		return ERR_PTR(error);
+	}
+	s->s_flags |= MS_ACTIVE;
+	return dget(s->s_root);
+}
+
+4.1 How to intialize the super_block?
+
+For rootfs, the call path is:
+
+mount_nodev
+--> sget(fs_type, NULL, set_anon_super, flags, NULL)
+	--> sget_userns(type, test, set, flags, user_ns, data)
+		--> set_anon_super()
+			--> get_anon_bdev(&s->s_dev)
+--> ramfs_fill_super(s, data, flags & MS_SILENT ? 1 : 0)
+
+
+4.1.1 sget
+This get_anon_bdev(&s->s_dev) will allocate a dev id from radix tree of
+unnamed_dev_ida and store into s->s_dev.
+
+Then setup the relation between struct file_system_type and the struct
+super_block :
+
+	s->s_type = type;
+	strlcpy(s->s_id, type->name, sizeof(s->s_id));
+	list_add_tail(&s->s_list, &super_blocks);
+	hlist_add_head(&s->s_instances, &type->fs_supers);
+
+1) a super block corresponds to one partition; I think;
+2) it is possible there are several partitions with the same file_system_type;
+	s->s_type points to the file_system_type this mount happens;
+	super_blocks: a global list of super_blocks where all super_block in use
+	are linked;
+	s->s_instances and type->fs_supers : the struct super_block node will be
+	linked into the 'fs_supers' list of struct file_system_type where this
+	super_block is mounted; each new struct super_block node will be
+	inserted as the first node of 'type->fs_supers' through the
+	's->s_instances' node.
+
+static inline void hlist_add_head(struct hlist_node *n, struct hlist_head *h)
+{
+	struct hlist_node *first = h->first;
+	n->next = first;
+	if (first)
+		first->pprev = &n->next;
+	WRITE_ONCE(h->first, n);
+	n->pprev = &h->first;
+}
+
+	-------------
+	| fs_supers |
+	-------------
+	| h->first  |
+	-------------		   first->pprev
+	    |	^ n->pprev	|----------------
+	    V   |		V		|
+	---------------------  next	----------------------
+	| s->instances	    | ----->	| s->instances	     |
+	---------------------		----------------------
+	| struct super_block|		| struct super_block |
+	---------------------		----------------------
+
+
+4.1.2 ramfs_fill_super
+
+int ramfs_fill_super(struct super_block *sb, void *data, int silent)
+{
+	struct ramfs_fs_info *fsi;
+	struct inode *inode;
+	int err;
+
+	save_mount_options(sb, data);
+
+	fsi = kzalloc(sizeof(struct ramfs_fs_info), GFP_KERNEL);
+	sb->s_fs_info = fsi;
+	if (!fsi)
+		return -ENOMEM;
+
+	err = ramfs_parse_options(data, &fsi->mount_opts);
+	if (err)
+		return err;
+
+	sb->s_maxbytes		= MAX_LFS_FILESIZE;
+	sb->s_blocksize		= PAGE_SIZE;
+	sb->s_blocksize_bits	= PAGE_SHIFT;
+	sb->s_magic		= RAMFS_MAGIC;
+	sb->s_op		= &ramfs_ops;
+	sb->s_time_gran		= 1;
+
+	inode = ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+
+	return 0;
+}
+
+1) continue to initialize the struct super_block node
+
+	fsi = kzalloc(sizeof(struct ramfs_fs_info), GFP_KERNEL);
+	sb->s_fs_info = fsi;
+	if (!fsi)
+		return -ENOMEM;
+
+	err = ramfs_parse_options(data, &fsi->mount_opts);
+	...
+	sb->s_op		= &ramfs_ops;
+
+4.2 initialize 'struct inode'
+
+setup struct inode for this struct super_block :
+
+inode = ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
+	--> struct inode * inode = new_inode(sb);
+		--> inode = new_inode_pseudo(sb);
+			--> struct inode *inode = alloc_inode(sb);
+				--> inode_init_always(sb, inode)
+				/* inode->i_sb = sb;
+				 * initialize the 'inode->i_data';
+				 */
+		/* setup the relation between struct inode and struct
+ 		 * super_block.
+		 * list_add(&inode->i_sb_list, &inode->i_sb->s_inodes);
+		 * all the inode belong to some super_block will be linked into
+		 * the 'struct list_head s_inodes' of struct super_block.
+		 */
+		--> inode_sb_list_add(inode);
+
+/* the remain handlings are to continue initialize the struct inode...*/
+		inode->i_ino = get_next_ino();
+		...
+		inode->i_mapping->a_ops = &ramfs_aops;
+		...
+		case S_IFDIR:
+			inode->i_op = &ramfs_dir_inode_operations;
+			inode->i_fop = &simple_dir_operations;
+
+4.3 initialize 'struct dentry'
+
+setup the struct dentry that corresponds to struct inode :
+
+	sb->s_root = d_make_root(inode);
+
+struct dentry *d_make_root(struct inode *root_inode)
+{
+	struct dentry *res = NULL;
+
+	if (root_inode) {
+		res = __d_alloc(root_inode->i_sb, NULL);
+		if (res)
+			d_instantiate(res, root_inode);
+		else
+			iput(root_inode);
+	}
+	return res;
+}
+
+
+struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
+{
+	...
+/* initialize the dentry->d_name with the 'struct qstr *name'; */
+	dentry->d_name.len = name->len;
+	dentry->d_name.hash = name->hash;
+	memcpy(dname, name->name, name->len);
+	dname[name->len] = 0;
+
+	/* Make sure we always see the terminating NUL character */
+	smp_wmb();
+	dentry->d_name.name = dname;
+	...
+	dentry->d_inode = NULL;
+	dentry->d_parent = dentry;
+	dentry->d_sb = sb;
+	dentry->d_op = NULL;
+	dentry->d_fsdata = NULL;
+	INIT_HLIST_BL_NODE(&dentry->d_hash);
+	INIT_LIST_HEAD(&dentry->d_lru);
+	INIT_LIST_HEAD(&dentry->d_subdirs);
+	INIT_HLIST_NODE(&dentry->d_u.d_alias);
+	INIT_LIST_HEAD(&dentry->d_child);
+	/* Here, will set dentry->d_op with 'dentry->d_sb->s_d_op'; */
+	d_set_d_op(dentry, dentry->d_sb->s_d_op);
+	...
+}
+
+continue to initialize the struct dentry:
+
+void d_instantiate(struct dentry *entry, struct inode * inode)
+{
+	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
+	if (inode) {
+		security_d_instantiate(entry, inode);
+		spin_lock(&inode->i_lock);
+		__d_instantiate(entry, inode);
+		spin_unlock(&inode->i_lock);
+	}
+}
+
+static void __d_instantiate(struct dentry *dentry, struct inode *inode)
+{
+	unsigned add_flags = d_flags_for_inode(inode);
+	WARN_ON(d_in_lookup(dentry));
+
+	spin_lock(&dentry->d_lock);
+	/* link this 'struct dentry' into 'struct inode'; */
+	hlist_add_head(&dentry->d_u.d_alias, &inode->i_dentry);
+	raw_write_seqcount_begin(&dentry->d_seq);
+	/*
+	 * dentry->d_inode = inode;
+	 * WRITE_ONCE(dentry->d_flags, flags);
+	 */
+	__d_set_inode_and_type(dentry, inode, add_flags);
+	raw_write_seqcount_end(&dentry->d_seq);
+	fsnotify_update_flags(dentry);
+	spin_unlock(&dentry->d_lock);
+}
+
+inode->i_dentry : the header of the list where all 'struct dentry' nodes are
+	linked by 'dentry->d_u.d_alias';
+
+
+Up to now, the 'struct super_block', 'struct inode', 'struct dentry' had been
+initialized and setup the relations between them.
+
+/*
+ * The 's_root' is the struct dentry node where the root directory for this 'sb'
+ */
+	sb->s_root = d_make_root(inode);
+
+
+5. vfs_kern_mount
+
+	mnt->mnt.mnt_root = root;
+	mnt->mnt.mnt_sb = root->d_sb;
+	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+	mnt->mnt_parent = mnt;
+	lock_mount_hash();
+	list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+
+1) struct mount will work as a bridge to connect the 'struct dentry' of VFS and
+the 'struct super_block' of device;
+
+struct vfsmount {
+	struct dentry *mnt_root;	/* root of the mounted tree */
+	struct super_block *mnt_sb;	/* pointer to superblock */
+	int mnt_flags;
+};
+
+2) For root dentry, the 'mnt->mnt_mountpoint = mnt->mnt.mnt_root';
+
+3) the 'struct mount' will be linked with 'struct list_head	s_mounts;' of
+'struct super_block';
+
+ 

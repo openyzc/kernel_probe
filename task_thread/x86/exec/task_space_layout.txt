@@ -1,0 +1,163 @@
+
+
+1. an example of task space layout
+
+
+yzc@yzc-linaro:/proc/710$ sudo cat maps
+
+sudo: unable to resolve host yzc-linaro
+00400000-00401000 r-xp 00000000 08:03 22043183		/home/yzc/coding/linux/bin/elf/meminfo
+00600000-00601000 r--p 00000000 08:03 22043183		/home/yzc/coding/linux/bin/elf/meminfo
+00601000-00602000 rw-p 00001000 08:03 22043183		/home/yzc/coding/linux/bin/elf/meminfo
+7f810f486000-7f810f644000 r-xp 00000000 08:03 1312535	/lib/x86_64-linux-gnu/libc-2.19.so
+7f810f644000-7f810f844000 ---p 001be000 08:03 1312535	/lib/x86_64-linux-gnu/libc-2.19.so
+7f810f844000-7f810f848000 r--p 001be000 08:03 1312535	/lib/x86_64-linux-gnu/libc-2.19.so
+7f810f848000-7f810f84a000 rw-p 001c2000 08:03 1312535	/lib/x86_64-linux-gnu/libc-2.19.so
+7f810f84a000-7f810f84f000 rw-p 00000000 00:00 0 	7f810f84f000-7f810f872000 r-xp 00000000 08:03 1312543
+/lib/x86_64-linux-gnu/ld-2.19.so
+7f810fa48000-7f810fa4b000 rw-p 00000000 00:00 0 	7f810fa6e000-7f810fa71000 rw-p 00000000 00:00 0 
+7f810fa71000-7f810fa72000 r--p 00022000 08:03 1312543	/lib/x86_64-linux-gnu/ld-2.19.so
+7f810fa72000-7f810fa73000 rw-p 00023000 08:03 1312543	/lib/x86_64-linux-gnu/ld-2.19.so
+7f810fa73000-7f810fa74000 rw-p 00000000 00:00 0 
+7ffff5d31000-7ffff5d52000 rw-p 00000000 00:00 0                 [stack]
+7ffff5da3000-7ffff5da5000 r-xp 00000000 00:00 0                 [vdso]
+ffffffffff600000-ffffffffff601000 r-xp 00000000 00:00 0		[vsyscall]
+
+
+I think the above layout is based on the non-legacy MMAP mode.
+
+2. What space segments exist?
+
+From low address to High address:
+
+text/code	start_code ~ end_code
+data		start_data ~ end_data
+bss		elf_bss ~ elf_brk		all data are ZERO
+
+
+
+start_code: the minimal start VMA addr of all PT_LOAD process segments;
+end_code: the maximum end VMA addr of all PT_LOAD process segments with PF_X;
+start_data: maximum start VMA addr of all PT_LOAD process segments;
+end_data: the maximum end VMA addr of all PT_LOAD process segments;
+elf_bss: should be equal to end_data;
+elf_brk: decided by 'k = elf_ppnt->p_vaddr + elf_ppnt->p_memsz;'. As p_memsz >=
+		p_filesz, so elf_brk >= elf_bss;
+
+
+load_bias: only for ET_DYN binary file; The offset between the loading VMA
+address in process space and the virtual addr in binary file;
+			load_bias = ELF_ET_DYN_BASE - vaddr;
+			if (current->flags & PF_RANDOMIZE)
+				load_bias += arch_mmap_rnd();
+			load_bias = ELF_PAGESTART(load_bias);
+load_addr: The offset between the final mapped VMA addr in process space and the
+		local offset in binary file;
+
+			load_addr = (elf_ppnt->p_vaddr - elf_ppnt->p_offset);
+			if (loc->elf_ex.e_type == ET_DYN) {
+				load_bias += error -
+				             ELF_PAGESTART(load_bias + vaddr);
+				load_addr += load_bias;
+
+
+Except BSS, the other segments are mapped with the process space by elf_map()
+--> vm_mmap() at alignment boundary.
+
+For BSS, set_brk() will do.
+
+## If the file is ET_DYN, all the PT_LOAD segments will be tried to load at
+the place around ELF_ET_DYN_BASE with a randomized offset, arch_mmap_rnd();
+## load_elf_interp() will map the 'interpreter' file to the process space;
+
+## As for stack segment, please refer to "stack_frame_in_exec.txt"; In
+## setup_arg_pages(), maximum 'stack_expand = 131072UL;' space is reserved for
+## the future stack storage.
+
+
+3. The userland space layout for LEGACY mode
+
+STACK_TOP	-------------------------
+		| stack			|
+		|			|
+		-------------------------
+		|			|
+		|	mmap area	|
+		|			|
+		------------------------- <-- mm->mmap_legacy_base
+		| random offset		|
+		-------------------------- <-- (PAGE_ALIGN(task_size / 3)) 
+		|			|
+		|			|
+		|			|
+		-------------------------
+		|	BSS		|
+		-------------------------
+		|	DATA		|
+		-------------------------
+		|	CODE		|
+		-------------------------
+		| ...			|
+		-------------------------- <--- 0
+
+As for how to decide the mm->map_legacy_base, refer to:
+	arch_pick_mmap_base(&mm->mmap_base, &mm->mmap_legacy_base,
+			arch_rnd(mmap64_rnd_bits), tasksize_64bit());
+		--> mmap_legacy_base();
+
+
+4. The userland space layout of non-LEGACY mode
+
+The difference is the base address of mmap area is at HIGH address. mmaping
+will perform from TOP to BOTTOM;
+
+static unsigned long mmap_base(unsigned long rnd, unsigned long task_size)
+{
+	unsigned long gap = rlimit(RLIMIT_STACK);
+	unsigned long gap_min, gap_max;
+
+	/*
+	 * Top of mmap area (just below the process stack).
+	 * Leave an at least ~128 MB hole with possible stack randomization.
+	 */
+	gap_min = SIZE_128M + stack_maxrandom_size(task_size);
+	gap_max = (task_size / 6) * 5;
+
+	if (gap < gap_min)
+		gap = gap_min;
+	else if (gap > gap_max)
+		gap = gap_max;
+
+	return PAGE_ALIGN(task_size - gap - rnd);
+}
+
+So, the base of mmap area should be at least SIZE_128 less than TASK_SIZE_MAX.
+
+
+
+TASK TOP		-----------------  -----------
+			|	stack	|
+			|		|   size >= SIZE_128M
+<= (task_size / 6) * 5	|		|
+			-----------------  -----------
+			|random offset(*)| <-- stack_maxrandom_size(task_size)
+-----------		-------------------  
+			| random off2	|  <-- arch_rnd(mmap64_rnd_bits)
+			-----------------  <-- mm->mmap_base, must page-aligned
+			|		|
+			| mmap area	|
+			|		|
+			-----------------
+			|		|
+			|		|
+			|		|
+			-----------------
+			|	BSS	|
+			-----------------
+			|	DATA	|
+			-----------------
+			|	CODE	|
+			-----------------
+
+
+

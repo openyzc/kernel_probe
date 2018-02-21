@@ -1,0 +1,224 @@
+
+
+1. What is CONFIG_STACK_GROWSUP for?
+
+yzc@yzc-linaro:~/linaro/work_dir/its_v3/src$ grep -nrI 'STACK_GROWSUP' .
+--include=Kconfig*
+./mm/Kconfig:644:	depends on STACK_GROWSUP && (!64BIT || COMPAT)
+./arch/metag/Kconfig:65:config STACK_GROWSUP
+./arch/parisc/Kconfig:53:config STACK_GROWSUP
+
+
+in arch/metag/include/asm/processor.h :
+
+#define TASK_SIZE	PAGE_OFFSET
+/* Add an extra page of padding at the top of the stack for the guard page. */
+#define STACK_TOP	(TASK_SIZE - PAGE_SIZE)
+#define STACK_TOP_MAX	STACK_TOP
+/* Maximum virtual space for stack */
+#define STACK_SIZE_MAX	(CONFIG_MAX_STACK_SIZE_MB*1024*1024)
+
+
+in arch/parisc/include/asm/processor.h :
+
+#define STACK_TOP	TASK_SIZE
+#define STACK_TOP_MAX	DEFAULT_TASK_SIZE
+
+/* Allow bigger stacks for 64-bit processes */
+#define STACK_SIZE_MAX	(USER_WIDE_MODE					\
+			 ? (1 << 30)	/* 1 GB */			\
+			 : (CONFIG_MAX_STACK_SIZE_MB*1024*1024))
+
+
+In __bprm_mm_init(), the parameter area of the new thread is created like this:
+
+	vma->vm_end = STACK_TOP_MAX;
+	vma->vm_start = vma->vm_end - PAGE_SIZE;
+	...
+	bprm->p = vma->vm_end - sizeof(void *);
+
+
+This VMA will be extended in need as more parameter data are stored.
+You can refer to the copy_strings. All the parameters including environment and
+argument will be copied to VMA from high address to low address.
+	exec filename  ----> environment ----> argument
+
+bprm->exec will initially point to the environmen parameter in VMA;
+
+
+2. The construction of userland stack for new process/task
+
+
+In load_elf_binary():
+
+	retval = setup_arg_pages(bprm, randomize_stack_top(STACK_TOP),
+				 executable_stack);
+
+
+2.1 randomize_stack_top(STACK_TOP)
+
+This calling will produce a top stack address depended on the STACK mode,
+CONFIG_STACK_GROWSUP or not:
+
+static unsigned long randomize_stack_top(unsigned long stack_top)
+{
+	unsigned long random_variable = 0;
+
+	if ((current->flags & PF_RANDOMIZE) &&
+		!(current->personality & ADDR_NO_RANDOMIZE)) {
+		random_variable = get_random_long();
+		random_variable &= STACK_RND_MASK;
+		random_variable <<= PAGE_SHIFT;
+	}
+#ifdef CONFIG_STACK_GROWSUP
+	return PAGE_ALIGN(stack_top) + random_variable;
+#else
+	return PAGE_ALIGN(stack_top) - random_variable;
+#endif
+}
+
+1) the input 'stack_top' is STACK_TOP;
+2) STACK_RND_MASK is arch-dependent; For x86, (22 + PAGE_SHIFT)  or (11 +
+PAGE_SHIFT) 
+3) return the randomized top address for stack;
+
+2.2 The VMA layout before adjustment the stack
+
+	-----------------
+	| sizeof(*void)	|
+	-----------------	vma->vm_end
+	| filename	|
+	----------------- <--- bprm->exec (just after 'filename')
+	| env para	|
+	| args para	|
+	-----------------  <--- bprm->p	
+	|		|
+	|		|
+	-----------------	vma->vm_start
+
+
+2.3 How to adjust the VMA to a new stack?
+
+
+There are two case : CONFIG_STACK_GROWSUP and non-STACK_GROWSUP;
+
+1) CONFIG_STACK_GROWSUP
+
+We must select a reasonable vma->vm_start at first.
+
+
+	stack_base = rlimit_max(RLIMIT_STACK);
+	if (stack_base > STACK_SIZE_MAX)
+		stack_base = STACK_SIZE_MAX;
+
+	/* Add space for stack randomization. */
+	stack_base += (STACK_RND_MASK << PAGE_SHIFT);
+
+	/* Make sure we didn't let the argument array grow too large. */
+	if (vma->vm_end - vma->vm_start > stack_base)
+		return -ENOMEM;
+
+## The above codes decide what is the maximum stack size. It should include the
+## min(rlimit_max(RLIMIT_STACK), STACK_SIZE_MAX) + (STACK_RND_MASK <<
+## PAGE_SHIFT). The late partion is the maximum randomized gap.
+
+Then we can caculate the vma->vm_start :
+
+	stack_base = PAGE_ALIGN(stack_top - stack_base);
+The 'stack_base' should be the new vma->vm_start; And how much is the
+'stack_shift' we need to offset/move :
+
+	stack_shift = vma->vm_start - stack_base;
+
+
+stack_top	-----------------	----
+		| random size0	|	  ^
+STACK_TOP	-----------------	  |
+		| maximum stack	|	stack_base : maximum size(include rand)
+		|	size	|	  |
+		|		|	  |
+		-----------------	  |
+		| random size1	|	  V
+		-----------------   	---- PAGE_ALIGN(stack_top - stack_base)
+
+## random size 0 + random size 1 == STACK_RND_MASK
+
+
+The code of 'stack_shift = vma->vm_start - stack_base;' will get the offset
+between new VMA start which is stored in local variable of 'stack_base' and the
+original vma->vm_start;
+
+So, after moving 'stack_shift' bytes, the original VMA will become :
+
+
+STACK_TOP	-----------------
+		|		|
+		|	idle	|
+		|		|
+		----------------- <---- new vm_end / new bprm->p
+		| file name	|
+		| env para	|
+		| args para	|
+		----------------- <---- new mm->arg_start
+		| ...(probably)	|
+		----------------- <----- new vm_start
+
+	mm->arg_start = bprm->p - stack_shift;
+	bprm->p = vma->vm_end - stack_shift;
+
+As current stack is GROWSUP, the new 'bprm->p' should be moved based on vm_end;
+
+2) non-GROWSUP
+
+	stack_top = arch_align_stack(stack_top);
+	stack_top = PAGE_ALIGN(stack_top);
+
+	if (unlikely(stack_top < mmap_min_addr) ||
+	    unlikely(vma->vm_end - vma->vm_start >= stack_top - mmap_min_addr))
+		return -ENOMEM;
+
+## The 'stack_top = arch_align_stack(stack_top);' seems make no sense as
+'stack_top = PAGE_ALIGN(stack_top);' will make stack_top aligned with PAGE
+boundary.
+
+## mmap_min_addr is from /proc/sys/vm/mmap_min_addr;
+
+
+After randomize_stack_top(STACK_TOP), the VMA layout should be:
+
+STACK_TOP	-----------------
+		| random size	|
+		-		- <---- vma->vm_end(probably)
+		|		|
+		-----------------  <---- stack_top as input of setup_arg_pages
+		|		|
+		----------------- <--- vma->vm_end(probably)
+		| file name	|
+		----------------- <---- bprm->exec
+		| env para	|
+		| args para	|
+		----------------- <---- bprm->p
+		| ...(probably)	|
+		----------------- <---- vma->vm_start
+
+Then we can get the offset like this :
+	stack_shift = vma->vm_end - stack_top;
+
+After the move of original VMA, the new VMA will be :
+
+STACK_TOP	-----------------
+		| random size	|
+		----------------- <--- stack_top / new vma->vm_end
+		| file name	|
+		----------------- <--- new bprm->exec
+		| env para	|
+		| args para	|
+		----------------- <---- new bprm->p
+		| ...		|
+		----------------- <--- new vma->vm_start
+		|		|
+		|	idle	|
+		----------------- <--- mmap_min_addr
+
+
+

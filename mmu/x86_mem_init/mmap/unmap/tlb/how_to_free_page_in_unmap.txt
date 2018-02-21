@@ -1,0 +1,187 @@
+This is an important issue.
+
+It is also complicated.
+Here we only give a rough description.
+
+do_munmap() will take this job.
+
+do_munmap() -->
+
+	detach_vmas_to_be_unmapped(mm, vma, prev, end);
+	unmap_region(mm, vma, prev, start, end);
+
+	arch_unmap(mm, vma, start, end);
+
+	/* Fix up all other VM information */
+	remove_vma_list(mm, vma);
+
+	return 0;
+}
+
+The above codes are from do_munmap() and the core of the unmapping.
+
+1. detach_vmas_to_be_unmapped(mm, vma, prev, end)
+
+static void
+detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
+	struct vm_area_struct *prev, unsigned long end)
+{
+	struct vm_area_struct **insertion_point;
+	struct vm_area_struct *tail_vma = NULL;
+
+## insertion_point points to the 'prev->vm_next' or 'mm->mmap'. Any value
+## assigned to '*insertion_point' actually update the value of 'prev->vm_next'
+## or 'mm->mmap';
+	insertion_point = (prev ? &prev->vm_next : &mm->mmap);
+## unlink vma from the original mm->mmap;
+	vma->vm_prev = NULL;
+	do {
+## vma_rb_erase() will delete the 'vma' from the RB tree;
+		vma_rb_erase(vma, &mm->mm_rb);
+		mm->map_count--;
+		tail_vma = vma;
+		vma = vma->vm_next;
+	} while (vma && vma->vm_start < end);
+
+## bypast all the overlapped VMAs and relinked the VMA list;
+	*insertion_point = vma;
+	if (vma) {
+		vma->vm_prev = prev;
+		vma_gap_update(vma);
+	} else
+## We reach the end of VMA list, so, mm->highest_vm_end is updated like that:
+		mm->highest_vm_end = prev ? vm_end_gap(prev) : 0;
+	tail_vma->vm_next = NULL;
+
+	/* Kill the cache */
+	vmacache_invalidate(mm);
+}
+
+After this detach function, all the overlapped VMA nodes will be unlinked from
+the VAM list of mm->mmap and deleted from RB tree of mm->mm_rb.
+
+2. unmap_region(mm, vma, prev, start, end)
+
+We first remind that 'vma' hadn't been changed by 'detach_vmas_to_be_unmapped()'
+as it isn't double pointer.
+So, 'vma' points to the first VMA which had been detached just now.
+'prev' is the previous VMA where the detach happens.
+
+static void unmap_region(struct mm_struct *mm,
+		struct vm_area_struct *vma, struct vm_area_struct *prev,
+		unsigned long start, unsigned long end)
+{
+## 'next' here points to the VMA of the new list which was detached;
+	struct vm_area_struct *next = prev ? prev->vm_next : mm->mmap;
+	struct mmu_gather tlb;
+
+	lru_add_drain();
+## initialize the local 'struct mmu_gather' to buffer the 'struct page' to be
+## freed later;
+	tlb_gather_mmu(&tlb, mm, start, end);
+	update_hiwater_rss(mm);
+## This is the core. 
+	unmap_vmas(&tlb, vma, start, end);
+
+	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+				 next ? next->vm_start : USER_PGTABLES_CEILING);
+	tlb_finish_mmu(&tlb, start, end);
+}
+
+2.1 Clear the PTEs
+
+zap_pte_range will also clear the corresponding PTE;
+
+
+2.2 how to collect the TLB entries to be freed
+
+The calling path is :
+
+void unmap_vmas(struct mmu_gather *tlb,
+		struct vm_area_struct *vma, unsigned long start_addr,
+		unsigned long end_addr)
+{
+	struct mm_struct *mm = vma->vm_mm;
+
+	mmu_notifier_invalidate_range_start(mm, start_addr, end_addr);
+	for ( ; vma && vma->vm_start < end_addr; vma = vma->vm_next)
+		unmap_single_vma(tlb, vma, start_addr, end_addr, NULL);
+	mmu_notifier_invalidate_range_end(mm, start_addr, end_addr);
+}
+
+	unmap_single_vma -->
+	unmap_page_range --> zap_p4d_range --> 
+
+static unsigned long zap_pte_range(struct mmu_gather *tlb,
+				struct vm_area_struct *vma, pmd_t *pmd,
+				unsigned long addr, unsigned long end,
+				struct zap_details *details)
+{
+	...
+
+	if (pte_present(ptent)) {
+	## This function will update the 'tlb->start' and 'tlb->end':
+		tlb_remove_tlb_entry(tlb, pte, addr); --> __tlb_adjust_range();
+
+	## This function will store the 'struct page' which will be freed to
+	## 'tlb->active->pages[]' :
+		__tlb_remove_page(tlb, page) -->
+			__tlb_remove_page_size(tlb, page, PAGE_SIZE);
+
+	...
+	}
+
+	## for swap page
+	...
+	if (unlikely(!free_swap_and_cache(entry)))
+		print_bad_pte(vma, addr, ptent, NULL);
+	pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+	...
+}
+
+2.3 free_pgtables
+
+void free_pgtables(struct mmu_gather *tlb, struct vm_area_struct *vma,
+		unsigned long floor, unsigned long ceiling)
+{
+	while (vma) {
+		struct vm_area_struct *next = vma->vm_next;
+		unsigned long addr = vma->vm_start;
+
+		/*
+		 * Hide vma from rmap and truncate_pagecache before freeing
+		 * pgtables
+		 */
+		unlink_anon_vmas(vma);
+		unlink_file_vma(vma);
+
+
+The calling of unlink_anon_vmas(vma), unlink_file_vma(vma) are important.
+I am not so clear what is the target of those:
+			while (next && next->vm_start <= vma->vm_end + PMD_SIZE
+			       && !is_vm_hugetlb_page(next)) {
+				vma = next;
+				next = vma->vm_next;
+				unlink_anon_vmas(vma);
+				unlink_file_vma(vma);
+			}
+			free_pgd_range(tlb, addr, vma->vm_end,
+				floor, next ? next->vm_start : ceiling);
+
+
+2.4 Free the physical pages
+
+tlb_finish_mmu(&tlb, start, end) will do this work.
+
+tlb_finish_mmu --> tlb_flush_mmu(tlb)
+
+
+This will free the page for the 'tlb':
+
+	for (batch = tlb->local.next; batch; batch = next) {
+		next = batch->next;
+		free_pages((unsigned long)batch, 0);
+	}
+
+
+

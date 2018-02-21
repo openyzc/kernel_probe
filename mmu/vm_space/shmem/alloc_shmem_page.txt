@@ -1,0 +1,178 @@
+
+shmem实际是基于tmpfs的，因此对数据的读写是
+file-mapped的。但是与传统的disk-backed的文件访问不同，tmpfs是没有与disk类似的物理存储设备采用回写(write-back)的方式来保留被回收的page/page-cache中的数据。
+tmpfs的page数据是以 swap分区/文件 作为回写目标的。这数据备份操作对于
+tmpfs是称为swap/page out的（换页）。
+
+有必要强调一点， shmem 的page不是anonymous的。 更多信息可以参考 :
+http://linuxperf.com/?p=142
+
+几个问题需要关注（不一定都跟踪分析）。
+
+1. IPC 机制 如何将shm （shared memory)关联到 文件
+
+请关注 shmget, shmat的实现。
+
+2. shmem自身是如何 使用tmpfs的
+
+参考 shmem_create， shmem_mkdir， shmem_tmpfile
+
+
+3. 在page out前，数据page是否采用传统的 file-mapped方式管理
+
+
+请参考 shmem_getpage --> shmem_getpage_gfp
+
+这里的shmem_getpage_gfp管理shmem的 page cache, swap-cache.
+猜想在 shmem开始访问某个 shared file时，会走 if
+(swap.val)的else分支，分配对应输入 index所需的page添加到 file的
+inode->i_mapping的 address-space描述的file的page-cache中。
+真正的数据读入到分配的page是在page-fault中完成。
+
+但是如果现在是swapin发生，那么将从 file的i_mapping的page-cache中得到swap
+entry, 然后尝试 page = lookup_swap_cache(swap) 从swap
+cache中找对应page，还失败就会发起从swap 分区/file中读取数据
+。此种情况下，i_mapping的page-cache对应的radix entry会更新为指向
+swap-cache的page地址，不再是 swap entry索引了。
+
+
+
+4. swap cache 与 tmpfs的page cache关系
+
+
+4.1 swap-in 基本过程
+
+In shmem_getpage_gfp(),
+	struct address_space *mapping = inode->i_mapping;
+
+Here, the struct inode is allocated by:
+
+__shmem_file_setup
+	--> shmem_get_inode
+		--> inode = new_inode(sb)
+			--> alloc_inode
+				--> sb->s_op->alloc_inode(sb)
+
+For shmem, this alloc_inode will point to 'shmem_alloc_inode'.
+
+static struct inode *shmem_alloc_inode(struct super_block *sb)
+{
+	struct shmem_inode_info *info;
+	info = kmem_cache_alloc(shmem_inode_cachep, GFP_KERNEL);
+	if (!info)
+		return NULL;
+	return &info->vfs_inode;
+}
+
+所以，这里的 'mapping' 是指向 file-mapped 机制下的 address_space;
+其中的 mapping->page_tree 应该是page-cache来保存tmpfs的文件数据：
+在 shmem 文件创建后，访问该文件的页偏移对应的PTE还没有建立。此时 shmem_fault
+会在缺页处理中被调到。
+	error = shmem_getpage_gfp(inode, vmf->pgoff, &vmf->page, sgp,
+				  gfp, vma, vmf, &ret);
+
+此时 inode->i_mapping中的 radix-tree还没有对应的pages。请注意，这里的
+radix-tree是shmem对应的fmpfs file的page cache。
+在shmem_getpage_gfp()中，会进入else分支：
+
+	if (swap.val) {
+		...
+	} else {
+		...
+alloc_huge:
+		page = shmem_alloc_and_acct_page(gfp, info, sbinfo,
+				index, true);
+		if (IS_ERR(page)) {
+alloc_nohuge:		page = shmem_alloc_and_acct_page(gfp, info, sbinfo,
+					index, false);
+		}
+/* 以上代码会分配所需的物理 pages. */
+		...
+		if (!error) {
+			error = shmem_add_to_page_cache(page, mapping, hindex,
+							NULL);
+			radix_tree_preload_end();
+		}
+/* 可以看到，这里的 shmem_add_to_page_cache() 调用时，参数 '*expected‘为NULL.
+ * 从而shmem_add_to_page_cache()会进入else分支. */
+	} else if (!expected) {
+		error = radix_tree_insert(&mapping->page_tree, index, page);
+	} else {
+		error = shmem_radix_tree_replace(mapping, index, expected,
+								 page);
+	}
+/* radix_tree_insert(&mapping->page_tree, index, page) 直接insert
+ * 所分配的page到&mapping->page_tree。 而 '*expected'
+ * 非NULL时，shmem_radix_tree_replace() 会使用新分配的 page地址replace
+ * 在&mapping->page_tree中已经存在的 entry, 此entry是以 page 偏移index为key
+ * field的。 注意，在replacing之前，原来的radix slot 中的值是
+ * swp_to_radix_entry(swap)，表示的是page-out后在 swap分区/file中的offset。
+ */
+
+在 shmem_getpage --> shmem_getpage_gfp
+中，如果page-cache中的page已经被swapped-out, 那么此时
+mapping->page_tree中对应的slot值不再是 page 的地址而是 swp_entry_t了:
+	swap.val = 0;
+	page = find_lock_entry(mapping, index);
+	if (radix_tree_exceptional_entry(page)) {
+		swap = radix_to_swp_entry(page);
+		page = NULL;
+	}
+	...
+	if (swap.val) {
+		/* Look it up and read it in.. */
+		page = lookup_swap_cache(swap);
+/* 请注意，这里的 lookup_swap_cache(swap) 不是在 inode的 i_mapping对应的
+ * address_space中lookup, 而是在 struct address_space *swapper_spaces[]
+ * 中找寻。请参考 find_get_page(swap_address_space(entry), swp_offset(entry));*/
+
+
+index ---> i_mapping->page_tree ---swp_entry_t--> swapper_spaces[]
+
+如果在 swap cache中已经没有对应的 page，那么需要从 swap 分区/file中readin:
+	page = shmem_swapin(swap, gfp, info, index);
+		--> read_swap_cache_async
+
+这里新分配的pages 是暂时挂入到 swap cache的address_space中的。
+之后将readin 的pages 添加到 i_mapping的address_space中：
+		if (!error) {
+			error = shmem_add_to_page_cache(page, mapping, index,
+						swp_to_radix_entry(swap));
+因为已经从swap 分区/file中readin了数据，这里会以 page地址覆盖
+i_mapping->page_tree的slot[]中的swp_entry_t值。
+
+swap-cache中的 page不需要再保留了：
+		delete_from_swap_cache(page);
+		set_page_dirty(page);
+		swap_free(swap);
+
+此外， shmem_unuse_inode() 会主动以传入的'struct page **pagep' 来覆盖 file
+page-cache中的slot[]数据。
+
+
+4.2 swap-out过程
+
+static const struct address_space_operations shmem_aops = {
+	.writepage	= shmem_writepage,
+
+
+shmem_writepage 中调用  swap = get_swap_page() 可以从
+swap分区/file中获取到空闲的swap slot 而构成 swp_entry_t swap。
+
+然后 add_to_swap_cache(page, swap, GFP_ATOMIC)将 被换出的page保存到
+swap-cache的address-space中。请注意，这里的 radix-tree的key是
+swp_offset(entry)：
+int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+{
+	...
+	error = radix_tree_insert(&address_space->page_tree,
+				  swp_offset(entry), page);
+}
+
+最后 replace 文件 i_mapping的page_tree中的 slot[] 为 swp_to_radix_entry(swap)：
+
+		shmem_delete_from_page_cache(page, swp_to_radix_entry(swap));
+
+
+
+

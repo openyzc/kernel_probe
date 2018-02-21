@@ -1,0 +1,114 @@
+
+1. Open the file
+
+In fs/open.c, do_dentry_open():
+
+	f->f_mode = OPEN_FMODE(f->f_flags) | FMODE_LSEEK |
+				FMODE_PREAD | FMODE_PWRITE;
+
+	path_get(&f->f_path);
+	f->f_inode = inode;
+	f->f_mapping = inode->i_mapping;
+	...
+	f->f_op = fops_get(inode->i_fop);
+	...
+	if (open) {
+		error = open(inode, f);
+		if (error)
+			goto cleanup_all;
+	}
+
+	if ((f->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
+		i_readcount_inc(inode);
+	if ((f->f_mode & FMODE_READ) &&
+	     likely(f->f_op->read || f->f_op->read_iter))
+		f->f_mode |= FMODE_CAN_READ;
+	if ((f->f_mode & FMODE_WRITE) &&
+	     likely(f->f_op->write || f->f_op->write_iter))
+		f->f_mode |= FMODE_CAN_WRITE;
+
+	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+
+	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping)
+
+We pay more attention about 'f->f_ra':
+
+void
+file_ra_state_init(struct file_ra_state *ra, struct address_space *mapping)
+{
+	ra->ra_pages = inode_to_bdi(mapping->host)->ra_pages;
+	ra->prev_pos = -1;
+}
+
+
+2. io vec setup
+
+static ssize_t new_sync_read(struct file *filp, char __user *buf, size_t len,
+loff_t *ppos)
+{
+	struct iovec iov = { .iov_base = buf, .iov_len = len };
+	struct kiocb kiocb;
+	struct iov_iter iter;
+	ssize_t ret;
+
+	init_sync_kiocb(&kiocb, filp);
+	kiocb.ki_pos = *ppos;
+	iov_iter_init(&iter, READ, &iov, 1, len);
+
+	ret = call_read_iter(filp, &kiocb, &iter);
+	BUG_ON(ret == -EIOCBQUEUED);
+	*ppos = kiocb.ki_pos;
+	return ret;
+}
+
+void iov_iter_init(struct iov_iter *i, int direction,
+			const struct iovec *iov, unsigned long nr_segs,
+			size_t count)
+{
+	/* It will get better.  Eventually... */
+	if (uaccess_kernel()) {
+		direction |= ITER_KVEC;
+		i->type = direction;
+		i->kvec = (struct kvec *)iov;
+	} else {
+		i->type = direction;
+		i->iov = iov;
+	}
+	i->nr_segs = nr_segs;
+	i->iov_offset = 0;
+	i->count = count;
+}
+
+So, for generic read,
+	i->nr_segs = 1;
+	i->iov_offset = 0;
+	i->count = len;
+
+Only one vector in 'struct iov_iter'. For user-land read, the i->type is 0, for
+kernel space read, the i->type will enable ITER_KVEC;
+
+
+
+For ext4 regular file, this operation structure will be used:
+
+const struct file_operations ext4_file_operations = {
+	.llseek		= ext4_llseek,
+	.read_iter	= ext4_file_read_iter,
+
+In ext4_iget():
+	if (S_ISREG(inode->i_mode)) {
+		inode->i_op = &ext4_file_inode_operations;
+		inode->i_fop = &ext4_file_operations;
+		ext4_set_aops(inode);
+	} else if (S_ISDIR(inode->i_mode)) {
+
+So, the process flow will be:
+
+ext4_file_read_iter() --> generic_file_read_iter(iocb, to)
+	--> retval = do_generic_file_read(file, &iocb->ki_pos, iter, retval)
+
+The core is do_generic_file_read(). will be analysed in other notes.
+
+
+
+

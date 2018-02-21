@@ -1,0 +1,494 @@
+This article will focus on bprm_mm_init() for the memory space of this thread.
+
+
+static int bprm_mm_init(struct linux_binprm *bprm)
+{
+	int err;
+	struct mm_struct *mm = NULL;
+
+	bprm->mm = mm = mm_alloc();
+	err = -ENOMEM;
+	if (!mm)
+		goto err;
+
+	err = __bprm_mm_init(bprm);
+	if (err)
+		goto err;
+
+	return 0;
+...
+}
+
+1. The mm_struct initialization
+
+mm_alloc --> mm_init(mm, current, current_user_ns()) --> mm_alloc_pgd(mm)
+--> mm->pgd = pgd_alloc(mm)
+
+
+Here, we only talk about the things on X86.
+
+pgd_t *pgd_alloc(struct mm_struct *mm)
+{
+	pgd_t *pgd;
+	pmd_t *pmds[PREALLOCATED_PMDS];
+
+	pgd = _pgd_alloc();
+
+	if (pgd == NULL)
+		goto out;
+
+	mm->pgd = pgd;
+
+	if (preallocate_pmds(mm, pmds) != 0)
+		goto out_free_pgd;
+
+
+when PREALLOCATED_PMDS is defined, preallocate_pmds() will allocate
+PREALLOCATED_PMDS pages as the pmd tables.
+
+#ifdef CONFIG_X86_PAE
+
+#define PREALLOCATED_PMDS	UNSHARED_PTRS_PER_PGD
+
+#define UNSHARED_PTRS_PER_PGD				\
+	(SHARED_KERNEL_PMD ? KERNEL_PGD_BOUNDARY : PTRS_PER_PGD)
+
+And SHARED_KERNEL_PMD is only defined for x86_32 PAE. You can refer to
+pgtable-3level_types.h;
+
+So, preallocate_pmds will allocate the PREALLOCATED_PMDS pages only when X86_PAE
+is enabled. But the PREALLOCATED_PMDS is depended on the SHARED_KERNEL_PMD.
+
+Then pgd_alloc() will continue these:
+
+	pgd_ctor(mm, pgd);
+	pgd_prepopulate_pmd(mm, pgd, pmds);
+
+	spin_unlock(&pgd_lock);
+
+	return pgd;
+
+
+
+static void pgd_ctor(struct mm_struct *mm, pgd_t *pgd)
+{
+	/* If the pgd points to a shared pagetable level (either the
+	   ptes in non-PAE, or shared PMD in PAE), then just copy the
+	   references from swapper_pg_dir. */
+	if (CONFIG_PGTABLE_LEVELS == 2 ||
+	    (CONFIG_PGTABLE_LEVELS == 3 && SHARED_KERNEL_PMD) ||
+	    CONFIG_PGTABLE_LEVELS >= 4) {
+		clone_pgd_range(pgd + KERNEL_PGD_BOUNDARY,
+				swapper_pg_dir + KERNEL_PGD_BOUNDARY,
+				KERNEL_PGD_PTRS);
+	}
+
+	/* list required to sync kernel mapping updates */
+	if (!SHARED_KERNEL_PMD) {
+		pgd_set_mm(pgd, mm);
+		pgd_list_add(pgd);
+	}
+}
+
+The process here confuses me!
+
+1) SHARED_KERNEL_PMD is only for X86_32 PAE; other architectures are not
+SHARED_KERNEL_PMD, which means the PMD tables are not shared with the
+page which swapper_pg_dir[] points to.
+2) Why are the pgd entriess corresponding to the Kernel direct memory cloned
+from swapper_pg_dir yet for X86_64 where !SHARED_KERNEL_PMD?
+
+You can find pgd_prepopulate_pmd() will assign the PGD entries and the next
+level pgtable with the entries data from the corresponding swapper_pg_dir[i];
+It seems the clone make no sense as those pgtable entries will be overwritten.
+
+From point of my perspectives, I think all the pgtable entires for kernel direct
+memory should shared with the corresponding ones in swapper_pg_dir[], then we
+don't need to update the pgtable for those shared entries.
+
+2. __bprm_mm_init(struct linux_binprm *bprm)
+
+The major work here is to create a new struct vm_area_struct for the current
+thread.
+
+The first vma area is initialized as:
+
+	vma->vm_end = STACK_TOP_MAX;
+	vma->vm_start = vma->vm_end - PAGE_SIZE;
+	vma->vm_flags = VM_SOFTDIRTY | VM_STACK_FLAGS |
+			VM_STACK_INCOMPLETE_SETUP;
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+
+then call this to add
+	err = insert_vm_struct(mm, vma);
+
+This insert_vm_struct(mm, vma) is our emphasis;
+
+int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
+{
+	struct vm_area_struct *prev;
+	struct rb_node **rb_link, *rb_parent;
+
+	if (find_vma_links(mm, vma->vm_start, vma->vm_end,
+			   &prev, &rb_link, &rb_parent))
+		return -ENOMEM;
+
+2.1 find_vma_links(struct mm_struct *mm, unsigned long addr,
+		unsigned long end, struct vm_area_struct **pprev,
+		struct rb_node ***rb_link, struct rb_node **rb_parent)
+
+1. What is the relation between struct mm_struct and struct vm_area_struct
+
+struct mm_struct is the entry to describe the whole task memory space;
+
+struct mm_struct {
+	struct vm_area_struct *mmap;		/* list of VMAs */
+	struct rb_root mm_rb;
+
+The '*mmap' is the head of the VMAs list for this thread;
+The 'mm_rb' is the root of the VMAs tree for this thread;
+
+There is only one struct mm_struct for one thread.
+
+2. The analysis on find_vma_links
+
+Traverse the R-B tree of the input 'struct mm_struct *mm' to locate the right
+place for the new vma of [addr, end).
+
+If there is existing VMA overlapping with the new one, return -ENOMEM;
+
+'struct vm_area_struct **pprev' will store the pointer to the previous RB node
+which is nearest to the new one but smaller; It can be NULL;
+'struct rb_node ***rb_link' is the pointer to the right node to link the new
+VMA;
+'struct rb_node **rb_parent' points to the parent RB node which '***rb_link' is
+its son; It can be NULL;
+
+
+2.2 static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
+			struct vm_area_struct *prev, struct rb_node **rb_link,
+			struct rb_node *rb_parent)
+
+vma_link(mm, vma, prev, rb_link, rb_parent);
+
+This functon is the core. It can link the new '*vma' to the 'mm->mmap' list and
+the RB tree of '&mm->mm_rb';
+
+1. the struct vm_area_struct
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+
+Here, '*vm_next', '*vm_prev' are for the list ordered by the VMA address;
+'vm_rb' is for the linking to RB tree;
+
+
+2. The macro of RB_DECLARE_CALLBACKS for vma_gap_callbacks##
+
+RB_DECLARE_CALLBACKS(static, vma_gap_callbacks, struct vm_area_struct, vm_rb,
+		     unsigned long, rb_subtree_gap, vma_compute_subtree_gap)
+
+in include/linux/rbtree_augmented.h :
+
+#define RB_DECLARE_CALLBACKS(rbstatic, rbname, rbstruct, rbfield,	\
+			     rbtype, rbaugmented, rbcompute)		\
+static inline void							\
+rbname ## _propagate(struct rb_node *rb, struct rb_node *stop)		\
+{									\
+	while (rb != stop) {						\
+		rbstruct *node = rb_entry(rb, rbstruct, rbfield);	\
+		rbtype augmented = rbcompute(node);			\
+		if (node->rbaugmented == augmented)			\
+			break;						\
+		node->rbaugmented = augmented;				\
+		rb = rb_parent(&node->rbfield);				\
+	}								\
+}									\
+static inline void							\
+rbname ## _copy(struct rb_node *rb_old, struct rb_node *rb_new)		\
+{									\
+	rbstruct *old = rb_entry(rb_old, rbstruct, rbfield);		\
+	rbstruct *new = rb_entry(rb_new, rbstruct, rbfield);		\
+	new->rbaugmented = old->rbaugmented;				\
+}									\
+static void								\
+rbname ## _rotate(struct rb_node *rb_old, struct rb_node *rb_new)	\
+{									\
+	rbstruct *old = rb_entry(rb_old, rbstruct, rbfield);		\
+	rbstruct *new = rb_entry(rb_new, rbstruct, rbfield);		\
+	new->rbaugmented = old->rbaugmented;				\
+	old->rbaugmented = rbcompute(old);				\
+}									\
+rbstatic const struct rb_augment_callbacks rbname = {			\
+	.propagate = rbname ## _propagate,				\
+	.copy = rbname ## _copy,					\
+	.rotate = rbname ## _rotate					\
+};
+
+
+After extension, there are these code:
+
+static inline void vma_gap_callbacks_propagate(struct rb_node *rb,
+	struct rb_node *stop)
+{
+        while (rb != stop) {
+                struct vm_area_struct *node = rb_entry(rb, struct
+vm_area_struct, vm_rb);
+                unsigned long augmented = vma_compute_subtree_gap(node);
+
+                if (node->rb_subtree_gap == augmented)
+                        break;
+                node->rb_subtree_gap = augmented;
+                rb = rb_parent(&node->vm_rb);
+        }
+}
+
+static inline void vma_gap_callbacks_copy(struct rb_node *rb_old,
+		struct rb_node *rb_new)
+{
+        struct vm_area_struct *old = rb_entry(rb_old, struct vm_area_struct,
+vm_rb);
+        struct vm_area_struct *new = rb_entry(rb_new, struct vm_area_struct,
+vm_rb);
+
+        new->rb_subtree_gap = old->rb_subtree_gap;
+}
+
+static void vma_gap_callbacks_rotate(struct rb_node *rb_old,
+		struct rb_node *rb_new)
+{
+        struct vm_area_struct *old = rb_entry(rb_old, struct vm_area_struct,
+vm_rb);
+        struct vm_area_struct *new = rb_entry(rb_new, struct vm_area_struct,
+vm_rb);
+
+        new->rb_subtree_gap = old->rb_subtree_gap;
+        old->rb_subtree_gap = vma_compute_subtree_gap(old);
+}
+
+static const struct rb_augment_callbacks vma_gap_callbacks = {
+        .propagate = vma_gap_callbacks_propagate,
+        .copy = vma_gap_callbacks_copy,
+        .rotate = vma_gap_callbacks_rotate
+};
+
+3. void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
+
+This function algorithm is not so easy to understand.
+It will link the new VMA node into the RB tree of '*mm';
+
+void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
+		struct rb_node **rb_link, struct rb_node *rb_parent)
+{
+	##As the new VM node hasn't added to the RB tree. We can't directly
+	##call vma_gap_update(vma) as vma->vm_next as the right child hasn't
+	##updated its rb_subtree_gap because the RB tree hadn't included the new
+	##VMA. So, here we first call vma_gap_update(vma->vm_next).
+	if (vma->vm_next)
+		vma_gap_update(vma->vm_next);
+	else
+		mm->highest_vm_end = vm_end_gap(vma);
+	##The new VMA will be linked to the RB tree as terminal leaf. It is not
+	##match the rule of RB tree yet. But follow the rule of binary tree.
+	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
+	vma->rb_subtree_gap = 0;
+	##setup the rb_subtree_gap of all the VMAs in the binary tree. After
+	##that, the new VMA node after the rotation will have the equal
+	##rb_subtree_gap to the old VMA node as the subtree of new or old VMA
+	##node has the same VMAs set. But the old VMA will be moved to the new
+	##position and the subtree set is changed, so has to be updated the
+	##rb_subtree_gap;
+	vma_gap_update(vma);
+	vma_rb_insert(vma, &mm->mm_rb);
+}
+
+
+
+
+mm->map_count will count how many VMAs are in the list of 'mm->mm_rb';
+
+4. The RB tree for file mapping
+
+In the above, we had mentioned some fields of struct vm_area_struct are used to
+setup the relation with struct mm_struct :
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+
+
+Then what fields are for the linking with file mapping between VMA area and the
+file segment?
+
+
+These fields of struct vm_area_struct will be applied :
+
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
+You can refer to :
+static void __vma_link_file(struct vm_area_struct *vma) -->
+vma_interval_tree_insert(vma, &mapping->i_mmap)
+
+
+static void __vma_link_file(struct vm_area_struct *vma)
+{
+	struct file *file;
+
+	file = vma->vm_file;
+	if (file) {
+		struct address_space *mapping = file->f_mapping;
+
+		if (vma->vm_flags & VM_DENYWRITE)
+			atomic_dec(&file_inode(file)->i_writecount);
+		if (vma->vm_flags & VM_SHARED)
+			atomic_inc(&mapping->i_mmap_writable);
+
+		flush_dcache_mmap_lock(mapping);
+		vma_interval_tree_insert(vma, &mapping->i_mmap);
+		flush_dcache_mmap_unlock(mapping);
+	}
+}
+
+So, the share VMAs which are relevant to file mapping will be linked to the RB
+tree defined in 'struct address_space'.
+
+   struct vm_area_struct		struct address_space
+VMA Node	--- vm.shared.rb ----> mapping ->i_mmap  --inode --> file
+
+
+You can refer to the function of vma_interval_tree_insert() which is expanded
+from this definition :
+INTERVAL_TREE_DEFINE(struct vm_area_struct, shared.rb,
+		     unsigned long, shared.rb_subtree_last,
+		     vma_start_pgoff, vma_last_pgoff,, vma_interval_tree)
+
+
+void vma_interval_tree_insert(struct vm_area_struct *node, struct rb_root *root)
+{
+        struct rb_node **link = &root->rb_node, *rb_parent = NULL;
+        unsigned long start = vma_start_pgoff(node), last = vma_last_pgoff(node);
+        struct vm_area_struct *parent;
+
+        while (*link) {
+                rb_parent = *link;
+                parent = rb_entry(rb_parent, struct vm_area_struct, shared.rb);
+                if (parent->shared.rb_subtree_last < last)
+                        parent->shared.rb_subtree_last = last;
+                if (start < vma_start_pgoff(parent))
+                        link = &parent->shared.rb.rb_left;
+                else
+                        link = &parent->shared.rb.rb_right;
+        }
+        node->shared.rb_subtree_last = last;
+        rb_link_node(&node->shared.rb, rb_parent, link);
+        rb_insert_augmented(&node->shared.rb, root, &vma_interval_tree_augment);
+}
+
+The RB tree for file mapping will be ordered by the virtual addr range of
+struct vm_area_struct. This field member is set by
+vma_interval_tree_compute_subtree_last() based on the end virtial address
+calculated by vma_last_pgoff(vma);
+
+
+The anonoymous mapping is similar to the file mapping. But because we don't need
+to bind the VMA to some data source, such as file, the anonymous mapping won't
+apply this field of struct vm_area_struct :
+
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
+
+Anonymous mapping will apply these fields of struct vm_area_struct :
+
+	struct list_head anon_vma_chain; /* Serialized by mmap_sem &
+					  * page_table_lock */
+	struct anon_vma *anon_vma;	/* Serialized by page_table_lock */
+
+With these, a struct vm_area_struct node can bind with some struct
+anon_vma_chain nodes.
+
+struct anon_vma_chain {
+	struct vm_area_struct *vma;
+	struct anon_vma *anon_vma;
+	struct list_head same_vma;   /* locked by mmap_sem & page_table_lock */
+	struct rb_node rb;			/* locked by anon_vma->rwsem */
+	unsigned long rb_subtree_last;
+#ifdef CONFIG_DEBUG_VM_RB
+	unsigned long cached_vma_start, cached_vma_last;
+#endif
+};
+
+struct list_head anon_vma_chain of struct vm_area_struct will work as head of a
+list linked the nodes of struct anon_vma_chain. In this way, the relation
+between struct anon_vma and struct vm_area_struct will be set :
+
+			same_vma of struct anon_vma_chain 0
+	------------------- 			--------------------------
+	| struct anon_vma | <-------------	| struct vm_area_struct 0|
+	-------------------			--------------------------
+		  ^
+		  | same_vma of struct anon_vma_chain 1
+		  |				--------------------------
+		  |-------------------------    | struct vm_area_struct 1|
+						---------------------------
+
+This is mainly used by RMAP to know the binding between struct page and struct
+vm_area_struct which mapped that page.
+
+And there is a structure named struct anon_vma :
+
+struct anon_vma {
+	struct anon_vma *root;		/* Root of this anon_vma tree */
+	struct rw_semaphore rwsem;	/* W: modification, R:walking the list*/
+
+	atomic_t refcount;
+
+	unsigned degree;
+
+	struct anon_vma *parent;	/* Parent of this anon_vma */
+
+	struct rb_root rb_root;	/* Interval tree of private "related" vmas */
+};
+
+All the struct anon_vma_chain nodes which are corresponding to a unique VMA will
+be linked into the 'struct rb_root rb_root' defined here.
+
+The key data of this RB tree is still the virtual address range of VMAs.
+
+You can refer to __anon_vma_interval_tree_insert() too.
+
+
+anon_vma_chain_link --> anon_vma_interval_tree_insert
+
+
+==========
+After insert_vm_struct(mm, vma), the new stack VMA had been bound with the
+struct mm_struct.
+
+
+In the end, will set the bprm->p as :
+
+bprm->p = vma->vm_end - sizeof(void *);
+

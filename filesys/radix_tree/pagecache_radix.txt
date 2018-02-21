@@ -1,0 +1,130 @@
+
+
+The pagecache of files are managed by Radix-tree.
+
+
+When the target file is opened, besides the 'struct file' initialization, we
+want to make some notes on the readahead :
+
+struct file {
+	...
+	struct file_ra_state	f_ra;
+	...
+}
+
+struct file_ra_state {
+	pgoff_t start;			/* where readahead started */
+	unsigned int size;		/* # of readahead pages */
+	unsigned int async_size;	/* do asynchronous readahead when
+					   there are only # of pages ahead */
+
+	unsigned int ra_pages;		/* Maximum readahead window */
+	unsigned int mmap_miss;		/* Cache miss stat for mmap accesses */
+	loff_t prev_pos;		/* Cache last read() position */
+};
+
+at the end of file open, will do some basic initialization for readahead
+structure:
+	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
+void
+file_ra_state_init(struct file_ra_state *ra, struct address_space *mapping)
+{
+	ra->ra_pages = inode_to_bdi(mapping->host)->ra_pages;
+	ra->prev_pos = -1;
+}
+
+And the 'inode_to_bdi(mapping->host)->ra_pages' is set by the block device such
+as SCSI, IDE, nvdimm, etc. We just list the flow on SCSI:
+
+scsi_alloc_queue()
+	--> blk_alloc_queue_node()
+		q->backing_dev_info->ra_pages =
+			(VM_MAX_READAHEAD * 1024) / PAGE_SIZE;
+
+
+We will trace how to allocate the pagecache for some file below, supposed we
+want to read some file. We only care about HARD-DISK at this moment.
+
+
+__vfs_read()
+	--> new_sync_read(file, buf, count, pos)
+		--> call_read_iter(filp, &kiocb, &iter)
+			--> file->f_op->read_iter(kio, iter)
+
+
+For ext4, in const struct file_operations ext4_file_operations = {
+	...
+	.read_iter	= ext4_file_read_iter,
+	...
+}
+
+So,
+	--> ext4_file_read_iter
+		--> generic_file_read_iter(iocb, to)
+			--> do_generic_file_read(file, &iocb->ki_pos, iter,
+				retval)
+
+Here, parameter of 'iocb' is 'struct kiocb *iocb', 'to' is 'struct iov_iter
+*to' which are setup by new_sync_read().
+
+
+1. when it is the first time to perform READ operation
+
+We knew the 'struct file *filp' is intialized by open systemcall.
+
+static ssize_t do_generic_file_read(struct file *filp, loff_t *ppos,
+		struct iov_iter *iter, ssize_t written)
+{
+	struct address_space *mapping = filp->f_mapping;
+	struct inode *inode = mapping->host;
+	struct file_ra_state *ra = &filp->f_ra;
+	...
+	/* find_get_page() will return NULL for the first-time READ on 'filp' as
+	 * 'mapping->page_tree.rnode' is NULL. */
+		page = find_get_page(mapping, index);
+		if (!page) {
+	/* Will reach here for the first-time READ. */
+			page_cache_sync_readahead(mapping,
+					ra, filp,
+					index, last_index - index);
+			page = find_get_page(mapping, index);
+			if (unlikely(page == NULL))
+				goto no_cached_page;
+		}
+	...
+}
+
+
+--> 	page_cache_sync_readahead(mapping, ra, filp,
+					index, last_index - index);
+
+void page_cache_sync_readahead(struct address_space *mapping,
+			       struct file_ra_state *ra, struct file *filp,
+			       pgoff_t offset, unsigned long req_size)
+{
+	/* no read-ahead */
+	if (!ra->ra_pages)
+		return;
+
+	/* yzc: This is not the normal case. We just skip here. */
+	/* be dumb */
+	if (filp && (filp->f_mode & FMODE_RANDOM)) {
+		force_page_cache_readahead(mapping, filp, offset, req_size);
+		return;
+	}
+
+	/* yzc: We will continue the analysis here. */
+	/* do read-ahead */
+	ondemand_readahead(mapping, ra, filp, false, offset, req_size);
+}
+
+
+The input 'pgoff_t offset' and 'unsigned long req_size' are the page offset.
+
+ondemand_readahead(struct address_space *mapping,
+		   struct file_ra_state *ra, struct file *filp,
+		   bool hit_readahead_marker, pgoff_t offset,
+		   unsigned long req_size)
+
+
+

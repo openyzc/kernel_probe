@@ -1,0 +1,116 @@
+
+
+In the end of execv(), start_thread() will be called:
+
+static void
+start_thread_common(struct pt_regs *regs, unsigned long new_ip,
+		    unsigned long new_sp,
+		    unsigned int _cs, unsigned int _ss, unsigned int _ds)
+{
+	loadsegment(fs, 0);
+	loadsegment(es, _ds);
+	loadsegment(ds, _ds);
+	load_gs_index(0);
+	regs->ip		= new_ip;
+	regs->sp		= new_sp;
+	regs->cs		= _cs;
+	regs->ss		= _ss;
+	regs->flags		= X86_EFLAGS_IF;
+	force_iret();
+}
+
+void
+start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
+{
+	start_thread_common(regs, new_ip, new_sp,
+			    __USER_CS, __USER_DS, 0);
+}
+
+From the code above, we know the 'new_ip', 'new_sp', '__USER_CS', '__USER_DS'
+will be pushed into the 'struct pt_regs' in the kernel stack as at that moment
+the processing happenes in kernel-space.
+
+So, where these fields in 'struct pt_regs' will be used?
+
+
+1. The system call entry
+
+in arch/x86/entry/entry_64.S :
+
+ENTRY(entry_SYSCALL_64)
+
+	at the beginning of GLOBAL(entry_SYSCALL_64_after_swapgs), the kernel
+stack will be setup a 'struct pt_regs' and %rsp will points to the start address
+of struct pt_regs.
+
+
+2. when exece() return to user-space?
+
+when SYSCALL_DEFINE3(execve returns, kernel should return to user-space through
+some functions in entry_64.S :
+
+entry_SYSCALL64_slow_path:
+	/* IRQs are off. */
+	SAVE_EXTRA_REGS
+	movq	%rsp, %rdi
+	call	do_syscall_64		/* returns with IRQs disabled */
+
+return_from_SYSCALL_64:
+	RESTORE_EXTRA_REGS
+	TRACE_IRQS_IRETQ		/* we're about to change IF */
+
+	/*
+	 * Try to use SYSRET instead of IRET if we're returning to
+	 * a completely clean 64-bit userspace context.
+	 */
+	movq	RCX(%rsp), %rcx
+	movq	RIP(%rsp), %r11
+	cmpq	%rcx, %r11			/* RCX == RIP */
+	jne	opportunistic_sysret_failed
+
+
+Here, return_from_SYSCALL_64 will be called when the system call entry of
+do_syscall_64() is returned.
+So,
+	opportunistic_sysret_failed --> restore_c_regs_and_iret -->
+
+
+restore_c_regs_and_iret:
+	RESTORE_C_REGS
+	REMOVE_PT_GPREGS_FROM_STACK 8
+	INTERRUPT_RETURN
+
+
+in arch/x86/entry/calling.h,
+
+	.macro RESTORE_C_REGS
+	RESTORE_C_REGS_HELPER 1,1,1,1,1
+	.endm
+
+	.macro REMOVE_PT_GPREGS_FROM_STACK addskip=0
+	subq $-(15*8+\addskip), %rsp
+	.endm
+
+Here, %rsp -= -(15*8 + \addskip).
+
+Refer to the definition of 'struct pt_regs' in arch/x86/include/asm/ptrace.h,
+you can find that when 'INTERRUPT_RETURN' reaches, the %rsp points to the
+'unsigned long ip' of struct pt_regs. So, 'iret' will return to the '__USER_CS'
+and 'new_ip' set by start_thread_common().
+
+
+
+To understand the stack operations more clearly, you can refer to the
+copy_thread_tls() meanwhile.
+
+
+In summary, execv() will trigger the binary entry function when it returns from
+kernel space.
+
+We only discuss the 'iret' mode here. After the 'iret', the stack will aslo be
+replaced by the user-land stack.
+
+As for other system call return mode, such as 'sysret', probably will be added
+in the future.
+
+

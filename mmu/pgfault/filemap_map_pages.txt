@@ -1,0 +1,169 @@
+
+In do_fault(),
+When vmf->vma->vm_ops && vma->vm_ops->fault && (!(vmf->flags &
+FAULT_FLAG_WRITE)), then do_read_fault(vmf) will be called:
+
+Then in do_read_fault():
+	if (vma->vm_ops->map_pages && fault_around_bytes >> PAGE_SHIFT > 1) {
+		ret = do_fault_around(vmf);
+		if (ret)
+			return ret;
+	}
+
+do_fault_around
+	--> vmf->vma->vm_ops->map_pages(vmf, start_pgoff, end_pgoff)
+		--> filemap_map_pages
+
+As for this processing, you can also refer to :
+
+https://lwn.net/Articles/588802/
+
+最主要目的是提高性能. 通过 map_pages() 将 包含触发page fault的 vmf->address
+的VMA范围 [start_pgoff, end_pgoff] 都尝试建立VA
+-->PA的映射，这个是基于很快会访问到 vmf->address 周边的其它 pages.
+需要关注几点：
+1) start_pgoff 是 对齐 max(fault_around_bytes >> PAGE_SHIFT, PTRS_PER_PTE）,
+end_pgoff 是指向 大于 ((vmf->address >> PAGE_SHIFT) & (PTRS_PER_PTE -
+1))且对齐 PTRS_PER_PTE 的最小边界； 在 fault_around_byte >> PAGE_SHIFT 小于
+PTRS_PER_PTE时有意义；
+2) 判断 filemap_map_pages() 是否解决了 page fault 问题的标准是 原始的
+vmf->address对应的 PTE 被成功设置为映射到PA了. 如下：
+
+	vmf->pte -= (vmf->address >> PAGE_SHIFT) - (address >> PAGE_SHIFT);
+	if (!pte_none(*vmf->pte))
+		ret = VM_FAULT_NOPAGE;
+因为 vmf->address 在 do_fault_around() 被修改了 ：
+	vmf->address = max(address & mask, vmf->vma->vm_start);
+实际上，filemap_map_pages()也会更改它. 所以在
+do_fault_around()中使用了本地变量'address'来保存原始的 vmf->address.
+在 filemap_map_pages()返回后， vmf->pte 指向的是 最后成功建立 PTE映射的
+vmf->address对应的 PTE, 因此需要调整 vmf->pte 指向 address 对应的
+PTE以便检查!pte_none(*vmf->pte) 是否满足。 如果yes, 那么本次page
+fault的触发因素对应的page已经solved映射问题，即便 [start_pgoff,
+end_pgoff]中有部分pages没能与 page
+cache的对应pages建立关联，那也不影响当前的访问。
+
+3) VM_FAULT_NOPAGE在 do_fault_around()中 表示触发 page falut的 PTE miss已经解决.
+此返回值在 handle_mm_fault()中没有作为error处理，而是可以 return 0;
+
+4) vmf->vma->vm_ops->map_pages 一般是针对 file mapping的。
+
+
+void filemap_map_pages(struct vm_fault *vmf,
+		pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+	struct radix_tree_iter iter;
+	void **slot;
+	struct file *file = vmf->vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	pgoff_t last_pgoff = start_pgoff;
+	unsigned long max_idx;
+	struct page *head, *page;
+
+	rcu_read_lock();
+/* The key is radix_tree_for_each_slot. This macro will scan whole radix-tree of
+ * mapping->page_tree to find the non-empty slot returned in '&iter'. */
+	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter,
+			start_pgoff) {
+
+
+
+
+
+
+1. macro radix_tree_for_each_slot
+
+#define radix_tree_for_each_slot(slot, root, iter, start)		\
+	for (slot = radix_tree_iter_init(iter, start) ;			\
+	     slot || (slot = radix_tree_next_chunk(root, iter, 0)) ;	\
+	     slot = radix_tree_next_slot(slot, iter, 0))
+
+
+1.1 radix_tree_next_chunk
+
+Will return the first non-empty slot pointer 'node->slots + offset' scanned from
+'iter->next_index'.
+
+This function also setup the 'struct radix_tree_iter' for the next calling of
+'radix_tree_next_slot' as the input.
+
+struct radix_tree_iter {
+	unsigned long	index;
+	unsigned long	next_index;
+	unsigned long	tags;
+	struct radix_tree_node *node;
+#ifdef CONFIG_RADIX_TREE_MULTIORDER
+	unsigned int	shift;
+#endif
+};
+
+'index' is the radix-tree index which corresponds to the return slot;
+'next_index' define the index range for the search in 'radix_tree_next_slot'. If
+kernel can't find non-empty slot in this range by 'radix_tree_next_slot', then
+return NULL and radix_tree_next_chunk() will start the new scanning from
+'iter->next_index';
+
+1.2 radix_tree_next_slot
+
+For if (flags & RADIX_TREE_ITER_TAGGED), will search the 'iter->tags' to find
+out the first set bit index as the 'offset'. Please note that the first bit of
+'iter->tags' is for the 'iter->index', so this bit should be skipped here.
+
+If all the bits of 'iter->tags', BITS_PER_LONG, are scanned and no set bit is
+found, then return NULL.
+
+For non-TAGGED, will scan 'count = radix_tree_chunk_size(iter)' nodes in the
+same radix-tree level/layer. If can't found valid slot, return NULL too.
+
+
+If kernel successfully find a valid internal slot, then the search should be
+down to the next level for the external node/leaf:
+
+	if (unlikely(radix_tree_is_internal_node(rcu_dereference_raw(*slot))))
+		return __radix_tree_next_slot(slot, iter, flags);
+
+2. 使用 page cache中已经存在的 pages 来建立页表
+
+alloc_set_pte(vmf, NULL, page) 完成此任务。
+
+在此之前，会调用 page = radix_tree_deref_slot(slot); 获得 page cache 中对应的
+page帧.
+
+在 alloc_set_pte()中，核心是 ：
+	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+
+但是 有一点需要特别提及， 即便当前访问的是 file
+mapping的空间，如果该file的访问方式是 MAP_PRIVATE 且 WRITE，那么此 page
+还会被映射为 anonymous。 I think that is what the commentary said:
+	/*
+	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
+	 * list, after a COW of one of the file pages.	A MAP_SHARED vma
+	 * can only be in the i_mmap tree.  An anonymous MAP_PRIVATE, stack
+	 * or brk vma (with NULL file) can only be in an anon_vma list.
+	 */
+	struct list_head anon_vma_chain;
+
+
+如果 do_fault_around() got failed, 会转入通常的处理途径:
+
+	ret = __do_fault(vmf);
+	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY)))
+		return ret;
+
+	ret |= finish_fault(vmf);
+
+因此重点是 __do_fault(). 会在其它地方描述 __do_fault().
+
+
+
+最后，还有一个问题， 在 filemap_map_pages()中，有以下这个conditions:
+
+		if (!PageUptodate(page) ||
+				PageReadahead(page) ||
+				PageHWPoison(page))
+			goto skip;
+
+我没想明白 为什么 PageReadahead(page) 需要skip？ PageUptodate(page)
+已经确保该page已经在 page-cache中了，应该可以将此page 完成到 vma
+address的mapping啊。
+

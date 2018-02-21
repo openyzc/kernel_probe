@@ -1,0 +1,185 @@
+
+In mm/mmap.c :
+
+SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, pgoff)
+
+
+This is the really functon to implement the mmap().
+
+
+1. For MAP_ANONYMOUS mmapping, the 'fd' and 'offset' arguments are ignored;
+
+So, for the non-MAP_ANONYMOUS, kernel should get the 'struct file' firstly by
+the parameter of 'fd':
+
+		file = fget(fd);
+
+
+At this moment, we just skip the process relevant to MAP_HUGETLB.
+
+
+Ok. Let's start the core function of vm_mmap_pgoff().
+
+	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
+
+	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+
+
+
+unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+	unsigned long len, unsigned long prot,
+	unsigned long flag, unsigned long pgoff)
+{
+	unsigned long ret;
+	struct mm_struct *mm = current->mm;
+	...
+
+	if (!ret) {
+		if (down_write_killable(&mm->mmap_sem))
+			return -EINTR;
+		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
+				    &populate, &uf);
+		up_write(&mm->mmap_sem);
+		userfaultfd_unmap_complete(mm, &uf);
+		if (populate)
+			mm_populate(ret, populate);
+	}
+	return ret;
+}
+
+		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
+				    &populate, &uf);
+		--> do_mmap(file, addr, len, prot, flags, 0, pgoff, populate,
+			uf)
+
+
+2. do_mmap() --> get_unmapped_area
+
+/* The generic 'get_unmapped_area' is 'arch_get_unmapped_area'. */
+	get_area = current->mm->get_unmapped_area;
+/* For file mapping, if file->f_op->get_unmapped_area is registered, overwrite
+ * the generic 'current->mm->get_unmapped_area'. */
+	if (file) {
+		if (file->f_op->get_unmapped_area)
+			get_area = file->f_op->get_unmapped_area;
+	} else if (flags & MAP_SHARED) {
+		/* For shared ANONYMOUS mapping....  */
+		pgoff = 0;
+		get_area = shmem_get_unmapped_area;
+	}
+
+Here, kernel will allocate the idle VMA sub-range from the 'struct rb_root
+mm_rb' of the 'current->mm'.
+
+2.1 file->f_op->get_unmapped_area
+
+It seems all these hooks are based on the generic 'get_unmapped_area'. Even
+there are file-specific hooks, some special handlings are added for the huge
+table.
+
+2.2 shmem_get_unmapped_area
+The base is still 'current->mm->get_unmapped_area :
+	get_area = current->mm->get_unmapped_area;
+	addr = get_area(file, uaddr, len, pgoff, flags);
+
+Only when the 'addr' returned can be applied for anonymous SHMEM_HUGE, then will
+call this:
+	inflated_addr = get_area(NULL, 0, inflated_len, 0, flags);
+
+please note the 'inflated_len' is not less than the original 'len' parameter.
+
+
+3. mmap_region()
+
+3.1 file mapping
+
+We care about the file mapping relevant handlings here.
+
+		vma->vm_file = get_file(file);
+		error = call_mmap(file, vma);
+		if (error)
+			goto unmap_and_free_vma;
+
+		...
+		addr = vma->vm_start;
+		vm_flags = vma->vm_flags;
+
+static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	return file->f_op->mmap(file, vma);
+}
+
+So, what will be done in 'file->f_op->mmap'???
+
+For ext4, this hook points to 'ext4_file_mmap' :
+
+	if (IS_DAX(file_inode(file))) {
+		vma->vm_ops = &ext4_dax_vm_ops;
+		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+	} else {
+		vma->vm_ops = &ext4_file_vm_ops;
+	}
+
+There are no any operations relevant to the pagecache. Only 'vma->vm_ops =
+&ext4_file_vm_ops'.
+The 'ext4_filemap_fault' should play a role when in page fault during the memory
+accesses on the mapped VMA range.
+
+3.2 Anonymous shared mode
+
+in mmap_region():
+
+	} else if (vm_flags & VM_SHARED) {
+		error = shmem_zero_setup(vma);
+		if (error)
+			goto free_vma;
+	}
+
+
+int shmem_zero_setup(struct vm_area_struct *vma)
+{
+	...
+	file = __shmem_file_setup("dev/zero", size, vma->vm_flags, S_PRIVATE);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = file;
+	vma->vm_ops = &shmem_vm_ops;
+	...
+}
+
+/* No matter file-mapped or anonymous shared mapped, the 'mmap()' hook will set
+ * 'vma->vm_ops', 'vma->vm_file' */
+
+For SHM, the important operation structure is 'shmem_vm_ops'.
+
+
+For SHM inode, in ramfs_fill_super(), there are these processings:
+
+	sb->s_maxbytes		= MAX_LFS_FILESIZE;
+	sb->s_blocksize		= PAGE_SIZE;
+	sb->s_blocksize_bits	= PAGE_SHIFT;
+	sb->s_magic		= RAMFS_MAGIC;
+	sb->s_op		= &ramfs_ops;
+	sb->s_time_gran		= 1;
+
+it seems not to set 'struct dentry_operations *s_d_op' of struct super_block for
+this inode.
+
+
+in __shmem_file_setup(), kernel will not linked the dentry newly created into
+the dcache by the field of 'struct hlist_bl_node d_hash;' of struct dentry. I
+think that is why the 'dev/zero' can be applied as the name for
+__shmem_file_setup(), you known, it is probably several callings on this
+function.
+
+
+This anonaymous shared mapping will create a SHM file for this anonymous VMA.
+But how to use this SHM file?
+
+
+

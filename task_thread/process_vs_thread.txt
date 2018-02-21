@@ -1,0 +1,22 @@
+
+What is the relation between process and thread in Linux?
+
+you can also refer to these:
+
+https://my.oschina.net/cnyinlinux/blog/422207
+
+https://my.oschina.net/cnyinlinux/blog/367910
+
+1. In Linux, thread will share the memory space as the thread leader/main
+thread/process, but with a separate stack which is from the input parameter of
+clone();
+
+2. execv() will make the thread to be upgraded as process/thead leader; All the
+other threads of same thread group will be killed. Please refer to de_thread();
+
+3. For a process, a separate stack in TOP VMA space is created when kernel is
+exec() this process.
+
+
+
+

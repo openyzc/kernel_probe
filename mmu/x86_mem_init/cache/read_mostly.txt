@@ -1,0 +1,43 @@
+
+
+http://blog.csdn.net/yeyuangen/article/details/7307326
+
+
+ __read_mostly原语将定义为存放在.data.read_mostly段中
+
+  include/asm/cache.h
+
+#define __read_mostly __attribute__((__section__(".data.read_mostly")))
+
+    由此可见,我们可以将经常需要被读取的数据定义为 __read_mostly类型,
+这样Linux内核被加载时,该数据将自动被存放到Cache中,以提高整个系统的执行效率.
+
+   另一方面,如果所在的平台没有Cache,或者虽然有Cache,但并不提供存放数据的接口,(也就是并不允许人工放置数据在Cache中),
+这样定义为
+__read_mostly类型的数据将不能存放在Linux内核中,甚至也不能够被加载到系统内存去执行,将造成Linux
+内核启动失败.
+
+   解决的方法有两种:
+
+   修改include/asm/cache.h中的__ready_mostly定义为:
+
+   #define __read_mostly
+
+   或者修改arch/xxx/kernel/vmlinux.S
+
+   修改.data.read_mostly段的位置到实际内存空间中去,例如放置在 .data段之后等等
+
+
+
+In vmlinux.lds.h :
+
+#define READ_MOSTLY_DATA(align)						\
+	. = ALIGN(align);						\
+	*(.data..read_mostly)						\
+	. = ALIGN(align);
+
+	READ_MOSTLY_DATA(cacheline)
+
+in arch/x86/include/asm/cache.h :
+
+#define __read_mostly __attribute__((__section__(".data..read_mostly")))

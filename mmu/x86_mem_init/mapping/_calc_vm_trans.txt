@@ -1,0 +1,10 @@
+
+
+#define _calc_vm_trans(x, bit1, bit2) \
+  ((bit1) <= (bit2) ? ((x) & (bit1)) * ((bit2) / (bit1)) \
+   : ((x) & (bit1)) / ((bit1) / (bit2)))
+
+
+This macro is to move the bit value from bit1 to bit2;
+
+

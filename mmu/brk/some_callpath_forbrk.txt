@@ -1,0 +1,123 @@
+
+In mm/mmap.c, there are several functions to manage the brk.
+
+What are the differences between them?
+
+
+Case 1)
+
+int vm_brk(unsigned long addr, unsigned long len)
+{
+	return vm_brk_flags(addr, len, 0);
+}
+
+
+Case 2)
+
+SYSCALL_DEFINE1(brk, unsigned long, brk)
+{
+	unsigned long retval;
+	unsigned long newbrk, oldbrk;
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *next;
+	unsigned long min_brk;
+	bool populate;
+	LIST_HEAD(uf);
+
+	if (down_write_killable(&mm->mmap_sem))
+		return -EINTR;
+	...
+	/* Ok, looks good - let it rip. */
+	if (do_brk(oldbrk, newbrk-oldbrk, &uf) < 0)
+		goto out;
+	...
+}
+
+static int do_brk(unsigned long addr, unsigned long len, struct list_head *uf)
+{
+	return do_brk_flags(addr, len, 0, uf);
+}
+
+
+Case 3)
+
+In fs/binfmt_elf.c :
+static int set_brk(unsigned long start, unsigned long end, int prot)
+{
+	start = ELF_PAGEALIGN(start);
+	end = ELF_PAGEALIGN(end);
+	if (end > start) {
+		/*
+		 * Map the last of the bss segment.
+		 * If the header is requesting these pages to be
+		 * executable, honour that (ppc32 needs this).
+		 */
+		int error = vm_brk_flags(start, end - start,
+				prot & PROT_EXEC ? VM_EXEC : 0);
+		if (error)
+			return error;
+	}
+	current->mm->start_brk = current->mm->brk = end;
+	return 0;
+}
+
+
+1. All are based on do_brk_flags()
+
+Case 1 and case 3 will call vm_brk_flags() in the end.
+Case 2 will call do_brk_flags().
+
+int vm_brk_flags(unsigned long addr, unsigned long len, unsigned long flags)
+{
+	struct mm_struct *mm = current->mm;
+	int ret;
+	bool populate;
+	LIST_HEAD(uf);
+
+	if (down_write_killable(&mm->mmap_sem))
+		return -EINTR;
+
+	ret = do_brk_flags(addr, len, flags, &uf);
+	populate = ((mm->def_flags & VM_LOCKED) != 0);
+	up_write(&mm->mmap_sem);
+	userfaultfd_unmap_complete(mm, &uf);
+	if (populate && !ret)
+		mm_populate(addr, len);
+	return ret;
+}
+
+But vm_brk_flags() calls do_brk_flags() too.
+
+## So, all these function are depended on do_brk_flags().
+
+2. vm_brk_flags is a small sys_brk()
+
+The basic flow are same.
+
+down_write_killable(&mm->mmap_sem)
+do_brk_flags(addr, len, flags, &uf)
+at last, poulate the physical pages if needed :
+	if (populate && !ret)
+		mm_populate(addr, len);
+
+The difference are:
+1) for sys_brk(), 'flags' is 0;
+   for vm_brk_flags(), 'flags' is an input parameter, although it can only
+support VM_EXEC now. (You can refer to the do_brk_flags())
+2) Strict checkings will perform in sys_brk() on the address range;
+	--> no any overlaps with the mmap area;
+	--> input 'brk' should bigger than 'mm->start_brk';
+	--> support brk area shrinking;
+
+
+There are some common things for vm_brk and sys_brk :
+	--> When request the unmmapped address, apply the 'MAP_FIXED';
+	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
+	## this is in the common called function, do_brk_flags();
+	--> The mapping is anonymous;
+	--> The start address is page-align, the length will be extended to the
+	multiple of PAGE_SIZE;
+	--> The default VMA flags will be updated as:
+		flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
+
+

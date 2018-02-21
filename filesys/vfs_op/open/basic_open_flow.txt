@@ -1,0 +1,32 @@
+
+
+SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
+
+	--> do_sys_open(AT_FDCWD, filename, flags, mode)
+
+
+1. initialize the 'struct open_flags op' based on the input 'flags' and 'mode'
+	struct open_flags op;
+	int fd = build_open_flags(flags, mode, &op);
+
+Should return 0 when build_open_flags() is successful.
+
+
+2. convert the 'filename' to struct filename *tmp in kernel space
+	tmp = getname(filename);
+
+3. allocate a idle FD id
+
+	fd = get_unused_fd_flags(flags);
+
+return a non-negative value when successfully.
+
+4. The open procedure
+	struct file *f = do_filp_open(dfd, tmp, &op);
+		--> path_openat(&nd, op, flags | LOOKUP_RCU)
+
+The 'tmp' is the path paramter, &op is the local variable of struct open_flags.
+'flags' of path_openat() is 'int flags = op->lookup_flags;'.
+
+
+

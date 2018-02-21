@@ -1,0 +1,24 @@
+
+
+int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
+	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
+	struct vm_area_struct *expand)
+
+
+*vma: point to the VMA which will be adjusted the range for all cases excepts
+the case 8;( For case 8, the *vma will be swapped with the 'next'. So, the
+'next' is really adjusted.);
+
+start + end : the range of new VMA;
+
+*insert: After the '*vma' is adjusted/updated, this '*insert' will be inserted
+to the RB tree;
+
+
+*expand: only used to make sure the case is 8;
+
+
+This function will update the '*vma' and return 0 when succeed.
+
+
+

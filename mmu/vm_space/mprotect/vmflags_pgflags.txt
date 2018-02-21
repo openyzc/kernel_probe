@@ -1,0 +1,103 @@
+
+1. The access/protection attribute flags
+
+	vm_flags |= calc_vm_prot_bits(prot, pkey) | calc_vm_flag_bits(flags) |
+			mm->def_flags | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC;
+
+The above processing will convert the original input 'flags' or 'prot' to the
+corresponding kernel VM flags. The core is macro _calc_vm_trans(x, bit1, bit2).
+We take this as example:
+	_calc_vm_trans(prot, PROT_READ,  VM_READ )
+
+If the PROT_READ bit of 'prot' is set, then this macro will return a value whose
+VM_READ bit is set(only this bit).
+
+
+2.1 
+
+Q1? What are the relationship between vm_flags, file->f_mode, inode->i_flags?
+
+
+
+Q2? What is the difference between VM_MAYWRITE, VM_WRITE
+
+2.2 'vma->vm_page_prot' vs 'vma->vm_flags'
+
+This will reveal how to convert the 'vm_flags' into page flags.
+
+
+
+pgprot_t protection_map[16] = {
+	__P000, __P001, __P010, __P011, __P100, __P101, __P110, __P111,
+	__S000, __S001, __S010, __S011, __S100, __S101, __S110, __S111
+};
+
+pgprot_t vm_get_page_prot(unsigned long vm_flags)
+{
+	return __pgprot(pgprot_val(protection_map[vm_flags &
+				(VM_READ|VM_WRITE|VM_EXEC|VM_SHARED)]) |
+			pgprot_val(arch_vm_get_page_prot(vm_flags)));
+}
+
+The array index of protection_map[16] is decided by the bit value of
+'(VM_READ|VM_WRITE|VM_EXEC|VM_SHARED)' in 'vm_flags'. The bit 0 is VM_READ, bit
+1 is VM_WRITE, bit 2 is VM_EXEC, bit 3 is VM_SHARED. So, total element count is
+16.
+
+With the values defined in 'protection_map[16]', kernel can convert the lowest 4
+bits of vm_flags into the page attributes defined in
+arch/x86/asm/pgtable_types.h, such as :
+
+#define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | \
+				 _PAGE_ACCESSED | _PAGE_NX)
+
+#define PAGE_COPY_NOEXEC	__pgprot(_PAGE_PRESENT | _PAGE_USER |	\
+					 _PAGE_ACCESSED | _PAGE_NX)
+...
+#define PAGE_COPY		PAGE_COPY_NOEXEC
+
+1)
+On x86,
+	if VM_WRITE is set, VM_READ is implicitly set too, which means the page
+	attributes between __P010 and __P011, __P110 and __P111 are same.
+
+	if VM_SHARED is set, _PAGE_RW will be set in the PTE;
+
+It seems the PAGE_COPY is for COW when a specific private page data is needed,
+then the copy from the original page can be performed.
+
+2) !VM_SHARED will ensure the page flags setting is private
+
+When !VM_SHARED, these page flags will be used:
+
+#define __P000	PAGE_NONE
+#define __P001	PAGE_READONLY
+#define __P010	PAGE_COPY
+#define __P011	PAGE_COPY
+#define __P100	PAGE_READONLY_EXEC
+#define __P101	PAGE_READONLY_EXEC
+#define __P110	PAGE_COPY_EXEC
+#define __P111	PAGE_COPY_EXEC
+
+Please note, there are no _PAGE_RW in all the above macros. Take an example :
+
+#define PAGE_COPY_NOEXEC	__pgprot(_PAGE_PRESENT | _PAGE_USER |	\
+					 _PAGE_ACCESSED | _PAGE_NX)
+#define PAGE_COPY		PAGE_COPY_NOEXEC
+
+#define PAGE_SHARED	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_USER | \
+				 _PAGE_ACCESSED | _PAGE_NX)
+
+
+SO, _PAGE_RW is set only for VM_SHARED area.
+
+That is the role of VM_SHARED for page entries.
+
+
+
+
+
+
+
+
+

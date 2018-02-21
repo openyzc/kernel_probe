@@ -1,0 +1,31 @@
+
+
+Besides the thread.sp0, it seems there is an extra stack for the
+interrupt/exception handling.
+
+
+you can refer there code in entry_64.S :
+
+	movq	%rsp, %rdi
+	incl	PER_CPU_VAR(irq_count)
+	cmovzq	PER_CPU_VAR(irq_stack_ptr), %rsp
+	pushq	%rdi
+
+	...
+
+ret_from_intr:
+	DISABLE_INTERRUPTS(CLBR_ANY)
+	TRACE_IRQS_OFF
+	decl	PER_CPU_VAR(irq_count)
+
+	/* Restore saved previous stack */
+	popq	%rsp
+
+	testb	$3, CS(%rsp)
+	jz	retint_kernel
+
+
+
+I think, the top of irq_stack_ptr can be pushed into 'irq_stack_ptr' when
+interrupt embeding happened.
+

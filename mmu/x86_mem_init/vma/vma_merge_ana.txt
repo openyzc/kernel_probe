@@ -1,0 +1,83 @@
+
+
+The function of vma_merge() defined in mm/mmap.c :
+
+struct vm_area_struct *vma_merge(struct mm_struct *mm,
+			struct vm_area_struct *prev, unsigned long addr,
+			unsigned long end, unsigned long vm_flags,
+			struct anon_vma *anon_vma, struct file *file,
+			pgoff_t pgoff, struct mempolicy *policy,
+			struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
+
+
+mm: where do the VMAs belong to; It is only used to get the next VMA when the
+input '*prev' is NULL;
+
+*prev: The VMA to be merged is [addr, end). This range should fall into the
+range defined by '*prev->vm_start' and 'next->vm_end'. Here, 'next' is the next
+of '*pdev'; More important is that, [addr, end) should be adjacent with
+'*prev->vm_end' on the left 'addr' or be adjacent to 'area->vm_end' by the right
+'end'; For the later case, the area->next->vm_start will aslo have two cases:
+1) end == area->next->vm_start; or
+2) end < area->next->vm_start;
+For the first case, the 'next' will be updated as 'area->vm_next';
+
+IF there are no any adjacence with the '*prev' or 'area/next', this vma_merge()
+will not perform any merges;
+
+
+You can refer to
+http://edsionte.com/techblog/archives/category/linux%E5%86%85%E6%A0%B8/%E5%86%85%E5%AD%98%E7%AE%A1%E7%90%86/page/3
+
+There are 8 cases of the relation between '*prev', 'next', and the new VMA of
+[addr, end) :
+
+case 1: prev->vm_end == addr && end == next->vm_start; (There is no space
+between new VMA and the next VMA)
+
+	prev will be extended to cover prev + new + next;
+
+case 2: prev->vm_end == addr && end < next->vm_start; (There is space between
+new VMA and the next VMA. NO any VMA is overlapped by new VMA)
+
+	prev will be extended to cover the new VMA;
+
+case 6:  prev->vm_end == addr && end == area->vm_end && end ==
+area->next_vm->vm_start;
+
+	prev will be extended to cover prev + new + area->next_vm && area will
+be overwritten by the new '*prev' and removed;
+
+case 5: prev->vm_end == addr && end > area->vm_start or next->vm_start;
+(new VMA is overlapping with the next)
+
+	next will be shrinked and prev will be extended to cover 'prev + new';
+
+case 7: prev->vm_end == addr && end == area->vm_end && end <
+next->vm_start;(There is space between area and next. area is overlapped by new
+VMA)
+
+	prev will be extended to cover 'prev + new' && area will be removed;
+
+
+case 4: prev->vm_end > addr && end == next->vm_start; (New VMA is overlapping
+with prev)
+
+	prev will be shinked and next will be extended to cover 'next + new';
+
+case 3: prev->vm_end < addr && end == next_vm_start; (New VMA is in the gap of
+prev and next)
+
+	next will be extended to cover 'next + new';
+
+case 8: prev->vm_end < addr && end == area->vm_end && end ==
+area->vm_next->vm_start; (New VAM covers the area)
+
+	area will be removed and next will be extended to cover 'next + new';
+
+
+
+According to the above cases, the vm_merge() will call __vma_adjust() with
+different parameters, especially the start 'addr' and 'end' of new VMA.
+For vm_merge(), there is no 'insert' paramter when calling __vma_adjust();
+

@@ -1,0 +1,120 @@
+
+https://lwn.net/Articles/625077/
+
+可以参考 generic_perform_write()中相关的iov操作。
+
+
+struct iov_iter {
+/* type 包含两部分. bit0 表示direction，R0 or W1. 其它bits 采用诸如
+ * ITER_KVEC之类的 enum 定义。*/
+	int type;
+/* 表示 iteration过程中当前在 scanning的vector 已经R/W了多少字节的数据.  */
+	size_t iov_offset;
+/* 整个 iter chunks待R/W 的bytes数. */
+	size_t count;
+/* 下面的 union指向对应 type的数组. 譬如 '*iov' 是指向 struct iovec
+ * []表示的chunks. */
+	union {
+		const struct iovec *iov;
+		const struct kvec *kvec;
+		const struct bio_vec *bvec;
+		struct pipe_inode_info *pipe;
+	};
+	union {
+/* 还有多少 iter vectors 待处理. */
+		unsigned long nr_segs;
+		struct {
+			int idx;
+			int start_idx;
+		};
+	};
+};
+
+
+enum {
+/* 对应user-space的读写调用，例如 writev中的 struct iovec*/
+	ITER_IOVEC = 0,
+/* 这种type的 iov buffer chunks都是kernel space */
+	ITER_KVEC = 2,
+/* 操作blk 的buffer... 没有深入跟踪... */
+	ITER_BVEC = 4,
+/* 似乎 与 ITER_IOVEC 近似... */
+	ITER_PIPE = 8,
+};
+
+
+我们以下面宏来给出对iov_itr的分析。
+
+1.
+#define iterate_and_advance(i, n, v, I, B, K) {
+
+1) i指向 描述本次操作所涉及的 iteratioin chunks 对应的 struct iov_iter结构；
+	n 是本次调用 iov_iter_advance 希望处理的byte数。此n可以小于 i->count；
+	v是定义在宏内部的local ‘struct iovec v‘--对于ITER_IOVEC |
+	ITER_PIPE，主要是内部iternation处理时用于保存每次iteration处理的数据len
+	和起始address; 如果某次 iternation处理的 n字节超过了i中某个vector的
+	iov_len,会延续处理i中'struct iovec *iov'指向的下一个vector;
+	I 是对应 ITER_IOVEC | ITER_PIPE 的iternation 处理hook;
+	B 是对应 ITER_BVEC的hook;
+	K 是对应 ITER_KVEC 的 hook;
+2) iterate_and_advance的主要功能是 调整 i->nr_segs，i->iov, i->count,
+i->iov_offset以反映下一次iteration需处理的位置；
+
+3) 主体函数是 iterate_iovec(i, n, v, iov, skip, (I))
+此函数是尝试处理n字节的数据，并会被更新为真实完成了处理的字节数；
+iov指向的是最后被处理的vector,此结构中的成员都没有被修改，iteration中的变动都是'v'中体现；
+skip反映的是在最后处理的 vector中实际完成的字节数；
+因此如果 skip ==
+iov->iov_len，那么表示最后处理的vector是都处理完了，可以移动到下一个vector去：
+			if (skip == iov->iov_len) {		\
+				iov++;				\
+				skip = 0;			\
+			}
+
+
+补充一个， local的'v'变量中的 __v.iov_len 是记录某次 (STEP)处理的字节数。参见
+iterate_iovec. 该宏中的 size_t left 是(STEP)返回的本次STEP 遗留的byte数。
+
+
+2.
+宏 #define iterate_all_kinds(i, n, v, I, B, K) {
+
+不同于 iterate_and_advance(i, n, v, I, B, K)，iterate_all_kinds没有更新
+i,只是对n覆盖的 vectors 进行对应的 （I）/（B）/（K）的处理。
+
+3.
+首次         if (likely(__v.iov_len)) {                      \
+下的 left = (STEP)；是首先根据当前 'i->iov'中剩余的 iov_len来开始希望的'n'
+字节数据。 如果 n > i->iov->iov_len, 那么将继续下面的 'while (unlikely(!left &&
+n)) {' 从下一个vector开始来完成余下的数据。
+#define iterate_iovec(i, n, __v, __p, skip, STEP) {	\
+	size_t left;					\
+	size_t wanted = n;				\
+	__p = i->iov;					\
+	__v.iov_len = min(n, __p->iov_len - skip);	\
+	if (likely(__v.iov_len)) {			\
+		__v.iov_base = __p->iov_base + skip;	\
+		left = (STEP);				\
+		__v.iov_len -= left;			\
+		skip += __v.iov_len;			\
+		n -= __v.iov_len;			\
+	} else {					\
+		left = 0;				\
+	}						\
+	while (unlikely(!left && n)) {			\
+		__p++;					\
+		__v.iov_len = min(n, __p->iov_len);	\
+		if (unlikely(!__v.iov_len))		\
+			continue;			\
+		__v.iov_base = __p->iov_base;		\
+		left = (STEP);				\
+		__v.iov_len -= left;			\
+		skip = __v.iov_len;			\
+		n -= __v.iov_len;			\
+	}						\
+	n = wanted - n;					\
+}
+
+
+
+

@@ -1,0 +1,98 @@
+
+This function will increase the counter only when the current counter value is
+not negative. Otherwise, will return 0(FALSE) directly without any increasement.
+
+There is another sense, this function will check whether the current value is
+negative, if yes, 0 will be returned without any increase.
+
+static inline int atomic_inc_unless_negative(atomic_t *p)
+{
+	int v, v1;
+	for (v = 0; v >= 0; v = v1) {
+		v1 = atomic_cmpxchg(p, v, v + 1);
+		if (likely(v1 == v))
+			return 1;
+	}
+	return 0;
+}
+
+When current counter value is postive, no decreasing happens, return 0(FALSE)
+direclty; When current value is >=0, decreasing will perform, return 1(TRUE)
+when match.
+
+
+static inline int atomic_dec_unless_positive(atomic_t *p)
+{
+	int v, v1;
+	for (v = 0; v <= 0; v = v1) {
+		v1 = atomic_cmpxchg(p, v, v - 1);
+		if (likely(v1 == v))
+			return 1;
+	}
+	return 0;
+}
+
+
+In summary, atomic_inc_unless_negative() will return F when current negative; If
+update happens, the new counter value should be > 0 (postive);
+atomic_dec_unless_positive() will return F directly for current postive; The
+decrease only happens when current counter is not positive;
+
+
+If current 'file' is allowed to write, this deny_write_access() will return
+'-ETXTBSY' which represents we can't deny write now. So, can't configure as
+'deny write' with this function;
+
+static inline int deny_write_access(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	return atomic_dec_unless_positive(&inode->i_writecount) ? 0 : -ETXTBSY;
+}
+
+
+If the current 'inode' was configured as write denial, can not update it as
+writable by this API. return '-ETXTBSY' directly.
+
+static inline int get_write_access(struct inode *inode)
+{
+	return atomic_inc_unless_negative(&inode->i_writecount) ? 0 : -ETXTBSY;
+}
+
+It seems inode_is_open_for_write() is used to check whether the 'inode' can be
+written.
+
+====================
+Based on the above result, we continue on these inline functions:
+
+/* Whether the mapping is writable... */
+static inline int mapping_writably_mapped(struct address_space *mapping)
+{
+	return atomic_read(&mapping->i_mmap_writable) > 0;
+}
+/* make mapping writable if current 'i_mmap_writable' is not negative. which
+ * means that we can make the mapping writable only whan >= 0, otherwise return
+ * -EBUSY to represent denial of writable setting for this mapping. */
+static inline int mapping_map_writable(struct address_space *mapping)
+{
+	return atomic_inc_unless_negative(&mapping->i_mmap_writable) ?
+		0 : -EPERM;
+}
+
+static inline void mapping_unmap_writable(struct address_space *mapping)
+{
+	atomic_dec(&mapping->i_mmap_writable);
+}
+/* This is opposite of mapping_map_writable(). Which means to disable the
+ * writable mapping, and succeed only when current 'i_mmap_writable' <= 0, that
+ * is to say current is not writable. Otherwise will return -EBUSY. */
+static inline int mapping_deny_writable(struct address_space *mapping)
+{
+	return atomic_dec_unless_positive(&mapping->i_mmap_writable) ?
+		0 : -EBUSY;
+}
+
+static inline void mapping_allow_writable(struct address_space *mapping)
+{
+	atomic_inc(&mapping->i_mmap_writable);
+}
+

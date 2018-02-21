@@ -1,0 +1,161 @@
+
+On X86_32, there is only 32 bits for virtual address which means that maximum
+virtual address space is 4G. Normally, the user-land space will populate the
+0~3G, only the high 1G is for kernel.
+
+It can not setup the direct mapping for all physical memory.
+
+So, to support access the high memory, kernel for 32 bit systems introduce the
+HIGHMEM mechanism to make kernel access that range.
+
+On X86_32, there are three ways:
+
+FIX_KMAP;
+kmap;
+vmalloc;
+
+Here, we only discuss kmap first.
+
+
+1. initialize of kmap
+
+native_pagetable_init --> paging_init --> pagetable_init
+
+
+static void __init pagetable_init(void)
+{
+	pgd_t *pgd_base = swapper_pg_dir;
+
+	permanent_kmaps_init(pgd_base);
+}
+
+static void __init permanent_kmaps_init(pgd_t *pgd_base)
+{
+	unsigned long vaddr;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+
+	vaddr = PKMAP_BASE;
+	page_table_range_init(vaddr, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base);
+
+	pgd = swapper_pg_dir + pgd_index(vaddr);
+	p4d = p4d_offset(pgd, vaddr);
+	pud = pud_offset(p4d, vaddr);
+	pmd = pmd_offset(pud, vaddr);
+	pte = pte_offset_kernel(pmd, vaddr);
+	pkmap_page_table = pte;
+}
+
+
+1) page_table_range_init(vaddr, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base)
+
+This calling will setup the page table for kmap region between PKMAP_BASE ~
+PKMAP_BASE + PAGE_SIZE * LAST_PKMAP.
+
+This page_table_range_init() also was called by
+early_ioremap_page_table_range_init():
+
+The mapped range is:
+
+	vaddr = __fix_to_virt(__end_of_fixed_addresses - 1) & PMD_MASK;
+	end = (FIXADDR_TOP + PMD_SIZE - 1) & PMD_MASK;
+
+So, the page_table_range_init(vaddr, end, pgd_base) here will setup the page
+table for whole FIX MAP area. The special processing for FIX_KMAP_BEGIN ~
+FIX_KMAP_END makes sense at this moment. Because the PTE tables for FIX_KMAP are
+allocated the contiguous pages, the page table entries corresponding to the
+contiguous KM_TYPE are also stored in the contiguous pages. So, kernel can walk
+aroud the FIX_KMAP entries by 'kmap_pte'.
+
+But for PKMAP_BASE region, it is lower than FIX_MAP area, the
+page_table_range_init() called by permanent_kmaps_init() will not allocate
+contiguous pages to store the page table. But PKMAP area only populate one
+PMD_SIZE which correspond to one page for the PTEs. So, we still can use
+'pkmap_page_table' to walk around the PKMAP.
+
+As for how to use 'pkmap_page_table', you can refer to:
+kmap_to_page()
+
+2. How to use pkmap area to access high memory
+
+we can trace how the kmap() works to discover that.
+
+As the PKMAP has only LAST_PKMAP mapping entries, it is impossible to map all
+the high memory if the physical memory is large. So, how to use these LAST_PKMAP
+entries is an issue.
+
+The LAST_PKMAP is sharable in the kernel, we need to guarantee the idle PKMAP
+slot allocation should not be concurrent.
+That is why lock_kmap()/unlock_kmap() needed.
+
+void *kmap_high(struct page *page)
+{
+	unsigned long vaddr;
+
+	lock_kmap();
+	vaddr = (unsigned long)page_address(page);
+	if (!vaddr)
+		vaddr = map_new_virtual(page);
+	pkmap_count[PKMAP_NR(vaddr)]++;
+	BUG_ON(pkmap_count[PKMAP_NR(vaddr)] < 2);
+	unlock_kmap();
+	return (void*) vaddr;
+}
+
+*) page_address(page) will check whether the mapping between 'struct *page' and
+the pkmap virtual address exists. If not exists, which means this mapping is a
+new mapping, so, 'vaddr = map_new_virtual(page);'; Otherwise, the existing
+mapping will be returned by increasing the 'pkmap_count[]' directly since we
+don't need to build the mapping again.
+
+*) map_new_virtual()
+-- 'pte_t * pkmap_page_table' points to a page table whose size is LAST_PKMAP.
+It is initialized by permanent_kmaps_init() and point to the whole page table
+for PKMAP;
+-- when map_new_virtual() is called, will scan all the LAST_PKMAP entries to
+find a idle entry, because these entries are shared by whole kernel system, it
+is scarce. And this allocation must be protected by lock_kmap/unlock_kmap;
+-- The scanning start from the entry index allocated last time, that is what
+this code will do:
+	last_pkmap_nr = get_next_pkmap_nr(color);
+-- When the 'last_pkmap_nr' now is ZERO, which means kernel had a complete scan
+on the 'pkmap_page_table[]', and it is time to flush pkmap_page_table[] to free
+the entries which had been unmapped :
+	flush_all_zero_pkmaps();
+	count = get_pkmap_entries_count(color);
+-- After the above handling, it is possible there are idle entries. 'count =
+get_pkmap_entries_count(color);' will reset the count to rescan the whole
+entries. But this case is depent on whether all entries are populated. If there
+are no any entries are unmapped at the same time when the scanning is ongoing in
+map_new_virtual(), the scanning will be executed continuously.
+I wonder the current process in map_new_virtual() is not right if there are many
+kmap request concurrently. It seems the wait_queue will not be added into
+pkmap_map_wait.
+-- kunmap_high() will unmap the KMAP entries in using. Kernel will not clear the
+'pkmap_page_table[]' at once, because probably there are idle entries yet, we
+don't need to clear each unmapping, it is too expensive. So, kunmap_high() is
+only 'switch (--pkmap_count[nr])' and wakup the KMAP requests blocked by the
+kmap_high --> map_new_virtual;
+
+3. The work of pkmap_count[]
+
+static int pkmap_count[LAST_PKMAP];
+
+The index is the PKMAP entry ID;
+
+0: this entry is idle;
+1: this entry had been unmapped and is waiting for flush;
+>= 2: this entry is in using for a sucessful mapping; support mapping on the
+	same 'struct page';
+
+
+
+
+
+
+ 
+
+

@@ -1,0 +1,96 @@
+
+1. struct swap_info_struct *swap_info[MAX_SWAPFILES];
+
+每个sys_swapon() 会创建一个 struct swap_info_struct.
+至于会将地址保存在哪个array element, 参考 alloc_swap_info().
+最终选定的 element index 也会作为 'signed char type;' 的值。
+
+struct swap_info_struct {
+/* 经过 swapon后，flags中应该会设置了 SWP_WRITEOK. 参见 _enable_swap_info. */
+	unsigned long	flags;
+	signed short	prio;
+	struct plist_node list;
+	struct plist_node avail_list;
+	signed char	type;
+	unsigned int	max;
+	unsigned char *swap_map;
+/*只是在 blk_queue_nonrot(bdev_get_queue(p->bdev)) 时有分配内存.
+ * 这个目前可能是针对SSD硬盘的。此数组大小为maxpages/256 */
+	struct swap_cluster_info *cluster_info;
+/* 此成员是与 cluster_info搭配使用的，所有free的 struct
+ * swap_cluster_info会在此list中。此list的创建，可以参考
+ * setup_swap_map_and_extents. BTW，此函数的返回值是
+ * setup_swap_extents()返回的具有连续disk blocks 的swap page
+ * slots数。请注意，setup_swap_extends() 会更新本结构中的 max, pages,
+ * highest_bit这些fields. 每个page slot的大小就是系统使用的 page大小。
+	struct swap_cluster_list free_clusters;
+	unsigned int lowest_bit;
+	unsigned int highest_bit;/*初始值为 maxpages - 1 */
+	unsigned int pages;		/* total of usable pages of swap */
+	unsigned int inuse_pages;	/* number of those currently in use */
+	unsigned int cluster_next;	/* likely index for next allocation */
+	unsigned int cluster_nr;	/* countdown to next cluster search */
+/* 应该与 free_clusters关联使用的。scan_swap_map_slots -->
+ * scan_swap_map_try_ssd_cluster 会设置此field。 */
+	struct percpu_cluster __percpu *percpu_cluster;
+	struct swap_extent *curr_swap_extent;
+	struct swap_extent first_swap_extent;
+	struct block_device *bdev;	/* swap device or bdev of swap file */
+	struct file *swap_file;		/* seldom referenced */
+	unsigned int old_block_size;	/* seldom referenced */
+#ifdef CONFIG_FRONTSWAP
+	unsigned long *frontswap_map;	/* frontswap in-use, one bit per page */
+	atomic_t frontswap_pages;	/* frontswap pages in-use counter */
+#endif
+	spinlock_t lock;
+	struct work_struct discard_work; /* discard worker */
+	struct swap_cluster_list discard_clusters; /* discard clusters list */
+};
+
+
+对于 SSD swapfile来说， 定义了一个size 为
+DIV_ROUND_UP(maxpage, SWAPFILE_CLUSTER) 的 struct swap_cluster_info的数组。
+		nr_cluster = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
+
+		cluster_info = kvzalloc(nr_cluster * sizeof(*cluster_info),
+					GFP_KERNEL);
+
+这个数组通过 以下结构中的两个 struct swap_cluster_info 来使用。 head
+中的‘unsigned int data‘ 被设置为 struct swap_cluster_info [] 中的某个element
+index, 表示第一个CLUSTER_FLAG_FREE 的struct swap_cluster_info.
+而 tail中的 'unsigned int data' 指向 struct swap_cluster_info []
+中free的最后一个struct swap_cluseter_info.
+
+需要注意， 每个free的struct swap_cluster_info 的 'unsigned int data'
+都是指向下一个free的 struct swap_cluster_info 的element index。
+在struct swap_info_struct 中的'struct swap_cluster_list free_clusters;'
+对应的list 中，第一个free的struct swap_cluster_info的index总是保存在
+'free_clusters.head.data' 或 'free_clusters.tail.data'中，后续节点的
+index才保存在struct swap_cluseter_info[] 的某个 element的data中。
+
+struct swap_cluster_list {
+	struct swap_cluster_info head;
+	struct swap_cluster_info tail;
+};
+
+
+struct swap_cluster_info {
+	spinlock_t lock;	/*
+				 * Protect swap_cluster_info fields
+				 * and swap_info_struct->swap_map
+				 * elements correspond to the swap
+				 * cluster
+				 */
+	unsigned int data:24;
+	unsigned int flags:8;
+};
+
+上面的 data在free 链中是下一个空闲 struct swap_cluster_info 节点在数组中的下标。
+在已经分配的链中是 记录该节点使用的counter.
+
+具体以上结构的初始化，list的建立，请参考 setup_swap_map_and_extents().
+需要注意的是，添加到 free_clusters 中的 struct swap_cluster_info 不是相邻的
+elements，而是 从 'p->cluster_next / SWAPFILE_CLUSTER % SWAP_CLUSTER_COLS'
+开始的。
+
+2. 

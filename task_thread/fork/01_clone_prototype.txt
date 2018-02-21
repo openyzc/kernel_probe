@@ -1,0 +1,64 @@
+
+There are different prototype of clone() in kernel.
+
+
+in kernel/fork.c :
+
+#ifdef CONFIG_CLONE_BACKWARDS
+SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+		 int __user *, parent_tidptr,
+		 unsigned long, tls,
+		 int __user *, child_tidptr)
+#elif defined(CONFIG_CLONE_BACKWARDS2)
+SYSCALL_DEFINE5(clone, unsigned long, newsp, unsigned long, clone_flags,
+		 int __user *, parent_tidptr,
+		 int __user *, child_tidptr,
+		 unsigned long, tls)
+#elif defined(CONFIG_CLONE_BACKWARDS3)
+SYSCALL_DEFINE6(clone, unsigned long, clone_flags, unsigned long, newsp,
+		int, stack_size,
+		int __user *, parent_tidptr,
+		int __user *, child_tidptr,
+		unsigned long, tls)
+
+
+So, why are those prototypes needed?
+
+in arch/Kconfig :
+
+config CLONE_BACKWARDS
+        bool
+        help
+          Architecture has tls passed as the 4th argument of clone(2),
+          not the 5th one.
+
+config CLONE_BACKWARDS2
+        bool
+        help
+          Architecture has the first two arguments of clone(2) swapped.
+
+config CLONE_BACKWARDS3
+        bool
+        help
+          Architecture has tls passed as the 3rd argument of clone(2),
+          not the 5th one.
+
+So, we know the difference between them.
+
+I think there are different libc version where adopt different definition of
+clone().
+
+
+There is another Kconfig item relevant to the TLS:
+
+config HAVE_COPY_THREAD_TLS
+        bool
+        help
+          Architecture provides copy_thread_tls to accept tls argument via
+          normal C parameter passing, rather than extracting the syscall
+          argument from pt_regs.
+
+
+For x86, this is enabled in default.
+
+

@@ -1,0 +1,631 @@
+
+As for where 'apic' points to? Please refer to these Make rules:
+
+ifeq ($(CONFIG_X86_64),y)
+# APIC probe will depend on the listing order here
+obj-$(CONFIG_X86_NUMACHIP)      += apic_numachip.o
+obj-$(CONFIG_X86_UV)            += x2apic_uv_x.o
+obj-$(CONFIG_X86_X2APIC)        += x2apic_phys.o
+obj-$(CONFIG_X86_X2APIC)        += x2apic_cluster.o
+obj-y                           += apic_flat_64.o
+endif
+
+# APIC probe will depend on the listing order here
+obj-$(CONFIG_X86_BIGSMP)        += bigsmp_32.o
+
+# For 32bit, probe_32 need to be listed last
+obj-$(CONFIG_X86_LOCAL_APIC)    += probe_$(BITS).o
+
+
+
+
+
+In arch/x86/kernel/apic/apic.c :
+
+DEFINE_EARLY_PER_CPU_READ_MOSTLY(u16, x86_cpu_to_apicid, BAD_APICID);
+
+How to set this early percpu variable?
+
+
+void __init init_cpu_to_node(void)
+
+
+The call path should be :
+
+start_arch() ---> init_cpu_to_node() 
+
+
+
+int numa_cpu_node(int cpu)
+{
+	int apicid = early_per_cpu(x86_cpu_to_apicid, cpu);
+
+	if (apicid != BAD_APICID)
+		return __apicid_to_node[apicid];
+	return NUMA_NO_NODE;
+}
+
+
+1. NUMA intialization
+
+In setup_arch():
+
+	acpi_boot_table_init();
+
+	early_acpi_boot_init();
+
+	initmem_init();
+
+
+1) acpi_boot_table_init() will perform the initialization of ACPI
+namespace/tables; We don't dive into here. It belongs to ACPI driver framework.
+
+2) early_acpi_process_madt()
+
+static void __init early_acpi_process_madt(void)
+{
+#ifdef CONFIG_X86_LOCAL_APIC
+	int error;
+
+	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
+
+		/*
+		 * Parse MADT LAPIC entries
+		 */
+		error = early_acpi_parse_madt_lapic_addr_ovr();
+		if (!error) {
+			acpi_lapic = 1;
+			smp_found_config = 1;
+		}
+		if (error == -EINVAL) {
+			/*
+			 * Dell Precision Workstation 410, 610 come here.
+			 */
+			printk(KERN_ERR PREFIX
+			       "Invalid BIOS MADT, disabling ACPI\n");
+			disable_acpi();
+		}
+	}
+#endif
+}
+
+The major works of cpi_parse_madt() are :
+*) set 'acpi_lapic_addr = (u64) madt->address;'. This is the base address of
+lapic;
+*) 	default_acpi_madt_oem_check(madt->header.oem_id,
+				    madt->header.oem_table_id);
+Will set the '*apic' to the right 'static struct apic' variable, such as
+apic_x2apic_phys;
+
+I wonder for xeon, the 'apic' points to 'static struct apic
+apic_x2apic_cluster';
+
+
+*) early_acpi_parse_madt_lapic_addr_ovr() -->
+	register_lapic_address(acpi_lapic_addr);
+
+will set the 'boot_cpu_physical_apicid' and 'boot_cpu_apic_version';
+
+1.3 initmem_init
+
+void __init initmem_init(void)
+{
+	x86_numa_init();
+}
+
+
+void __init x86_numa_init(void)
+{
+	if (!numa_off) {
+#ifdef CONFIG_ACPI_NUMA
+		if (!numa_init(x86_acpi_numa_init))
+			return;
+#endif
+#ifdef CONFIG_AMD_NUMA
+		if (!numa_init(amd_numa_init))
+			return;
+#endif
+	}
+
+	numa_init(dummy_numa_init);
+}
+
+
+numa_off normally will be FALSE. So, numa_init(x86_acpi_numa_init) will be
+entered. This is the focus.
+
+
+1.3.1 some structures
+
+nodemask_t numa_nodes_parsed __initdata;
+
+#define node_online_map 	node_states[N_ONLINE]
+#define node_possible_map 	node_states[N_POSSIBLE]
+
+in mm/page_alloc.c :
+nodemask_t node_states[NR_NODE_STATES] __read_mostly = { ...
+
+in arch/x86/mm/numa.c :
+
+static struct numa_meminfo numa_meminfo;
+
+1.3.2 x86_acpi_numa_init
+
+int __init x86_acpi_numa_init(void)
+{
+	int ret;
+
+	ret = acpi_numa_init();
+	if (ret < 0)
+		return ret;
+	return srat_disabled() ? -EINVAL : 0;
+}
+
+
+int __init acpi_numa_init(void)
+{
+	int cnt = 0;
+
+	if (acpi_disabled)
+		return -EINVAL;
+
+	/*
+	 * Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
+	 * SRAT cpu entries could have different order with that in MADT.
+	 * So go over all cpu entries in SRAT to get apicid to node mapping.
+	 */
+
+	/* SRAT: Static Resource Affinity Table */
+	if (!acpi_table_parse(ACPI_SIG_SRAT, acpi_parse_srat)) {
+		struct acpi_subtable_proc srat_proc[3];
+
+		memset(srat_proc, 0, sizeof(srat_proc));
+		srat_proc[0].id = ACPI_SRAT_TYPE_CPU_AFFINITY;
+		srat_proc[0].handler = acpi_parse_processor_affinity;
+		srat_proc[1].id = ACPI_SRAT_TYPE_X2APIC_CPU_AFFINITY;
+		srat_proc[1].handler = acpi_parse_x2apic_affinity;
+		srat_proc[2].id = ACPI_SRAT_TYPE_GICC_AFFINITY;
+		srat_proc[2].handler = acpi_parse_gicc_affinity;
+
+		acpi_table_parse_entries_array(ACPI_SIG_SRAT,
+					sizeof(struct acpi_table_srat),
+					srat_proc, ARRAY_SIZE(srat_proc), 0);
+
+		cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
+					    acpi_parse_memory_affinity,
+					    NR_NODE_MEMBLKS);
+	}
+
+	/* SLIT: System Locality Information Table */
+	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
+
+	if (cnt < 0)
+		return cnt;
+	else if (!parsed_numa_memblks)
+		return -ENOENT;
+	return 0;
+}
+
+1)
+For ACPI_SRAT_TYPE_CPU_AFFINITY, ACPI_SRAT_TYPE_X2APIC_CPU_AFFINITY, will setup
+the following data by node = acpi_map_pxm_to_node(pxm):
+
+static int pxm_to_node_map[MAX_PXM_DOMAINS]
+			= { [0 ... MAX_PXM_DOMAINS - 1] = NUMA_NO_NODE };
+static int node_to_pxm_map[MAX_NUMNODES]
+			= { [0 ... MAX_NUMNODES - 1] = PXM_INVAL };
+
+2)
+setup the following by 'set_apicid_to_node(apic_id, node)' :
+
+s16 __apicid_to_node[MAX_LOCAL_APIC] = {
+	[0 ... MAX_LOCAL_APIC-1] = NUMA_NO_NODE
+};
+
+The index is apic_id, the value is node id.
+
+3)
+	cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
+				    acpi_parse_memory_affinity,
+				    NR_NODE_MEMBLKS);
+
+This will setup the numa_meminfo by this call path:
+	acpi_numa_memory_affinity_init() -->
+		numa_add_memblk(node, start, end)
+
+4) initialize the numa distance matrix
+
+	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
+
+
+1.3.3 clean up numa_meminfo
+
+	ret = numa_cleanup_meminfo(&numa_meminfo);
+
+Will check the configures MEMORY_AFFINITY of SRAT are valid.
+*) If anyone of them doesn't overlap with any the memblock.memory, it is
+invalid;
+*) The regions in numa_meminfo is clapped less than PFN_PHYS(max_pfn);
+*) The numa memory regions in numa_meminfo can be overlapping. But any two
+overlapped regions must be in the same node! otherwise, ERROR!
+
+*) how to merge two memory regions in numa_meminfo?
+	-- belong to the same node;  (bi->nid == bj->nid)
+	-- in the new range, there are no any other ranges overlapping with
+	different node;
+				if (start < bk->end && end > bk->start)
+					break;
+
+When these two are ok, then we can extend the memory region to cover another,
+this is what We said merging.
+
+
+
+
+1.3.4 ret = numa_register_memblks(&numa_meminfo)
+
+1) set node_possible_map
+	node_possible_map = numa_nodes_parsed;
+	numa_nodemask_from_meminfo(&node_possible_map, mi);
+
+I don't think 'node_possible_map = numa_nodes_parsed;' is needed.
+Because numa_nodes_parsed is all the nodes which were defined by SRAT, and
+after numa_cleanup_meminfo(), some memory regions were probably removed and it
+is possible there are no any valid memory regions in numa_meminfo for one
+specific node. So, How can we only call
+'numa_nodemask_from_meminfo(&node_possible_map, mi);' to set some node bits
+without any clean on 'node_possible_map' for some nodes without any memomry
+regions.
+
+
+2) update the nid of memblock.memory regions
+
+	for (i = 0; i < mi->nr_blks; i++) {
+		struct numa_memblk *mb = &mi->blk[i];
+		memblock_set_node(mb->start, mb->end - mb->start,
+				  &memblock.memory, mb->nid);
+	}
+
+
+After that, all memblock.memory regions have the right logic node id;
+
+3) clear the hotplug flag for those memory regions in memblock.reserved
+
+	numa_clear_kernel_node_hotplug();
+
+	*) set the nid of memblock.reserved regions
+	*) For any reserved regions with same node of numa_meminfo.blk[], clear
+	the MEMBLOCK_HOTPLUG;
+
+4) check the minimal alignment of valid numa node ranges >= PAGES_PER_SECTION
+	pfn_align = node_map_pfn_alignment();
+	if (pfn_align && pfn_align < PAGES_PER_SECTION) {
+		...
+
+Based on this, the memory regions of memblock for same node must belong to
+defferent memory section from other nodes' regions. Otherwise, SPARSEMEM can not
+divide the memory into different sections corresponding to different nodes.
+
+5) Check the NUMA node configurations are acceptable
+
+	numa_meminfo_cover_memory(mi);
+
+e820 from UEFI tell kernel what are available ranges. But if numa node
+configurations are not cover the e820 memory, will lead to big memory loss.
+This is not what we want, so, here will check how much memory loss.
+
+6)
+
+
+	for_each_node_mask(nid, node_possible_map) {
+		u64 start = PFN_PHYS(max_pfn);
+		u64 end = 0;
+
+## Here, we get the minimal 'start', maximum 'end' for a specific node;
+
+		for (i = 0; i < mi->nr_blks; i++) {
+			if (nid != mi->blk[i].nid)
+				continue;
+			start = min(mi->blk[i].start, start);
+			end = max(mi->blk[i].end, end);
+		}
+
+		if (start >= end)
+			continue;
+
+		/*
+		 * Don't confuse VM with a node that doesn't have the
+		 * minimum amount of memory:
+		 */
+		if (end && (end - start) < NODE_MIN_SIZE)
+			continue;
+
+		alloc_node_data(nid);
+	}
+
+
+## alloc_node_data(nid) will allocate 'pg_data_t' for nid. It is better this
+## memory allocated successfully is in the same node as 'nid';
+
+	tnid = early_pfn_to_nid(nd_pa >> PAGE_SHIFT);
+
+will get the corresponding node id for 'nd_pa'; This search is ineffective.
+
+At last, will set the bit in node_online_map :
+
+	node_set_online(nid);
+
+
+2. CPU id allocation
+
+2.1 some structures
+
+#define NR_CPUS		CONFIG_NR_CPUS
+
+int nr_cpu_ids __read_mostly = NR_CPUS;
+
+
+So, nr_cpu_ids >= 8 when SMP.
+You can refer to arch/x86/Kconfig for 'config NR_CPUS';
+
+You can also modify nr_cpu_ids by kernel parameter of "nr_cpus";
+
+
+/*
+ * The start available logical cpuid for the allocation. The initial value
+ * is 1 because the boot cpu always populate cpuid 0.
+ */
+static int nr_logical_cpuids = 1;
+
+
+static int cpuid_to_apicid[] = {
+	[0 ... NR_CPUS - 1] = -1,
+};
+
+The index is the logical cpu id, the value is the apic id;
+you can refer to allocate_logical_cpuid(apicid);
+
+2.2 The boot cpu initialization
+
+in start_kernel(), before setup_arch(), will call this:
+
+void __init boot_cpu_init(void)
+{
+	int cpu = smp_processor_id();
+
+	/* Mark the boot cpu "present", "online" etc for SMP and UP case */
+	set_cpu_online(cpu, true);
+	set_cpu_active(cpu, true);
+	set_cpu_present(cpu, true);
+	set_cpu_possible(cpu, true);
+
+#ifdef CONFIG_SMP
+	__boot_cpu_id = cpu;
+#endif
+}
+
+So, cpu 0 will be set in the bitstring.
+
+2.3  initialize numa
+
+
+Before this, I want to mention something about the kernel memomry PTE
+intialization.
+
+in start_kernel(), before the numa initialization, will setup the PTEs:
+
+	init_mem_mapping();
+
+You can check this function, it will setup the PTEs for [0, max_pfn << 12) or
+[0, max_low_pfn << PAGE_SHIFT);
+
+Ok. Let's return to the issue.
+
+	acpi_boot_table_init();
+
+	early_acpi_boot_init();
+
+	initmem_init();
+
+These three functions will finish the numa initialization.
+
+'acpi_boot_table_init();' is just to initiailze ACPI namespace/tables for coming
+accesses.
+
+2.3.1 parse MADT to get some info for boot cpu
+
+	acpi_boot_table_init();
+
+
+	--> early_acpi_process_madt()
+
+static void __init early_acpi_process_madt(void)
+{
+#ifdef CONFIG_X86_LOCAL_APIC
+	int error;
+/*
+ * Here, acpi_parse_madt() will get the base address of MADT.
+ * 	default_acpi_madt_oem_check(madt->header.oem_id,
+ *				    madt->header.oem_table_id);
+ *	default_acpi_madt_oem_check() will probe the 'struct apic' node to set
+ *	the 'struct apic *apic __ro_after_init = &apic_default;' to the
+ *	mathched 'struct apic' node. Then we can access the APIC though this
+ *	structure. But for x86_32, there is no 'acpi_madt_oem_check' hook, so,
+ *	the 'apic_default' will be used to access APIC data. For x86_64, there
+ *	is 'acpi_madt_oem_check', the matched 'struct apic' node will be used
+ *	through 'struct apic *apic' which is defined in apic_flag_64.c;
+ *	struct apic *apic __ro_after_init = &apic_flat;
+ */
+	if (!acpi_table_parse(ACPI_SIG_MADT, acpi_parse_madt)) {
+
+/*
+ * error = early_acpi_parse_madt_lapic_addr_ovr() -->
+ * register_lapic_address(acpi_lapic_addr)
+ */
+		error = early_acpi_parse_madt_lapic_addr_ovr();
+		if (!error) {
+			acpi_lapic = 1;
+			smp_found_config = 1;
+		}
+		if (error == -EINVAL) {
+			/*
+			 * Dell Precision Workstation 410, 610 come here.
+			 */
+			printk(KERN_ERR PREFIX
+			       "Invalid BIOS MADT, disabling ACPI\n");
+			disable_acpi();
+		}
+	}
+#endif
+}
+
+
+void __init register_lapic_address(unsigned long address)
+{
+	mp_lapic_addr = address;
+
+/*
+ * setup the fixmap mapping for APIC space.
+ * Then this macro will be applied to access LAPIC space :
+ * #define APIC_BASE (fix_to_virt(FIX_APIC_BASE)) by native_apic_mem_read();
+ */
+	if (!x2apic_mode) {
+		set_fixmap_nocache(FIX_APIC_BASE, address);
+		apic_printk(APIC_VERBOSE, "mapped APIC to %16lx (%16lx)\n",
+			    APIC_BASE, address);
+	}
+/*
+ * Get the Boot cpu's apicid and the apic version.
+ */
+	if (boot_cpu_physical_apicid == -1U) {
+		boot_cpu_physical_apicid  = read_apic_id();
+		boot_cpu_apic_version = GET_APIC_VERSION(apic_read(APIC_LVR));
+	}
+}
+
+2.3.2 numa initialization
+
+In arch/x86/mm/numa.c :
+
+void __init initmem_init(void)
+{
+	x86_numa_init();
+}
+
+--> numa_init(x86_acpi_numa_init)
+
+
+1) x86_acpi_numa_init --> acpi_numa_init
+
+Major works are to pase SRAT and SLIT.
+
+2) numa_init(int (*init_func)(void))
+
+update the memblock.memory and memblock.reserved;
+We had described just before.
+
+After this calling, all the numa memory regions are ready.
+
+
+2.4 apic probing for x86_32
+
+generic_apic_probe();
+
+
+2.5 Processors probing
+
+This step will allocate logical cpu id for all processors configured by ACPI;
+
+
+acpi_boot_init(void)  --> acpi_process_madt()
+
+	--> error = acpi_parse_madt_lapic_entries();
+
+The core functions are acpi_parse_lapic() and acpi_parse_x2apic().
+
+In MADT, the local APIC will be configured and with unique apic id.
+These two function will process the entries one by one to detect the processors
+and register these lapic/processors;
+
+	apic_id = processor->local_apic_id;
+	enabled = processor->lapic_flags & ACPI_MADT_ENABLED;
+	
+	if (!apic->apic_id_valid(apic_id) && enabled)
+		printk(KERN_WARNING PREFIX "x2apic entry ignored\n");
+	else
+		acpi_register_lapic(apic_id, processor->uid, enabled);
+
+Ok, acpi_register_lapic(apic_id, processor->uid, enabled) --> cpu =
+generic_processor_info(id, ver) will finish the registration and return the
+logical cpu id allocated.
+
+*) cpuid_to_apicid[] will be set by allocate_logical_cpuid(apicid);
+
+*) 	early_per_cpu(x86_cpu_to_apicid, cpu) = apicid;
+	early_per_cpu(x86_bios_cpu_apicid, cpu) = apicid;
+
+*) the 'cpu' bit of __cpu_possible_mask will be set :
+	set_cpu_possible(cpu, true);
+the 'apicid' bit of phys_cpu_present_map will be set :
+	physid_set(apicid, phys_cpu_present_map);
+the 'cpu' bit of __cpu_present_mask will be set :
+	set_cpu_present(cpu, true);
+
+
+2.6 adjust the nr_cpu_ids and __cpu_possible_mask
+
+The possible cpu should contain the CPUs disabled for CONFIG_HOTPLUG_CPU.
+And the nr_cpu_ids is also the total of all CPUs.
+
+2.7 setup 'x86_cpu_to_node_map'
+
+void __init init_cpu_to_node(void)
+{
+	int cpu;
+	u16 *cpu_to_apicid = early_per_cpu_ptr(x86_cpu_to_apicid);
+
+	BUG_ON(cpu_to_apicid == NULL);
+
+	for_each_possible_cpu(cpu) {
+		int node = numa_cpu_node(cpu);
+
+		if (node == NUMA_NO_NODE)
+			continue;
+
+		if (!node_online(node))
+			init_memory_less_node(node);
+
+		numa_set_node(cpu, node);
+	}
+}
+
+
+percpu x86_cpu_to_apicid : cpu id -------> apic id
+
+__apicid_to_node[]: apic id ----> node id
+
+
+So, we can setup the  'cpu id ----> node id' in percpu variable of
+'x86_cpu_to_node_map' by numa_set_node(int cpu, int node);
+
+
+That is what we want to discover!
+
+
+MADT : ACPI UID     ----------------> APIC ID
+
+One core corresponds to one APIC ID;
+
+SRAT: PXM  ----------------> APIC ID
+
+	PXM ------------> memomry range   (Memory Affinity Structure)
+
+I think,
+One PXM can have multiple APIC ID. So, One PXM can cover multiple cores(CPUs),
+and corresponds to one memory node.
+
+So, one NODE can cover several CPUs/COREs depending on the configuration.
+
+
+
+

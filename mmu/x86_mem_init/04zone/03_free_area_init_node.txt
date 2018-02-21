@@ -1,0 +1,126 @@
+
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+		free_area_init_node(nid, NULL,
+			find_min_pfn_for_node(nid), NULL);
+		...
+	}
+
+
+
+1. set_pfnblock_flags_mask and __get_pfnblock_flags_mask
+
+
+				   end_bitidx 0
+				     | _______|	
+
+
+if bitidx = 4, end_bitidx = 2, then bitidx+=end_bitidx will get 6.
+[4,6]
+
+(BITS_PER_LONG - bitidx - 1) = 64 - 7 = 57
+
+So, [4,6] ---> [57, 59] 
+
+
+[4,7]  ----> [56,59]
+
+
+These two functions are a bit strange.
+Through these two functions we can set the pageblock flags at the right place,
+such as '__pfn_to_section(pfn)->pageblock_flags'.
+
+But which bit of that ulong pageblock_flags is corresponding to the input 'pfn'
+and the 'end_bitidx'? (please note that 'end_bitidx' is enum pageblock_bits
+value)
+
+	bitmap = get_pageblock_bitmap(page, pfn);
+	bitidx = pfn_to_bitidx(page, pfn);
+	word_bitidx = bitidx / BITS_PER_LONG;
+	bitidx &= (BITS_PER_LONG-1);
+	...
+	bitidx += end_bitidx;
+	mask <<= (BITS_PER_LONG - bitidx - 1);
+	flags <<= (BITS_PER_LONG - bitidx - 1);
+
+It seems a convertion had been done. The original bit positions will be moduled
+by (BITS_PER_LONG - 1).
+I don't know why apply this algorithm.
+
+2. The call path
+
+zone_sizes_init(void) --> free_area_init_nodes(max_zone_pfns)
+	--> find_zone_movable_pfns_for_nodes
+	--> 		free_area_init_node(nid, NULL,
+				find_min_pfn_for_node(nid), NULL);
+
+
+3. what will zone_sizes_init() do
+
+'node_data[nid]' is set by alloc_node_data() in arch/x86/mm/numa.c;
+
+-- Whole memory will be divided into section, node, zone, page.
+-- How to divide the memory into ZONEs?
+	-- There are zone types defined in enum zone_type for whole system;
+	-- Only ZONE_NORMAL is generic for all platforms. Others are depended on
+	the kernel configure items, such as 'CONFIG_HIGHMEM';
+	-- Kernel will defines several address limits. Based on this limits,
+	If some memory ranges fall into the limits, then these ranges are the
+	corresponding zone type. Please note that these limits are global, not
+	node-dependent; Those limits are architecture-dependent;
+	-- All those limits are stored in:
+static unsigned long __meminitdata arch_zone_lowest_possible_pfn[MAX_NR_ZONES];
+static unsigned long __meminitdata arch_zone_highest_possible_pfn[MAX_NR_ZONES];
+	-- find_zone_movable_pfns_for_nodes() will setup the
+	zone_movable_pfn[MAX_NUMNODES] according the kernel configuration; If
+	without movable configuration, these 'zone_movable_pfn[MAX_NUMNODES]'
+	should be ZERO; Please note that, this 'zone_movable_pfn[]' is
+	node-dependent and used as the delimit to separate the ZONE_MOVABLE from
+	the other zones of same node;
+
+
+	-- For each node 'nid', call free_area_init_node().
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+		free_area_init_node(nid, NULL,
+				find_min_pfn_for_node(nid), NULL);
+
+		/* Any memory on that node */
+		if (pgdat->node_present_pages)
+			node_set_state(nid, N_MEMORY);
+		check_for_memory(pgdat, nid);
+	}
+
+		-- calculate_node_totalpages(pgdat, start_pfn, end_pfn,
+			  zones_size, zholes_size);
+		/* for each zone of the node 'nid', perform the following: */
+		size = zone_spanned_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn,
+						  node_end_pfn,
+						  &zone_start_pfn,
+						  &zone_end_pfn,
+						  zones_size);
+		real_size = size - zone_absent_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn, node_end_pfn,
+						  zholes_size);
+
+			-- zone_spanned_pages_in_node() return the zone size
+			covered by arch_zone_lowest_possible_pfn[zone_type] and
+			arch_zone_highest_possible_pfn[zone_type];
+			-- zone_absent_pages_in_node(pgdat->node_id, i,
+						  node_start_pfn, node_end_pfn,
+						  zholes_size);
+			calculated the hole size of the ZONE. All the ranges are
+			not in the mblock.memory are holes;
+
+	-- initialise the pgdat->node_zones[] and setup the mapping between all
+	the pages and the corresponding node/zone:
+		free_area_init_core(pgdat);
+		-- memmap_init(size, nid, j, zone_start_pfn)
+		-- memmap_init_zone
+			-- __init_single_page(page, pfn, zone, nid)
+			-- set_pageblock_migratetype(page, MIGRATE_MOVABLE)
+
+

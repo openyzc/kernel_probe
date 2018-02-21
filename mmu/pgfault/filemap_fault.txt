@@ -1,0 +1,85 @@
+
+
+In mm/filemap.c, int filemap_fault(struct vm_fault *vmf)
+是__do_fault的core函数。
+此函数用于file mapping方式。
+
+在 mapping对应的page-cache中lookup 对应offset的page是否存在：
+	page = find_get_page(mapping, offset);
+
+/* FAULT_FLAG_TRIED被设置表示之前的第一次 filemap_fault
+ * 处理已经调用过do_async_mmap_readahead()，不再重复。 */
+	if (likely(page) && !(vmf->flags & FAULT_FLAG_TRIED)) {
+		/*
+		 * We found the page, so try async readahead before
+		 * waiting for the lock.
+		 */
+		do_async_mmap_readahead(vmf->vma, ra, file, page, offset);
+	} else if (!page) {
+		/* No page in the page cache at all */
+		do_sync_mmap_readahead(vmf->vma, ra, file, offset);
+		count_vm_event(PGMAJFAULT);
+		mem_cgroup_count_vm_event(vmf->vma->vm_mm, PGMAJFAULT);
+		ret = VM_FAULT_MAJOR;
+retry_find:
+		page = find_get_page(mapping, offset);
+/* 上面的do_sync_mmap_readahead()不一定会分配page添加到
+ * page-cache中，譬如VM_RAND_READ的访问模式。此时就不需要采取readahead的方式添加
+ * page到page-cache. 直接跳转no_cached_page通过 page_cache_read(file, offset,
+ * vmf->gfp_mask)进行page的分配和添加。
+ */
+	if (!page)
+			goto no_cached_page;
+	}
+
+后面的处理就是确保 page-cache中的page状态是OK的。
+/* 获取pagelock. 这里可能会因为io 延迟而设置 VM_FAULT_RETRY. */
+	if (!lock_page_or_retry(page, vmf->vma->vm_mm, vmf->flags)) {
+		put_page(page);
+		return ret | VM_FAULT_RETRY;
+	}
+
+	/* Did it get truncated? */
+	if (unlikely(page->mapping != mapping)) {
+		unlock_page(page);
+		put_page(page);
+		goto retry_find;
+	}
+	VM_BUG_ON_PAGE(page->index != offset, page);
+
+	/*
+	 * We have a locked page in the page cache, now we need to check
+	 * that it's up-to-date. If not, it is going to be due to an error.
+	 */
+	if (unlikely(!PageUptodate(page)))
+		goto page_not_uptodate;
+/* 上面是确保 page 数据是 uptodate的。 */
+	...
+/* OK. 成功处理完， return */
+	vmf->page = page;
+	return ret | VM_FAULT_LOCKED;
+
+
+---------------------------
+
+这里描述一下 do_sync_mmap_readahead()
+
+	if (vma->vm_flags & VM_RAND_READ)
+		return;
+	if (!ra->ra_pages)
+		return;
+/* 如果是指定了 VM_SEQ_READ,(可能通过madvise),那么直接使用 'offset'
+ * 来开始本次readahead操作。*/
+	if (vma->vm_flags & VM_SEQ_READ) {
+		page_cache_sync_readahead(mapping, ra, file, offset,
+					  ra->ra_pages);
+		return;
+	}
+	...
+/* 对于非 SEQ_READ, 选择 [offset - ra->ra_pages/2, offset + ra->rapages/2)
+ * 的readahead windows。 其中 ra->async_size 占最后的 ra->rapages/4. */
+	ra->start = max_t(long, 0, offset - ra->ra_pages / 2);
+	ra->size = ra->ra_pages;
+	ra->async_size = ra->ra_pages / 4;
+	ra_submit(ra, mapping, file);
+

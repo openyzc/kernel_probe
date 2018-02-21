@@ -1,0 +1,27 @@
+
+
+This function is the core of brk management.
+
+static int do_brk_flags(unsigned long addr, unsigned long request,
+	unsigned long flags, struct list_head *uf)
+
+
+## The 'mm->mmap_sem' had been locked before entering here.
+## So, this will check the lock status. If still can get the lock, will WARN_ON:
+	verify_mm_writelocked(mm);
+
+## If the request range of [addr, addr + request) overlap with some mmapped
+## VMAs, those overlapped range will be split and unmapped:
+
+	while (find_vma_links(mm, addr, addr + len, &prev, &rb_link,
+			      &rb_parent)) {
+		if (do_munmap(mm, addr, len, uf))
+			return -ENOMEM;
+	}
+
+
+## do_munmap() will unmap any overlap sub-ranges in the [addr, addr + len).
+## you can refer to 'how_to_free_page_in_unmap.txt' for more detail.
+
+
+

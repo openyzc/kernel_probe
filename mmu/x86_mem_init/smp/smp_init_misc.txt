@@ -1,0 +1,38 @@
+
+
+This is only to write down some information about SMP initialization.
+
+
+kernel_init_freeable ->
+smp_prepare_cpus(setup_max_cpus) -->
+	smp_ops.smp_prepare_cpus(max_cpus) -->
+		native_smp_prepare_cpus(max_cpus) : for x86
+		--> default_setup_apic_routing()
+
+Then, the following will be done:
+
+	for (drv = __apicdrivers; drv < __apicdrivers_end; drv++) {
+		if ((*drv)->probe && (*drv)->probe()) {
+			if (apic != *drv) {
+				apic = *drv;
+
+
+The section of '__apicdrivers' is defined by these:
+
+	apic_driver(sym) or
+	apic_drivers(sym1, sym2)
+
+
+And the staic variable of 'apic' are defined for x86 like these:
+
+./arch/x86/kernel/apic/probe_32.c:129:struct apic *apic __ro_after_init =
+&apic_default;
+./arch/x86/kernel/apic/apic_flat_64.c:28:struct apic *apic __ro_after_init =
+&apic_flat;
+
+
+But in kernel, there are some 'static struct apic' defined, which one is the
+right one for us?
+
+
+

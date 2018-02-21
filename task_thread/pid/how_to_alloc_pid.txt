@@ -1,0 +1,249 @@
+
+
+In most cases, when forking a new thread, these in copy_process will be
+performed:
+
+	if (pid != &init_struct_pid) {
+		pid = alloc_pid(p->nsproxy->pid_ns_for_children);
+
+Here, we only discuss the case when 'p->nsproxy' is 'init_nsproxy' and
+'pid_ns_for_children' is init_pid_ns :
+
+struct pid_namespace init_pid_ns = {
+	.kref = KREF_INIT(2),
+	.pidmap = {
+		[ 0 ... PIDMAP_ENTRIES-1] = { ATOMIC_INIT(BITS_PER_PAGE), NULL }
+	},
+	.last_pid = 0,
+	.nr_hashed = PIDNS_HASH_ADDING,
+	.level = 0,
+	.child_reaper = &init_task,
+	.user_ns = &init_user_ns,
+	.ns.inum = PROC_PID_INIT_INO,
+#ifdef CONFIG_PID_NS
+	.ns.ops = &pidns_operations,
+#endif
+};
+
+
+1. The struct pid_namespace
+
+struct pid_namespace {
+	struct kref kref;
+	struct pidmap pidmap[PIDMAP_ENTRIES];
+	struct rcu_head rcu;
+	int last_pid;
+	unsigned int nr_hashed;
+	struct task_struct *child_reaper;
+	struct kmem_cache *pid_cachep;
+	unsigned int level;
+	struct pid_namespace *parent;
+#ifdef CONFIG_PROC_FS
+	struct vfsmount *proc_mnt;
+	struct dentry *proc_self;
+	struct dentry *proc_thread_self;
+#endif
+#ifdef CONFIG_BSD_PROCESS_ACCT
+	struct fs_pin *bacct;
+#endif
+	struct user_namespace *user_ns;
+	struct ucounts *ucounts;
+	struct work_struct proc_work;
+	kgid_t pid_gid;
+	int hide_pid;
+	int reboot;	/* group exit code if this pidns was rebooted */
+	struct ns_common ns;
+}
+
+The current pid allocation algorithm apply the bitmap because the PID range is
+[0, pid_max) which is big. Bitmap can represent more PIDs.
+
+The bitmap is defined by this field:
+	struct pidmap pidmap[PIDMAP_ENTRIES];
+
+struct pidmap {
+       atomic_t nr_free;
+       void *page;
+};
+
+#define BITS_PER_PAGE		(PAGE_SIZE * 8)
+#define BITS_PER_PAGE_MASK	(BITS_PER_PAGE-1)
+#define PIDMAP_ENTRIES		((PID_MAX_LIMIT+BITS_PER_PAGE-1)/BITS_PER_PAGE)
+
+The bitmap is in 'void *page'. So each pidmap[] can represent BITS_PER_PAGE
+PIDs.
+
+** What's the value of PIDMAP_ENTRIES?
+
+#define PIDMAP_ENTRIES          ((PID_MAX_LIMIT+BITS_PER_PAGE-1)/BITS_PER_PAGE)
+
+So, PIDMAP_ENTRIES is dependent on the PID_MAX_LIMIT.
+
+#define PID_MAX_DEFAULT (CONFIG_BASE_SMALL ? 0x1000 : 0x8000)
+
+/*
+ * A maximum of 4 million PIDs should be enough for a while.
+ * [NOTE: PID/TIDs are limited to 2^29 ~= 500+ million, see futex.h.]
+ */
+#define PID_MAX_LIMIT (CONFIG_BASE_SMALL ? PAGE_SIZE * 8 : \
+	(sizeof(long) > 4 ? 4 * 1024 * 1024 : PID_MAX_DEFAULT))
+
+
+Also influent by the configure item of BASE_SMALL:
+
+config BASE_FULL
+        default y
+        bool "Enable full-sized data structures for core" if EXPERT
+        help
+          Disabling this option reduces the size of miscellaneous core
+          kernel data structures. This saves memory on small machines,
+          but may reduce performance.
+
+config BASE_SMALL
+        int
+        default 0 if BASE_FULL
+        default 1 if !BASE_FULL
+
+** The initialization of pid_max
+
+The variable definition:
+	int pid_max = PID_MAX_DEFAULT;
+
+The reinit of pidmap_init :
+	pid_max = min(pid_max_max, max_t(int, pid_max,
+			PIDS_PER_CPU_DEFAULT * num_possible_cpus()));
+
+2. allocate PID
+
+2.1 allocate struct pid node from ns->pid_cachep
+
+struct pid *alloc_pid(struct pid_namespace *ns)
+{
+	struct pid *pid;
+	enum pid_type type;
+	int i, nr;
+	struct pid_namespace *tmp;
+	struct upid *upid;
+	int retval = -ENOMEM;
+
+	pid = kmem_cache_alloc(ns->pid_cachep, GFP_KERNEL);
+	if (!pid)
+		return ERR_PTR(retval);
+
+
+The ns->pid_cachep is initialized in create_pid_namespace() -->
+	ns->pid_cachep = create_pid_cachep(level + 1)
+
+	cachep = kmem_cache_create(pcache->name,
+			sizeof(struct pid) + (nr_ids - 1) * sizeof(struct upid),
+			0, SLAB_HWCACHE_ALIGN, NULL);
+	...
+	pcache->nr_ids = nr_ids;
+	pcache->cachep = cachep;
+
+So, the cache object size is sizeof(struct pid) + (nr_ids - 1)*sizeof(struct
+upid).
+
+We know the definition of struct pid is :
+
+struct pid
+{
+	atomic_t count;
+	unsigned int level;
+	/* lists of tasks that use this pid */
+	struct hlist_head tasks[PIDTYPE_MAX];
+	struct rcu_head rcu;
+	struct upid numbers[1];
+};
+
+Then we can find that the object of pcache->cachep is struct pid with a array
+whose size is 'struct upid numbers[nr_ids]'. Here, nr_ids should be the
+namespace level.
+
+2.2 allocate the PIDs of each namespace hierarchy level upwards from
+'ns->parent'
+
+	tmp = ns;
+	pid->level = ns->level;
+	for (i = ns->level; i >= 0; i--) {
+		nr = alloc_pidmap(tmp);
+		if (nr < 0) {
+			retval = nr;
+			goto out_free;
+		}
+
+		pid->numbers[i].nr = nr;
+		pid->numbers[i].ns = tmp;
+		tmp = tmp->parent;
+	}
+
+For each namespace level, 'nr = alloc_pidmap(tmp)' will be called to allocate
+the local PID in this PID namespace level. The results will be stored in the
+'struct upid numbers[]' of struct pid.
+
+2.3 alloc_pidmap(struct pid_namespace *pid_ns)
+
+The PID allocation will start from pid_ns->last_pid;
+
+the corresponding 'struct pidmap pidmap[PIDMAP_ENTRIES]' of 'struct
+pid_namespace *pid_ns' will be checked one by one.
+
+
+The 'struct pidmap pidmap[PIDMAP_ENTRIES]' of struct pid_namespace can be
+extended in alloc_pidmap() when the pidmap[0] can not find the idle bit.
+
+
+2.4 other processings in alloc_pid()
+
+This judegement means disable_pid_allocation() for this 'ns' :
+	if (!(ns->nr_hashed & PIDNS_HASH_ADDING))
+		goto out_unlock;
+So, have to 'goto out_unlock' to terminate the pid allocation.
+
+	for ( ; upid >= pid->numbers; --upid) {
+		hlist_add_head_rcu(&upid->pid_chain,
+				&pid_hash[pid_hashfn(upid->nr, upid->ns)]);
+		upid->ns->nr_hashed++;
+	}
+
+The above processing is important. Each PID corresponds an unique struct pid
+which is global. With namespace introduction, PID is not global anymore besides
+the topest pid_namespace level(i.e level0), now, PID is local of any downstream
+pid_namespaces and has local unique pid value of some pid_namespace. The pid
+value can be duplicated among different pid_namespace.
+So, a pid value is not enough to locate the PID. Now, the keys to locate the PID
+are the pointer of a pid_namespace and the local pid of this pid_namespace.
+
+These two key fields are defined in struct upid :
+
+struct upid {
+	int nr;  /*local pid of the 'pid_namespace *ns' */
+	struct pid_namespace *ns; /* pointer to a pid_namespace of hierarchy*/
+	struct hlist_node pid_chain;
+};
+
+And all the struct upid nodes are in 'struct upid numbers[]' of struct pid :
+
+struct pid
+{
+	atomic_t count;
+	unsigned int level;
+	/* lists of tasks that use this pid */
+	struct hlist_head tasks[PIDTYPE_MAX];
+	struct rcu_head rcu;
+	struct upid numbers[1];
+};
+
+To locate the PID with 'ns' + 'nr', Linux introduces a hashed hlist :
+	#define pid_hashfn(nr, ns)	\
+		hash_long((unsigned long)nr + (unsigned long)ns, pidhash_shift)
+	static struct hlist_head *pid_hash;
+
+So, we know that 'for ( ; upid >= pid->numbers; --upid) {' just linked all the
+struct upid of 'numbers[]' to the hashed hlist, pid_hash;
+
+
+
+
+
+

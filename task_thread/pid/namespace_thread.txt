@@ -1,0 +1,51 @@
+
+1. The resources of one thread are defined by this field of struct task_struct:
+
+	struct nsproxy	*nsproxy;
+
+struct nsproxy {
+	atomic_t count;
+	struct uts_namespace *uts_ns;
+	struct ipc_namespace *ipc_ns;
+	struct mnt_namespace *mnt_ns;
+	struct pid_namespace *pid_ns_for_children;
+	struct net 	     *net_ns;
+	struct cgroup_namespace *cgroup_ns;
+};
+
+So, this struct nsproxy pointer indirectly points to a namespace set. It will be
+more flexiable to adjust the namespace of the thread.
+
+2. The initial nsproxy points to the one of the 'current' thread : 
+
+	p = dup_task_struct(current, node);
+
+In dup_task_struct(current, node), a new struct task_struct will be allocated
+and initialized with the copy of 'current'. So, the 'struct nsproxy *nsproxy'
+will have the same pointer value as the one of 'current'.
+
+We had known the init_task, PID0, set the '*nsproxy' to 'init_nsproxy'.
+This global struct nsproxy variable is the default one.
+
+3. If you want to apply non-default nsproxy for the new forked thread, please
+use a right clone flags value when you call the fork/clone/vfork.
+
+int copy_namespaces(unsigned long flags, struct task_struct *tsk)
+{
+	struct nsproxy *old_ns = tsk->nsproxy;
+	struct user_namespace *user_ns = task_cred_xxx(tsk, user_ns);
+	struct nsproxy *new_ns;
+
+	if (likely(!(flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+			      CLONE_NEWPID | CLONE_NEWNET |
+			      CLONE_NEWCGROUP)))) {
+		get_nsproxy(old_ns);
+		return 0;
+	}
+
+So, you should set the 'unsigned long flags' as at least one of those six
+'CLONE_NEWxxx'.
+
+
+
+

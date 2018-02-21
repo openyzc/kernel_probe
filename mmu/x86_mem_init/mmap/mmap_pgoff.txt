@@ -1,0 +1,53 @@
+This is the base of mmap. No matter x86_32 or X86_64, all mmap system-call will
+be converged into this 'mmap_pgoff'.
+
+In mm/mmap.c :
+
+SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
+		unsigned long, prot, unsigned long, flags,
+		unsigned long, fd, unsigned long, pgoff)
+
+
+1. if (!(flags & MAP_ANONYMOUS)), must call this with 'unsigned long fd'
+
+With 'fd', kernel can get the corresponding 'struct file *file'.
+
+Then all other processings are relevant to hugetblfs.
+Based on these info, probably 'len' will be adjusted for alignment.
+
+2. The 'addr' is the user-land virtual address for this mapping. It is probably
+NULL when the caller asks kernel to choose the virtual address.
+
+
+==============================
+
+retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
+
+
+unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
+	unsigned long len, unsigned long prot,
+	unsigned long flag, unsigned long pgoff)
+{
+	unsigned long ret;
+	struct mm_struct *mm = current->mm;
+	unsigned long populate;
+	LIST_HEAD(uf);
+
+	ret = security_mmap_file(file, prot, flag);
+	if (!ret) {
+		if (down_write_killable(&mm->mmap_sem))
+			return -EINTR;
+		ret = do_mmap_pgoff(file, addr, len, prot, flag, pgoff,
+				    &populate, &uf);
+		up_write(&mm->mmap_sem);
+		userfaultfd_unmap_complete(mm, &uf);
+		if (populate)
+			mm_populate(ret, populate);
+	}
+	return ret;
+}
+
+do_mmap_pgoff()
+	--> do_mmap
+
+

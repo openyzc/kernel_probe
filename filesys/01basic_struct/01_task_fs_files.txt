@@ -1,0 +1,23 @@
+
+
+In include/linux/sched.h :
+
+struct task_struct {
+	...
+	/* Filesystem information: */
+	struct fs_struct		*fs;
+
+	/* Open file information: */
+	struct files_struct		*files;
+	...
+}
+
+每个task都有自己的根目录，工作目录。这些相关的信息都由'struct fs_struct *fs'
+指向；
+
+每个task都有其管理的files，这些都由 'struct files_struct *files' 来管理。
+
+As for on thread, you can check what files are opened :
+/proc/xxx/fd
+
+

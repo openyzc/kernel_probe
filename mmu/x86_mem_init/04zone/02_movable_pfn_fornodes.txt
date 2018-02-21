@@ -1,0 +1,143 @@
+1. The kernel parameters for movable zone
+
+Documentation/memory-hotplug.txt
+
+Documentation/admin-guide/kernel-parameters.txt
+
+1.1 "kernelcore="
+When kernelcode=mirror, cmdline_parse_kernelcore() will set:
+	mirrored_kernelcore = true;
+when kernelcode=nn[KMGTPE], cmdline_parse_core() will parse the kernel
+parameter:
+	coremem = memparse(p, &p);
+	*core = coremem >> PAGE_SHIFT;
+'static unsigned long __initdata required_kernelcore' will be set by '*core=';
+This variable specifies the amount of memory usable by the kernel for
+non-movable allocations.
+If you specify "mirror" option, mirrored(reliable) memory is used for
+non-movalbe allocations.
+
+1.2 movablecore
+
+this parameter is similar to kernelcore except it specifies the amount of memory
+used for migratable allocations.
+If both kernelcore and movablecore is specified, then kernelcore will be in high
+priority, kernel should first satisfy the 'kernelcore' configuration.
+
+'static unsigned long __initdata required_movablecore' will be set by
+cmdline_parse_movablecore().
+
+1.3 movable_node
+
+This parameter is bound with CONFIG_MOVABLE_NODE. ONly when CONFIG_MOVABLE_NODE
+is enabled, the variable of 'movable_node_enabled' can be set TRUE.
+
+You can refer to cmdline_parse_movable_node().
+This parameter will ignore the 'movablecore' and 'kernelcore'.
+
+
+2. find_zone_movable_pfns_for_nodes()
+
+2.1 For "movable_node"
+
+	if (movable_node_is_enabled()) {
+		for_each_memblock(memory, r) {
+			if (!memblock_is_hotpluggable(r))
+				continue;
+
+			nid = r->nid;
+
+			usable_startpfn = PFN_DOWN(r->base);
+			zone_movable_pfn[nid] = zone_movable_pfn[nid] ?
+				min(usable_startpfn, zone_movable_pfn[nid]) :
+				usable_startpfn;
+		}
+
+		goto out2;
+	}
+
+-- zone_movable_pfn[nid] will store the minimum PFN of all hotpluggable memory
+ranges of 'nid';
+
+
+2.2 select from non-mirrored zones
+
+When mirrored_kernelcore is TRUE, the zone_movable_pfn will populate the memory
+range from non-mirrorred zones.
+That is what these code below do:
+
+		for_each_memblock(memory, r) {
+			if (memblock_is_mirror(r))
+				continue;
+
+			nid = r->nid;
+
+			usable_startpfn = memblock_region_memory_base_pfn(r);
+
+			if (usable_startpfn < 0x100000) {
+				mem_below_4gb_not_mirrored = true;
+				continue;
+			}
+
+			zone_movable_pfn[nid] = zone_movable_pfn[nid] ?
+				min(usable_startpfn, zone_movable_pfn[nid]) :
+				usable_startpfn;
+		}
+
+The 'usable_startpfn' which is less than 4G should not be stored into
+zone_movable_pfn[nid]. If there is any 'usable_startpfn' below than 4G, will
+give a WARNING.
+
+2.3 when both 'movablecore' and 'kernelcore' are configured
+
+	if (required_movablecore) {
+		unsigned long corepages;
+
+		/*
+		 * Round-up so that ZONE_MOVABLE is at least as large as what
+		 * was requested by the user
+		 */
+		required_movablecore =
+			roundup(required_movablecore, MAX_ORDER_NR_PAGES);
+		required_movablecore = min(totalpages, required_movablecore);
+		corepages = totalpages - required_movablecore;
+
+		required_kernelcore = max(required_kernelcore, corepages);
+	}
+
+-- The kernelcore configuration is in high priority, that is why
+required_kernelcore is updated:
+	required_kernelcore = max(required_kernelcore, corepages);
+
+2.4 set zone_movable_pfn[nid] according the 'required_kernelcore'
+
+-- Try to spread 'required_kernelcore' evenly to all nodes with available
+memory;
+	kernelcore_node = required_kernelcore / usable_nodes;
+	for_each_node_state(nid, N_MEMORY) {
+-- Traverse all valid memory ranges of one 'nid', any memory which is below than
+arch_zone_lowest_possible_pfn[movable_zone] will be used as part of
+'required_kernelcore'; If the sum of all these ranges of 'nid' is not enough to
+satisfy the 'kernelcore_node' requested, kernel will assigned the memory range
+which is over the arch_zone_lowest_possible_pfn[movable_zone] as the kernelcore
+range, which means kernel will try its best to satisfy the 'kernelcore_node'
+request at first. When all the available memory ranges of 'nid' are exhauted, we
+finished the processing about the movable boundary and start a new node id.
+zone_movable_pfn[nid] will be set as the last PFN of the kernelcore area
+allocatted.
+
+-- The allocation for 'required_kernelcore' will finish when
+'required_kernelcore' rearch ZERO.
+
+In summary, find_zone_movable_pfns_for_nodes() will decide the
+zone_movable_pfn[nid] as the delimiter between kernelcore area and movable area
+for 'nid'.
+
+ 
+The final zone_movable_pfn[nid] should be aligned to MAX_ORDER_NR_PAGES :
+
+	for (nid = 0; nid < MAX_NUMNODES; nid++)
+		zone_movable_pfn[nid] =
+			roundup(zone_movable_pfn[nid], MAX_ORDER_NR_PAGES);
+
+

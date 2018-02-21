@@ -1,0 +1,32 @@
+
+
+In handle_pte_fault():
+
+	if (!vmf->pte) {
+		if (vma_is_anonymous(vmf->vma))
+			return do_anonymous_page(vmf);
+		else
+			return do_fault(vmf);
+	}
+
+
+So, when vmf->pte is not existing and vma_is_anonymous(vmf->vma), then will call
+do_anonymous_page(vmf).
+
+这是针对 PTE 为 NULL的情形, 也就是没有建立VA --> PA 的映射.
+
+
+static int do_anonymous_page(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	...
+/* only for anonymous private?? */
+	if (vma->vm_flags & VM_SHARED)
+		return VM_FAULT_SIGBUS;
+/* if *pmd == NULL, allocate a new page table and assign it to '*pmd'. */
+	if (pte_alloc(vma->vm_mm, vmf->pmd, vmf->address))
+		return VM_FAULT_OOM;
+
+
+
+

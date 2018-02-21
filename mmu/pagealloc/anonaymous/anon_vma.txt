@@ -1,0 +1,82 @@
+
+
+int __anon_vma_prepare(struct vm_area_struct *vma)
+
+ |--> root
+ |    ---\   |---------------------------------vma->anon_vma-----
+ |   /	  \  |							|
+ |   |	  V  V							|
+ |    \	------------ avc->anon_vma----------------  avc->vma  ---------
+ | ---->| anon_vma |<------------| anon_vma_chain| ---------> | vma   |
+ | |	------------		 -----------------	      ---------
+ | |	     |			   |	|			|
+ | | rb_root |	<----avc->rb------ |	|--avc->same_vma ----->	|anon_vma_chain
+ | |	     V
+ | |
+ | |								anon_vma_chain
+ | |				------------------			|
+ | ----avc->anon_vma----------- | anon_vma_chain |--avc->vma----------  |
+ |				------------------		     |  |
+ |								     |  |
+ | root								     V  |
+ |	 -----------		      ----------------		     ------
+ ------- | anon_vma| <--avc->aon_vma--|anon_vma_chain| --avc->vma--> | vma |
+	 -----------		      ----------------		     ------
+	   ^    ^						     (child)
+	   |	|
+	   |	|			----------------
+	   |	------avc->anon_vma --- |anon_vma_chain| --avc->vma -->----
+	   |				----------------		  |	
+	   |								-----
+	   ------------------vma->anon_vma ---------------------------  |vma|
+									-----
+								   (grandson)
+
+
+1) The anon_vma->degree is two after the __anon_vma_prepare() if kernel can't
+found the mergable anon_vma;
+
+2) In anon_vma_fork() --> anon_vma_clone(), no new anon_vma node is allocated
+for the cloned destination VMA;
+
+3) In anon_vma_fork(), the destination vma->anon_vma will be set as the new
+allocated anon_vma when anon_vma_clone() didn't assigned the right anon_vma to
+the destination VMA; More important is that, the anon_vma->degree is the initial
+one for the new anon_vma as 'anon_vma->parent->degree++' is only for the parent
+anon_vma here, that is to say, the root of the anon_vma tree. So, the
+anon_vma->degree of 'vma->anon_vma' of the forked VMA is 1.
+
+
+That is the role of anon_vma_chain_link(struct vm_area_struct *vma,
+				struct anon_vma_chain *avc,
+				struct anon_vma *anon_vma)
+
+
+4) The root anon_vma which created by __anon_vma_prepare() has 'degree' with
+value 2 when there are no any child 'anon_vam's are linked;
+
+5) For the VMA of the top parent task/thread, there is one avc node in the
+'vma->anon_vma_chain'. When the child VMAs are forked, one more avc node will be
+allocated, then is linked to 'vma->anon_vma_chain' of the new VMA and inserted
+to the RB tree of 'anon_vma->rb_root'. The avc nodes in 'vma->anon_vma_chain'
+are not less than those in parent VMA's anon_vma_chain. Especially only when
+kernel can find the reusable 'anon_vma', the avc nodes' count is equal to the
+parent VMA.
+
+Based on this, if the fourth descending level VMAs are forked, we can find the
+qualified anon_vma for these in anon_vma_clone():
+
+		if (!dst->anon_vma && anon_vma != src->anon_vma &&
+				anon_vma->degree < 2)
+			dst->anon_vma = anon_vma;
+
+In this case, there is no new 'anon_vma' node is allocated for the new VMA.
+
+
+
+As for the usage of 'anon_vma->degree', please refer to this patch:
+
+mm: prevent endless growth of anon_vma hierarchy
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/mm?id=7a3ef208e662f4b63d43a23f61a64a129c525bbc
+

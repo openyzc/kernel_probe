@@ -1,0 +1,20 @@
+
+
+In include/linux/page-flags.h :
+
+#define test_set_page_writeback(page)			\
+	__test_set_page_writeback(page, false)
+#define test_set_page_writeback_keepwrite(page)	\
+	__test_set_page_writeback(page, true)
+
+static inline void set_page_writeback(struct page *page)
+{
+	test_set_page_writeback(page);
+}
+
+static inline void set_page_writeback_keepwrite(struct page *page)
+{
+	test_set_page_writeback_keepwrite(page);
+}
+
+

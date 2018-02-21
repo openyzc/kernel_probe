@@ -1,0 +1,84 @@
+
+
+Normally, read-ahead is only for file-mapping.
+
+For a VM offset, that is the 'pgoff' of a VMA, if we can't find the page in the
+page-cache :
+
+	page = find_get_page(mapping, offset);
+
+Then do_sync_mmap_readahead(vmf->vma, ra, file, offset);
+
+
+1) It seems that only when the 'ra->async_size' page is read, the
+page_cache_async_readahead() will be called to adjust the readahead window.
+
+Such as in do_generic_file_read():
+
+		if (PageReadahead(page)) {
+			page_cache_async_readahead(mapping,
+					ra, filp, page,
+					index, last_index - index);
+		}
+
+
+
+2)
+If there is no pagecache for 'vm->pgoff', page_cache_sync_readahead -->
+ondemand_readahead(mapping, ra, filp, false, offset, req_size) seems no much
+processings besides this:
+
+ondemand_readahead() -->
+	__do_page_cache_readahead(mapping, filp, offset, req_size, 0);
+
+It will setup the page-cache without any polution on readahead window.
+
+
+3) When the requested page resides in page-cache, but
+
+if the requested page is not adjacent to the current right edge of readahead
+window :
+
+	if ((offset == (ra->start + ra->size - ra->async_size) ||
+	     offset == (ra->start + ra->size))) {
+
+This branch will play the role because 'SetPageReadahead(page)' should had been
+called as the readahead window setup.
+	/* equal to 'if (PageReadahead(page)) {' */
+	if (hit_readahead_marker) {
+		pgoff_t start;
+
+		rcu_read_lock();
+		start = page_cache_next_hole(mapping, offset + 1, max_pages);
+		rcu_read_unlock();
+
+		if (!start || start - offset > max_pages)
+			return 0;
+
+		ra->start = start;
+		ra->size = start - offset;	/* old async_size */
+		ra->size += req_size;
+		ra->size = get_next_ra_size(ra, max_pages);
+		ra->async_size = ra->size;
+		goto readit;
+	}
+
+
+
+The readahead window size will be increased as the reading hit the window.
+
+will be descreased by :
+	try_context_readahead(mapping, ra, offset, req_size, max_pages)
+
+
+But as for readahead, I am not so clear why no any adjustment when there is miss
+reading. And when this readahead windown will be cleared for the random reading.
+Probably I need to continuse this after the memory reclaiming.
+
+
+
+
+
+
+
+

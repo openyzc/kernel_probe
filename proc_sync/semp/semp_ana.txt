@@ -1,0 +1,131 @@
+
+1. 数据结构
+
+struct semaphore {
+	raw_spinlock_t		lock;
+	unsigned int		count;
+	struct list_head	wait_list;
+};
+这里的count需要说明一下，如果为0表示还没有任何owner，在down()时将触发__down()来等待有可用的
+count，也就是 count > 0. 在count 为0时将可能进入sleep.
+因此 count 表示 semphore支持多少次不阻塞的down获取。
+
+在DEFINE_SEMAPHORE(name)时会初始化
+semaphore的count为1，表示可以不阻塞的down一次。
+而 sema_init(*sem, val)可以设置初始 count为 > 1，表示支持多个
+thread的并发down()获取。
+
+
+struct semaphore {
+	raw_spinlock_t		lock;
+	unsigned int		count;
+	struct list_head	wait_list;
+};
+
+在 up/down操作时，尤其是down时需要使用一个 struct semaphore_waiter
+节点来将被阻塞的thread 挂到 struct semphore的 wait_list中。
+
+struct semaphore_waiter {
+	struct list_head list;
+	struct task_struct *task;
+	bool up;
+};
+
+
+2. down
+
+
+static inline int __sched __down_common(struct semaphore *sem, long state,
+								long timeout)
+{
+	struct semaphore_waiter waiter;
+
+	list_add_tail(&waiter.list, &sem->wait_list);
+	waiter.task = current;
+	waiter.up = false;
+
+	for (;;) {
+		if (signal_pending_state(state, current))
+			goto interrupted;
+		if (unlikely(timeout <= 0))
+			goto timed_out;
+		__set_current_state(state);
+		raw_spin_unlock_irq(&sem->lock);
+		timeout = schedule_timeout(timeout);
+		raw_spin_lock_irq(&sem->lock);
+		if (waiter.up)
+			return 0;
+	}
+
+ timed_out:
+	list_del(&waiter.list);
+	return -ETIME;
+
+ interrupted:
+	list_del(&waiter.list);
+	return -EINTR;
+}
+
+主要是初始化 struct semaphore_waiter waiter 并添加到
+&sem->wait_list，然后睡眠等待：
+
+		__set_current_state(state);
+		raw_spin_unlock_irq(&sem->lock);
+		timeout = schedule_timeout(timeout);
+		raw_spin_lock_irq(&sem->lock);
+
+
+
+在 up/down操作时，尤其是down时需要使用一个 struct semaphore_waiter
+节点来将被阻塞的thread 挂到 struct semphore的 wait_list中。
+
+struct semaphore_waiter {
+	struct list_head list;
+	struct task_struct *task;
+	bool up;
+};
+
+
+2. down
+
+
+static inline int __sched __down_common(struct semaphore *sem, long state,
+								long timeout)
+{
+	struct semaphore_waiter waiter;
+
+	list_add_tail(&waiter.list, &sem->wait_list);
+	waiter.task = current;
+	waiter.up = false;
+
+	for (;;) {
+		if (signal_pending_state(state, current))
+			goto interrupted;
+		if (unlikely(timeout <= 0))
+			goto timed_out;
+		__set_current_state(state);
+		raw_spin_unlock_irq(&sem->lock);
+		timeout = schedule_timeout(timeout);
+		raw_spin_lock_irq(&sem->lock);
+		if (waiter.up)
+			return 0;
+	}
+
+ timed_out:
+	list_del(&waiter.list);
+	return -ETIME;
+
+ interrupted:
+	list_del(&waiter.list);
+	return -EINTR;
+}
+
+主要是初始化 struct semaphore_waiter waiter 并添加到
+&sem->wait_list，然后睡眠等待：
+
+		__set_current_state(state);
+		raw_spin_unlock_irq(&sem->lock);
+		timeout = schedule_timeout(timeout);
+		raw_spin_lock_irq(&sem->lock);
+
+

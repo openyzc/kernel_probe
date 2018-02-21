@@ -1,0 +1,255 @@
+
+In setup_arch():
+
+	reserve_real_mode();
+
+	trim_platform_memory_ranges();
+	trim_low_memory_range();
+
+	init_mem_mapping();
+	...
+	acpi_boot_table_init();
+
+	early_acpi_boot_init();
+
+	initmem_init();
+	...
+	x86_init.paging.pagetable_init();
+
+
+Here, we will dive into init_mem_mapping().
+This function is very important as it will setup the page tables for the kernel
+1:1 memory space.
+
+For X86_32, [0, max_low_pfn << PAGE_SHIFT);
+For X86_64, [0, max_pfn << PAGE_SHIFT);
+
+
+1. setup the pgtable for [0, ISA_END_ADDRESS)
+
+void __init init_mem_mapping(void)
+{
+	unsigned long end;
+
+	probe_page_size_mask();
+
+#ifdef CONFIG_X86_64
+	end = max_pfn << PAGE_SHIFT;
+#else
+	end = max_low_pfn << PAGE_SHIFT;
+#endif
+
+	/* the ISA range is always mapped regardless of memory holes */
+	init_memory_mapping(0, ISA_END_ADDRESS);
+
+
+** How to allocate the pages for the page tables of this mapping?
+
+We know there is identity mapping for the early boot. This identity mapping
+normally will not cover the big memory range, basically only setup the mapping
+for the range where kernel Image populates.
+
+So, we can't directly allocate the pages from that identity mapping region. We
+only can allocate pages from the mapped range and access by the corresponding
+virtual addresses, otherwise, will get page-fault for NO page tables.
+
+ the pages for the page tables of this mapping?
+
+We know there is identity mapping for the early boot. This identity mapping
+normally will not cover the big memory range, basically only setup the mapping
+for the range where kernel Image populates.
+
+So, we can't directly allocate the pages from that identity mapping region. We
+only can allocate pages from the mapped range and access by the corresponding
+virtual addresses, otherwise, will get page-fault for NO page tables.
+
+1.1 __brk_base to __brk_limit
+
+In arch/x86/kernel/vmlinux.lds.S :
+
+        . = ALIGN(PAGE_SIZE);
+        .brk : AT(ADDR(.brk) - LOAD_OFFSET) {
+                __brk_base = .;
+                . += 64 * 1024;         /* 64k alignment slop space */
+                *(.brk_reservation)     /* areas brk users have reserved */
+                __brk_limit = .;
+        }
+
+        . = ALIGN(PAGE_SIZE);           /* keep VO_INIT_SIZE page aligned */
+        _end = .;
+
+So, the [__brk_base, __brk_limit) is in the kernel Image.
+
+And in arch/x86/include/asm/setup.h :
+
+#define RESERVE_BRK(name,sz)						\
+	static void __section(.discard.text) __used notrace		\
+	__brk_reservation_fn_##name##__(void) {				\
+		asm volatile (						\
+			".pushsection .brk_reservation,\"aw\",@nobits;" \
+			".brk." #name ":"				\
+			" 1:.skip %c0;"					\
+			" .size .brk." #name ", . - 1b;"		\
+			" .popsection"					\
+			: : "i" (sz));					\
+	}
+
+This RESERVE_BRK() will define a .brk.xxx space in kernel Image.
+
+This brk section will be mapped by identity page tables. So, if we apply this
+macro to reserve some brk space, then we can directly access this space before
+the complete page tables have been setup.
+
+1.2 pgt_buf_start/pgt_buf_end/pgt_buf_top
+
+#ifndef CONFIG_RANDOMIZE_MEMORY
+#define INIT_PGD_PAGE_COUNT      6
+#else
+#define INIT_PGD_PAGE_COUNT      12
+#endif
+#define INIT_PGT_BUF_SIZE	(INIT_PGD_PAGE_COUNT * PAGE_SIZE)
+RESERVE_BRK(early_pgt_alloc, INIT_PGT_BUF_SIZE);
+void  __init early_alloc_pgt_buf(void)
+{
+	unsigned long tables = INIT_PGT_BUF_SIZE;
+	phys_addr_t base;
+
+	base = __pa(extend_brk(tables, PAGE_SIZE));
+
+	pgt_buf_start = base >> PAGE_SHIFT;
+	pgt_buf_end = pgt_buf_start;
+	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
+}
+
+void * __init extend_brk(size_t size, size_t align)
+{
+	size_t mask = align - 1;
+	void *ret;
+
+	BUG_ON(_brk_start == 0);
+	BUG_ON(align & mask);
+
+	_brk_end = (_brk_end + mask) & ~mask;
+	BUG_ON((char *)(_brk_end + size) > __brk_limit);
+
+	ret = (void *)_brk_end;
+	_brk_end += size;
+
+	memset(ret, 0, size);
+
+	return ret;
+}
+
+As the '_brk_start' and '_brk_end' are defined as an pointer to '__brk_base':
+
+static __initdata unsigned long _brk_start = (unsigned long)__brk_base;
+unsigned long _brk_end = (unsigned long)__brk_base;
+
+So, 'base = __pa(extend_brk(tables, PAGE_SIZE));' can request 'size' brk memory
+from the kernel .brk. area.
+
+And the return physical address will be stored as :
+
+	pgt_buf_start = base >> PAGE_SHIFT;
+	pgt_buf_end = pgt_buf_start;
+	pgt_buf_top = pgt_buf_start + (tables >> PAGE_SHIFT);
+
+
+We know :
+	*) pgt_buf_start is the start addr of this 'early_pgt_alloc';
+	*) pgt_buf_end is the stack top where the new allocation can start;
+	*) pgt_buf_top is the end addr of this 'early_pgt_alloc';
+
+2. map from bottom_to_top/top_to_bottom
+
+As the kernel image is stored in low memory, it is possible there are small
+memory margins remained. So we probably can't map a big memory region with
+several pages. And the page tables/pages are probably scattered rather than
+contiguous, it is not good for the access efficiency.
+
+So, a new map direction, top_to_bottom will be introduced.
+
+	if (memblock_bottom_up()) {
+		unsigned long kernel_end = __pa_symbol(_end);
+
+		/*
+		 * we need two separate calls here. This is because we want to
+		 * allocate page tables above the kernel. So we first map
+		 * [kernel_end, end) to make memory above the kernel be mapped
+		 * as soon as possible. And then use page tables allocated above
+		 * the kernel to map [ISA_END_ADDRESS, kernel_end).
+		 */
+		memory_map_bottom_up(kernel_end, end);
+		memory_map_bottom_up(ISA_END_ADDRESS, kernel_end);
+	} else {
+		memory_map_top_down(ISA_END_ADDRESS, end);
+	}
+
+*) For bottom_up, after 'memory_map_bottom_up(kernel_end, end);', a big memory
+region is setup the page tables and kernel has sufficient memory for the coming
+allocataion requests.
+
+	memory_map_bottom_up --> init_range_memory_mapping -->
+		init_memory_mapping()
+
+
+static unsigned long __init init_range_memory_mapping(
+					   unsigned long r_start,
+					   unsigned long r_end)
+{
+	...
+		can_use_brk_pgt = max(start, (u64)pgt_buf_end<<PAGE_SHIFT) >=
+				    min(end, (u64)pgt_buf_top<<PAGE_SHIFT);
+		init_memory_mapping(start, end);
+		mapped_ram_size += end - start;
+		can_use_brk_pgt = true;
+	...
+}
+
+The 'can_user_brk_pgt' is TRUE in default. But if the current memory region to
+be mapped is overlapping with [pgt_buf_end, pgt_buf_top), we can't allocate
+pages from 'pgt_buf' because the mapping relevant to that 'pgt_buf' will be
+changing you can't use it to translate the virtual before the updation, it will
+cause translation failures.
+
+For bottom_up, each memory mapping will update the 'min_pfn_mapped' :
+	min_pfn_mapped = start >> PAGE_SHIFT;
+
+And 'max_pfn_mapped' will be updated in this path:
+	init_memory_mapping -->
+		add_pfn_range_mapped(start >> PAGE_SHIFT, ret >> PAGE_SHIFT)
+		
+		max_pfn_mapped = max(max_pfn_mapped, end_pfn);
+
+All the memory regions mapped were saved in 'struct range
+pfn_mapped[E820_MAX_ENTRIES];'.
+
+This 'min_pfn_mapped' and 'max_pfn_mapped' are used to guarantee the early
+kernel should allocate pages from the mapped region, otherwise it will get
+failures.
+
+You can refer to 'alloc_low_pages(unsigned int num)' to know how to use these
+two limits during early page allocation.
+
+
+arch/x86/include/asm/e820/types.h:
+#define E820_MAX_ENTRIES	(E820_MAX_ENTRIES_ZEROPAGE + 3*MAX_NUMNODES)
+
+
+For top_down mapping, refer to memory_map_top_down():
+
+It is similar the 'min_pfn_mapped' will be updated as the loweset mapped PFN.
+
+We only want to provide some hits about these codes:
+
+		mapped_ram_size += init_range_memory_mapping(start,
+							last_start);
+		last_start = start;
+		min_pfn_mapped = last_start >> PAGE_SHIFT;
+		if (mapped_ram_size >= step_size)
+			step_size = get_new_step_size(step_size);
+
+Which means if the sum of mapped memory is big enough to map a more bigger
+region, we can increase the 'step_size'.
+
+

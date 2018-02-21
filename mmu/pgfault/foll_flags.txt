@@ -1,0 +1,232 @@
+
+
+代表一些信息，比如调用者为什么或以何种方式访问和获得目标的内存页。
+
+FOLL_DUMP
+
+
+In follow_page_pte(), this FOLL_DUMP will play the role:
+
+	} else if (unlikely(!page)) {
+		if (flags & FOLL_DUMP) {
+			/* Avoid special (like zero) pages in core dumps */
+			page = ERR_PTR(-EFAULT);
+			goto out;
+		}
+
+
+Can't return the 'struct page' of ZERO pages for the follow_page_mask().
+
+/* FOLL_DUMP to ignore special (like zero) pages */
+
+
+
+get_dump_page(),
+
+
+It seems only this function will request the FOLL_DUMP when calling
+__get_user_pages().
+
+
+
+FOLL_TRIED
+
+这个标志在 __get_user_pages()调用时使用，在 handle_mm_fault()返回VM_FAULT_RETRY
+时有关。
+
+在 faultin_page()中，如果本次 faultin_page()因某种原因而需要再来一次page
+fault处理，会返回VM_FAULT_RETRY。然后使用 nonblocking这个参数 返回值0给caller:
+
+	if (ret & VM_FAULT_RETRY) {
+		if (nonblocking)
+			*nonblocking = 0;
+		return -EBUSY;
+	}
+
+
+而在 __get_user_pages()中，会处理对应的 -EBUSY, 只是返回已经成功处理page
+fault的pages数，而不会改变 faultin_page()中设置过的 'nonblocking'：
+
+		if (!page) {
+			int ret;
+			ret = faultin_page(tsk, vma, start, &foll_flags,
+					nonblocking);
+			switch (ret) {
+			case 0:
+				goto retry;
+			case -EFAULT:
+			case -ENOMEM:
+			case -EHWPOISON:
+				return i ? i : ret;
+			case -EBUSY:
+				return i;
+
+那么哪里会使用返回的 'nonblocking'?
+在caller侧, __get_user_pages_locked()中，使用
+'nonblocking'中返回值来做后续处理：
+	for (;;) {
+		ret = __get_user_pages(tsk, mm, start, nr_pages, flags, pages,
+				       vmas, locked);
+		if (!locked)
+			/* VM_FAULT_RETRY couldn't trigger, bypass */
+			return ret;
+/* *locked 为0时, 表示缺页处理出现了 VM_FAULT_RETRY 而不是其它异常错误. */
+		/* VM_FAULT_RETRY cannot return errors */
+		if (!*locked) {
+			BUG_ON(ret < 0);
+			BUG_ON(ret >= nr_pages);
+		}
+/* 如果传入的 pages为NULL，意味着caller不关心是否成功 mapped需要的page,
+ * 那么直接返回本次__get_user_pages的结果. */
+		if (!pages)
+			/* If it's a prefault don't insist harder */
+			return ret;
+/* 更新数据为下次 __get_user_pages() 准备。*/
+		if (ret > 0) {
+			nr_pages -= ret;
+			pages_done += ret;
+			if (!nr_pages)
+				break;
+		}
+/* 构建返回值 pages_done. */
+		if (*locked) {
+			/* VM_FAULT_RETRY didn't trigger */
+			if (!pages_done)
+				pages_done = ret;
+			break;
+		}
+/* 开始 VM_FAULT_RETRY的处理。*/
+		/* VM_FAULT_RETRY triggered, so seek to the faulting offset */
+		pages += ret;
+		start += ret << PAGE_SHIFT;
+
+		/*
+		 * Repeat on the address that fired VM_FAULT_RETRY
+		 * without FAULT_FLAG_ALLOW_RETRY but with
+		 * FAULT_FLAG_TRIED.
+		 */
+		*locked = 1;
+		lock_dropped = true;
+		down_read(&mm->mmap_sem);
+/* 请注意这里最大的不同是传入了 FOLL_TRIED 标志，且 nr_pages 是1，nonblocking
+ * 为NULL。FOLL_TRIED告知 后续的page fault处理，这是第二次的page fault了...
+ * 实际上， FOLL_TRIED在faultin_page()中会转换为 pagefault通用的
+ * FAULT_FLAG_TRIED. */
+		ret = __get_user_pages(tsk, mm, start, 1, flags | FOLL_TRIED,
+				       pages, NULL, NULL);
+
+
+FOLL_TRIED 在 faultin_page()中有以下处理：
+	if (*flags & FOLL_TRIED) {
+		VM_WARN_ON_ONCE(fault_flags & FAULT_FLAG_ALLOW_RETRY);
+		fault_flags |= FAULT_FLAG_TRIED;
+	}
+
+FAULT_FLAG_ALLOW_RETRY在 FOLL_TRIED已经设置的情况下不应该还是TRUE。
+因为FAULT_FLAG_ALLOW_RETRY是用在__do_page_fault路径上。 首次page
+fault 处理返回VM_PAGE_RETRY后，FAULT_FLAG_ALLOW_RETRY 会被clear，然后才会设置
+FAULT_FLAG_TRIED到 'flags'以便启动第二次的page fault尝试。可参见
+__do_page_fault()中的相关处理。
+而在__get_user_pages_locked()中，是不应该使用
+FUALT_FLAG_ALLOW_RETRY的。因此上面的VM_WARN_ON_ONCE(fault_flags &
+FAULT_FLAG_ALLOW_RETRY) 就是检测这个不正常的情况。
+
+
+
+--------------------__do_page_fault()中的处理---------------
+
+
+FAULT_FLAG_TRIED， FAULT_FLAG_ALLOW_RETRY， VM_FAULT_RETRY应该有关联性。其中
+VM_FAULT_RETRY 是fault = handle_mm_fault(vma, address, flags); 的返回值。
+
+在 __do_page_fault()这个缺页处理的core函数中，有：
+	if (unlikely(fault & VM_FAULT_RETRY)) {
+		/* Retry at most once */
+		if (flags & FAULT_FLAG_ALLOW_RETRY) {
+			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+			flags |= FAULT_FLAG_TRIED;
+			if (!fatal_signal_pending(tsk))
+				goto retry;
+		}
+
+正如/* Retry at most once */ 所描述的，如果首次 handle_mm_fault()返回
+VM_FAULT_RETRY，且 FAULT_FLAG_ALLOW_RETRY 在flags中设置了，那么会再次尝试
+__do_page_fault()中的处理。 这个对于因为 page locking阻塞有意义。
+
+例如 在filemap_fault()中的处理：
+	if (!lock_page_or_retry(page, vmf->vma->vm_mm, vmf->flags)) {
+		put_page(page);
+		return ret | VM_FAULT_RETRY;
+	}
+如果第二次的 filemap_fault()还是不能lock page，那么再次返回的
+VM_FAULT_RETRY在 __do_page_fault()中是不会再次尝试page
+fault处理了，而是返回error。（这里的 lock_page_or_retry()
+不一定一直等待PG_locked）
+
+实际上， lock_page_or_retry()在 FAULT_FLAG_ALLOW_RETRY
+没有设置的情况下，是会通过wait_on_page_bit_common --> io_schedule() 等待
+PG_locked被设置为1的。只是这里的等待可能不是无条件的dead loop等：
+	如果 (flags & FAULT_FLAG_KILLABLE)，在有信号待处理时，会结束等待而返回；
+
+
+
+第二次 page fault处理时，会进入__lock_page_or_retry()的 else分支：
+
+int __lock_page_or_retry(struct page *page, struct mm_struct *mm,
+			 unsigned int flags)
+{
+	if (flags & FAULT_FLAG_ALLOW_RETRY) {
+		...		
+	} else {
+		if (flags & FAULT_FLAG_KILLABLE) {
+			int ret;
+
+			ret = __lock_page_killable(page);
+			if (ret) {
+				up_read(&mm->mmap_sem);
+				return 0;
+			}
+		} else
+			__lock_page(page);
+		return 1;
+	}
+}
+
+int __lock_page_killable(struct page *__page)
+{
+	struct page *page = compound_head(__page);
+	wait_queue_head_t *q = page_waitqueue(page);
+	return wait_on_page_bit_common(q, page, PG_locked, TASK_KILLABLE, true);
+}
+
+static inline int wait_on_page_bit_common(wait_queue_head_t *q,
+		struct page *page, int bit_nr, int state, bool lock)
+{
+	...
+		if (likely(test_bit(bit_nr, &page->flags))) {
+			io_schedule();
+			if (unlikely(signal_pending_state(state, current))) {
+				ret = -EINTR;
+				break;
+			}
+		}
+	...
+}
+
+/* 此函数在 (state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL) ，且当前 'p'
+ * 有信号等待处理时，会返回1。从而 wait_on_page_bit_common()
+ * 不再等待PG_locked而返回 ret = -EINTR; 了。 */
+static inline int signal_pending_state(long state, struct task_struct *p)
+{
+	if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))
+		return 0;
+	if (!signal_pending(p))
+		return 0;
+
+	return (state & TASK_INTERRUPTIBLE) || __fatal_signal_pending(p);
+}
+
+
+因此， if (flags & FAULT_FLAG_KILLABLE) 分支在有信号等待处理时是直接结束
+wait_on等待而返回-EINTR之类的error值的。
+

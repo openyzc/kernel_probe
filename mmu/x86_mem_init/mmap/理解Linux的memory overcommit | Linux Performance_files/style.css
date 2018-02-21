@@ -1,0 +1,31 @@
+/*
+Theme Name: Twenty Fourteen Child
+Description: Child theme for the Twenty Fourteen theme 
+Author: @vmunix
+Template: twentyfourteen
+*/
+
+@import url("../twentyfourteen/style.css");
+
+/* customize line 1050 ~ 1057 */
+.site-content .entry-header,
+.site-content .entry-content,
+.site-content .entry-summary,
+.site-content .entry-meta,
+.page-content {
+        margin: 0 auto;
+        max-width: 800px;
+}
+
+/* customize line 3689, 3907~3913 */
+@media screen and (min-width: 1008px) {
+
+        .footer-sidebar .widget .widget-title,
+        .primary-sidebar .widget .widget-title {
+                font-size: 16px;
+                font-weight: 900;
+                line-height: 1.6363636363;
+                margin-bottom: 18px;
+        }       
+
+}

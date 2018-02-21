@@ -1,0 +1,56 @@
+
+
+#define __GEN_RMWcc(fullop, var, cc, ...)				\
+do {									\
+	asm_volatile_goto (fullop "; j" #cc " %l[cc_label]"		\
+			: : "m" (var), ## __VA_ARGS__ 			\
+			: "memory" : cc_label);				\
+	return 0;							\
+cc_label:								\
+	return 1;							\
+} while (0)
+
+#define GEN_UNARY_RMWcc(op, var, arg0, cc) 				\
+	__GEN_RMWcc(op " " arg0, var, cc)
+
+#define GEN_BINARY_RMWcc(op, var, vcon, val, arg0, cc)			\
+	__GEN_RMWcc(op " %1, " arg0, var, cc, vcon (val))
+
+
+GEN_BINARY_RMWcc(LOCK_PREFIX "bts", *addr, "Ir", nr, "%0", c);
+
+So, 'op' is 'LOCK_PREFIX "bts"', 'var' is '*addr', 'vcon' is '"Ir"', 'val' is
+'nr', 'arg0' is '"%0"', 'cc' is 'c';
+
+Then we have :
+
+	__GEN_RMWcc("lock bts %1, " "%0", nr, c, "Ir"(*addr))
+
+
+do {
+	do {
+		asm goto("lock bts %1, %0; jc %l[cc_label]"
+			:: "m"(nr), "Ir"(*addr));
+		asm ("");
+	} while (0);
+	return 0;
+cc_label:
+	return 1;
+} while (0)
+
+
+The 'bts' will do these:
+
+CF ← Bit(BitBase, BitOffset);
+Bit(BitBase, BitOffset) ← 1;
+
+Selects the bit in a bit string (specified with the first operand, called the
+bit base) at the bit-position designated by
+the bit offset operand (second operand), stores the value of the bit in the CF
+flag, and sets the selected bit in the
+bit string to 1.
+
+
+
+
+you can also refer to filesys/misc/clear_bit_unlock_is_negative_byte.txt

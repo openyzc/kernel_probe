@@ -1,0 +1,112 @@
+
+在 intel中， page fault的 interrupt vector是 14.
+
+对应的interrupt handler是 do_page_fault.
+
+首先有几个概念：
+1） 系统调用会嵌入到内核态。但是上下文还是用户进程。
+CR3不会被更新。因此，如果缺页发生在系统调用过程中，那么cs是kernel的，页表还是用户进程的页表；
+2）CR2中的地址是异常发生时访问的地址。如果异常访问的触发地址是kernel态的，那么一般情况下是认为是错误。但是如果address是内核态访问vmalloc区的，那么vmalloc_fault会去修复；
+如果是lazy TLB导致的，那么检查当前page
+中的attr是否满足触发异常的fixup条件。如果是，则不直接结束page
+falut处理，继续运行。
+
+3）其它情况都认为是错误，如果此异常不是来自于 exception
+table中注册的错误path，需要oops。如果是 exception
+table中的entry,那么不进行fixup，完成 exception table中定义的handler获取来更新
+pt_regs 中的ip后，结束page fault处理。 进而从 page fault
+异常处理返回后，将继续触发此page fault的剩余部分，实际是使用 exception
+table中的handler来返回错误码；
+
+
+访问的addr是user space的地址时，
+
+1) 内核thread 不能访问；
+	if (unlikely(faulthandler_disabled() || !mm)) {
+		bad_area_nosemaphore(regs, error_code, address, NULL);
+		return;
+	}
+2） 系统调用过程中访问 user space, 如果触发page fault时还 down着
+mm->mmap_sem，且不属于任何 exception table 的entries， 认为是panic：
+	if (unlikely(!down_read_trylock(&mm->mmap_sem))) {
+		if ((error_code & PF_USER) == 0 &&
+		    !search_exception_tables(regs->ip)) {
+			bad_area_nosemaphore(regs, error_code, address, NULL);
+			return;
+		}
+
+因为后面的find_vma必须获得 mmap_sem，所以这里需要先get 此mmap_sem.
+
+3） 检查page fault访问的地址是否user space 空间的？
+
+	vma = find_vma(mm, address);
+	if (unlikely(!vma)) {
+		bad_area(regs, error_code, address);
+		return;
+	}
+
+不在user space中，但是可能在用户堆栈stack区的合理范围中，此时可以expand堆栈。
+
+
+4） 对于其它访问 user space触发的page fault, 有以下处理：
+
+good_area:
+	if (unlikely(access_error(error_code, vma))) {
+		bad_area_access_error(regs, error_code, address, vma);
+		return;
+	}
+
+	/*
+	 * If for any reason at all we couldn't handle the fault,
+	 * make sure we exit gracefully rather than endlessly redo
+	 * the fault.  Since we never set FAULT_FLAG_RETRY_NOWAIT, if
+	 * we get VM_FAULT_RETRY back, the mmap_sem has been unlocked.
+	 */
+	fault = handle_mm_fault(vma, address, flags);
+	major |= fault & VM_FAULT_MAJOR;
+
+access_error(error_code, vma) 是检查访问权限是否满足。
+
+handle_mm_fault()才是核心。 完成请求调页， COW等的处理。
+
+
+我们知道 mmap, brk 都是只是构建了 VMA 的空间，没有分配对应的物理页。一直到
+
+
+
+2. 关于page_debug_alloc
+
+主要几个问题， 一个是 PTE 构建时不能使用 high page或PSE；
+
+另外一个问题是 改变PTE中的valid比特；
+
+buddy allocation时 需要对 guard pages 进行特殊处理。 参考 expand 和
+__free_one_page的实现：
+1） 分配page时如果需要拆分high order的buddy，会将
+page order <= debug_guardpage_minorder 的剩余页面不挂入到 struct free_area的
+free_list[]中，且继续维持 PTE中 valid 为0， 因为 post_alloc_hook
+不会对这些没有分配的page进行 valid flag的更新；
+这些预留的 page 会被设置 PAGE_EXT_DEBUG_GUARD ：
+__set_bit(PAGE_EXT_DEBUG_GUARD, &page_ext->flags);
+
+2) 释放回某个page时，需要合并成为大的 buddy。
+此时需要检查被释放的page的对应buddy page是否
+page_is_guard(buddy)。如果是，那么之前预留的 page需要回归到 high
+order，不再作为guard page隔离出来：
+
+		if (page_is_guard(buddy)) {
+			clear_page_guard(zone, buddy, order, migratetype);
+		}
+
+
+还有就是实现 kernel_map_pages，以便page allocation或 free时调用。
+
+
+还有，此pagedebug_alloc 影响 slab, vmalloc。
+只是限于 !PageHighMem, 因为只是针对 mapped的 direct mapping 内存空间。
+
+X86与ARM64采用了不同的PTE构建策略。
+X86在初始化内核页表时还是保留大页，只是在具体页面分配出去后进行valid等属性修改时才进行页表的split。而目前ARM64是全部构建到PTE。
+
+ARM64的方法对效率有一定影响。
+

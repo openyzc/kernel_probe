@@ -1,0 +1,199 @@
+
+
+void __init mount_root(void)
+{
+	...
+#ifdef CONFIG_BLOCK
+	{
+		int err = create_dev("/dev/root", ROOT_DEV);
+
+		if (err < 0)
+			pr_emerg("Failed to create /dev/root: %d\n", err);
+		mount_block_root("/dev/root", root_mountflags);
+	}
+#endif
+}
+
+1) create a file, including dentry and the corresponding inode under file-system
+of "rootfs"; (The file name is '/dev/root'. The directory of '/dev' should had
+beee existing). This is for non-initrd mode.
+For initrd mode, we need to refer 'initrd_load()' and I wonder the current
+'rootfs' is the mounted initrd image. We can analyse this later.
+
+2) mount_block_root() --> do_mount_root()
+
+The mount_block_root() will traverse all the registered file-system types to
+find the matched one.
+
+static int __init do_mount_root(char *name, char *fs, int flags, void *data)
+{
+	...
+	int err = sys_mount(name, "/root", fs, flags, data);
+	if (err)
+		return err;
+
+	sys_chdir("/root");
+	s = current->fs->pwd.dentry->d_sb;
+	ROOT_DEV = s->s_dev;
+	...
+}
+
+Here, sys_mount() try to mount the 'fs' specified by '/dev/root' to '/root'.
+
+We only trace ext4_mount() for ext4 file-system here.
+
+static struct dentry *ext4_mount(struct file_system_type *fs_type, int flags,
+		       const char *dev_name, void *data)
+{
+	return mount_bdev(fs_type, flags, dev_name, data, ext4_fill_super);
+}
+
+
+1. bdev = blkdev_get_by_path(dev_name, mode, fs_type)
+
+Getting the 'struct block_device' node for 'dev_name'.
+
+After this processing, the struct block_device specified by 'dev_name', more
+clearly is dev_t value corresonds to this 'dev_name', will be setup the relation
+with file-system of 'fs_type'.
+
+A new 'struct inode' will be created from global superblock of
+'blockdev_superblock' for the new 'struct block_device' node. You can refer to :
+	lookup_bdev --> bd_acquire(struct inode *) --> bdget(inode->i_rdev)
+
+blkdev_get(bdev, mode, holder) will open the block device based on the mechanism
+of struct file_system_type, 'holder';
+
+2. create the 'struct super_block' for the 'struct block_device'
+
+	s = sget(fs_type, test_bdev_super, set_bdev_super, flags | MS_NOSEC,
+		 bdev);
+
+Please note 'set_bdev_super' is different from the other super-block fill-up
+hooks :
+
+#ifdef CONFIG_BLOCK
+static int set_bdev_super(struct super_block *s, void *data)
+{
+	s->s_bdev = data;
+	s->s_dev = s->s_bdev->bd_dev;
+	s->s_bdi = bdi_get(s->s_bdev->bd_bdi);
+
+	return 0;
+}
+
+You can find the 's->s_bdev' is a 'struct block_device' pointer;
+s->s_dev is a 'dev_t' value from 'struct block_device';
+
+The struct super_block seems to be an instance of struct file_system_type. So,
+super_block node will be linked to 'struct file_system_type'.
+
+
+3. create a root 'struct dentry' corresponding to the 'struct super_block'
+
+error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+
+Here, fill_super hook is 'ext4_fill_super' for ext4.
+
+'data' is the mounting input paramter specific to the file-system.
+
+static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+{
+	...
+
+/* initialize the sb->s_op operations. The later inode allocation will use. */
+	sb->s_op = &ext4_sops;
+	sb->s_export_op = &ext4_export_ops;
+	sb->s_xattr = ext4_xattr_handlers;
+	sb->s_cop = &ext4_cryptops;
+/*
+ * 'root = ext4_iget(sb, EXT4_ROOT_INO);' will allocate and initialize the
+ * 'struct inode' which is bound to 'sb'. For ext4, the 'struct inode' seems as
+ * a 'struct inode vfs_inode;' field of 'struct ext4_inode_info';
+ */
+	root = ext4_iget(sb, EXT4_ROOT_INO);
+	if (IS_ERR(root)) {
+		ext4_msg(sb, KERN_ERR, "get root inode failed");
+		ret = PTR_ERR(root);
+		root = NULL;
+		goto failed_mount4;
+	}
+	if (!S_ISDIR(root->i_mode) || !root->i_blocks || !root->i_size) {
+		ext4_msg(sb, KERN_ERR, "corrupt root inode, run e2fsck");
+		iput(root);
+		goto failed_mount4;
+	}
+/*
+ * here, will allocate and bind a new 'struct dentry' for the corresponding
+ * 'struct inode *';
+ */
+	sb->s_root = d_make_root(root);
+	...
+}
+
+
+All the above are triggered by 'root = mount_fs(type, flags, name, data);' in
+vfs_kern_mount().
+
+Then a struct mount node will be initialized for this file-system mount:
+
+	mnt->mnt.mnt_root = root;
+	mnt->mnt.mnt_sb = root->d_sb;
+	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+	mnt->mnt_parent = mnt;
+	lock_mount_hash();
+	list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+
+
+
+4. do_add_mount(real_mount(mnt), path, mnt_flags)
+
+A struct mountpoing will be created and bound with 'struct dentry' of path.
+
+
+	newmnt->mnt.mnt_flags = mnt_flags;
+	err = graft_tree(newmnt, parent, mp);
+
+Here, 'newmnt' is the root 'struct mount' of the file-system mounting this
+time. 'parent' is the root 'struct mount' of the upper file-system mounted
+before which corresponds to the '/root';
+
+in
+static int do_add_mount(struct mount *newmnt, struct path *path, int mnt_flags)
+{
+	...
+	parent = real_mount(path->mnt);
+	...
+}
+
+and path->mnt is assigned from this calling path:
+
+do_mount --> user_path(dir_name, &path) --> user_path_at_empty(AT_FDCWD, name,
+LOOKUP_FOLLOW, path, NULL)
+	-->filename_lookup(dfd, getname_flags(name, flags, empty),
+			       flags, path, NULL)
+		--> path_lookupat(&nd, flags | LOOKUP_RCU, path)
+			--> lookup_last(struct nameidata *nd)
+				--> walk_component(nd, 0)
+
+static int walk_component(struct nameidata *nd, int flags)
+{
+	...
+		path.dentry = lookup_slow(&nd->last, nd->path.dentry,
+					  nd->flags);
+		if (IS_ERR(path.dentry))
+			return PTR_ERR(path.dentry);
+
+		path.mnt = nd->path.mnt;
+		err = follow_managed(&path, nd);
+	...
+}
+
+As nd->path.mnt is from the parent 'struct path' which corresponds to the upper
+mounted dentry.
+
+So, the final path.mnt should point to the closest 'struct vfsmount' node of the
+file-system on searching.
+
+
+

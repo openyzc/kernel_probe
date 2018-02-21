@@ -47,3 +47,114 @@ If you want to know something more about irqbalance,
 
 https://access.redhat.com/solutions/677073
 
+
+
+
+怎么使用 以上绑定的 affinity?
+
+
+static struct irq_chip pci_msi_controller = {
+	.name			= "PCI-MSI",
+	.irq_unmask		= pci_msi_unmask_irq,
+	.irq_mask		= pci_msi_mask_irq,
+	.irq_ack		= irq_chip_ack_parent,
+	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+	.irq_compose_msi_msg	= irq_msi_compose_msg,
+	.flags			= IRQCHIP_SKIP_SET_WAKE,
+};
+
+
+当 compose msi消息时，会调用到 irq_msi_compose_msg;
+
+int irq_chip_compose_msi_msg(struct irq_data *data, struct msi_msg *msg)
+{
+	struct irq_data *pos = NULL;
+
+#ifdef	CONFIG_IRQ_DOMAIN_HIERARCHY
+	for (; data; data = data->parent_data)
+#endif
+		if (data->chip && data->chip->irq_compose_msi_msg)
+			pos = data;
+	if (!pos)
+		return -ENOSYS;
+
+	pos->chip->irq_compose_msi_msg(pos, msg);
+
+	return 0;
+}
+以上的函数对于 MSI, pos 会指向 MSI domain的 irq_data, 因此 pos->chip指向 
+pci_msi_controller；
+
+
+
+static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
+{
+	struct irq_cfg *cfg = irqd_cfg(data);
+	...
+	msg->data =
+		MSI_DATA_TRIGGER_EDGE |
+		MSI_DATA_LEVEL_ASSERT |
+		((apic->irq_delivery_mode != dest_LowestPrio) ?
+			MSI_DATA_DELIVERY_FIXED :
+			MSI_DATA_DELIVERY_LOWPRI) |
+		MSI_DATA_VECTOR(cfg->vector);
+}
+
+请注意，这里的 irqd_cfg(data) 会upstream 到parent domain获得
+irq_data，然后使用cfg->vector:
+
+static struct apic_chip_data *apic_chip_data(struct irq_data *irq_data)
+{
+	if (!irq_data)
+		return NULL;
+
+	while (irq_data->parent_data)
+		irq_data = irq_data->parent_data;
+
+	return irq_data->chip_data;
+}
+
+struct irq_cfg *irqd_cfg(struct irq_data *irq_data)
+{
+	struct apic_chip_data *data = apic_chip_data(irq_data);
+
+	return data ? &data->cfg : NULL;
+}
+而我们在 x86_vector_alloc_irqs()中知道，对于 MSI的IRQ 进行alloc时，最终会
+upstream到 top IRQ domain,也就是：
+
+int __init arch_early_irq_init(void)
+{
+	init_legacy_irqs();
+
+	x86_vector_domain = irq_domain_add_tree(NULL, &x86_vector_domain_ops,
+						NULL);
+	...
+	irq_set_default_host(x86_vector_domain);
+/* MSI domain 的parent 是 x86_vector_domain. */
+	arch_init_msi_domain(x86_vector_domain);
+	...
+}
+
+从而， x86_vector_domain_ops 中的 alloc 钩子会被调用，也就是
+x86_vector_alloc_irqs --> assign_irq_vector_policy --> assign_irq_vector -->
+__assign_irq_vector
+
+最终会将 virq 的struct irq_desc 关联到某个cpu下的 vector_irq下的某个vector中：
+
+	per_cpu(vector_irq, new_cpu)[vector] = irq_to_desc(irq);
+
+最终 所选择的 某个cpu下的中断vector 会被保存在 x86_vector_domain的
+struct irq_data 中：
+
+	d->cfg.old_vector = d->move_in_progress ? d->cfg.vector : 0;
+	d->cfg.vector = vector;
+
+MSI domain构造MSI消息时(参考irq_msi_compose_msg），才会使用到'd->cfg.vector'
+来作为msg->data的一部分发出去，以便触发 vector的 IRQ处理。具体可以参考 do_IRQ().
+
+
+
+
+
+

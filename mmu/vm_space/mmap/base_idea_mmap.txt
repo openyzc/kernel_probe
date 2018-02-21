@@ -1,0 +1,151 @@
+
+
+1. 核心函数是 do_mmap
+
+vm_mmap_pgoff
+	--> do_mmap_pgoff
+		--> do_mmap
+			--> mmap_region
+
+2. 找寻unmap 的VMA range
+
+addr = get_unmapped_area(file, addr, len, pgoff, flags)
+/* for x86_32, et c... */
+	--> arch_get_unmapped_area
+
+该系列函数将 遍历
+current->mm.mm_rb 中的 VMA, 过程中会通过 vma->vm_rb 来遍历 next 的VMA.
+
+struct mm_struct {
+	struct vm_area_struct *mmap;		/* list of VMAs */
+	struct rb_root mm_rb;
+	...
+}
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+	...
+}
+
+	...
+}
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+	...
+}
+
+	...
+}
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+	...
+}
+
+	...
+}
+
+struct vm_area_struct {
+	/* The first cache line has the info for VMA tree walking. */
+
+	unsigned long vm_start;		/* Our start address within vm_mm. */
+	unsigned long vm_end;		/* The first byte after our end address
+					   within vm_mm. */
+
+	/* linked list of VM areas per task, sorted by address */
+	struct vm_area_struct *vm_next, *vm_prev;
+
+	struct rb_node vm_rb;
+	...
+}
+
+
+
+3.  VA 与 PA 建立mapping
+
+参考 unsigned long mmap_region(struct file *file, unsigned long addr,
+
+
+对于 file mapping, 调用
+		vma->vm_file = get_file(file);
+		error = call_mmap(file, vma);
+
+static int ext4_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	...
+	if (IS_DAX(file_inode(file))) {
+		vma->vm_ops = &ext4_dax_vm_ops;
+		vma->vm_flags |= VM_MIXEDMAP | VM_HUGEPAGE;
+	} else {
+		vma->vm_ops = &ext4_file_vm_ops;
+	}
+	...
+}
+
+int generic_file_mmap(struct file * file, struct vm_area_struct * vma)
+{
+	struct address_space *mapping = file->f_mapping;
+
+	if (!mapping->a_ops->readpage)
+		return -ENOEXEC;
+	file_accessed(file);
+	vma->vm_ops = &generic_file_vm_ops;
+	return 0;
+}
+
+没有任何对物理页面的处理。应该在 page fault时，通过 vma->vm_ops来完成。
+
+对于 shared anonymous, 调用
+		error = shmem_zero_setup(vma);
+
+int shmem_zero_setup(struct vm_area_struct *vma)
+{
+	struct file *file;
+	loff_t size = vma->vm_end - vma->vm_start;
+
+	/*
+	 * Cloning a new file under mmap_sem leads to a lock ordering conflict
+	 * between XFS directory reading and selinux: since this file is only
+	 * accessible to the user through its mapping, use S_PRIVATE flag to
+	 * bypass file security, in the same way as shmem_kernel_file_setup().
+	 */
+	file = __shmem_file_setup("dev/zero", size, vma->vm_flags, S_PRIVATE);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	vma->vm_file = file;
+	vma->vm_ops = &shmem_vm_ops;
+	...
+}
+
+

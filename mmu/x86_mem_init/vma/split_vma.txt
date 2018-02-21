@@ -1,0 +1,26 @@
+
+
+Please check these lines in mprotect_fixup or mlock_fixup
+
+
+	if (start != vma->vm_start) {
+		error = split_vma(mm, vma, start, 1);
+		if (error)
+			goto fail;
+	}
+
+	if (end != vma->vm_end) {
+		error = split_vma(mm, vma, end, 0);
+		if (error)
+			goto fail;
+	}
+
+
+
+Normally, the first split_vma() will split the original VMA as two VMAs. They
+are [vma->vm_start, start), [start, vma->vm_end);
+
+The seconde will splict these two VMAs:
+
+[vma->vm_start, end) and [end, vma->vm_end)
+
